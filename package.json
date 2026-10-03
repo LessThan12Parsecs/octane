@@ -1,0 +1,28 @@
+{
+  "name": "octane",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Physically detailed combustion-engine simulator rendered with three.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "ref": "bash tools/reference/generate_all.sh"
+  },
+  "dependencies": {
+    "lil-gui": "^0.21.0",
+    "three": "^0.186.1",
+    "uplot": "^1.6.32"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "@types/three": "^0.186.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1",
+    "vitest": "^4.1.11"
+  }
+}

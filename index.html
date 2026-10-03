@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Physically detailed simulator of the Waukesha CFR F-1 octane-rating engine: spark, flame, knock and gas exchange, rendered with three.js." />
+    <title>Octane · CFR engine simulator</title>
+    <style>
+      /* Before the stylesheet loads: no white flash. */
+      html, body { margin: 0; height: 100%; background: #0b0e12; }
+    </style>
+  </head>
+  <body>
+    <main class="oct-viewport" id="viewport" aria-label="3D engine view"></main>
+    <div id="ui"></div>
+    <noscript>
+      <p style="color:#e6e9ee;font:14px system-ui,sans-serif;padding:16px">Octane needs JavaScript, WebGL 2 and module Web Workers.</p>
+    </noscript>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

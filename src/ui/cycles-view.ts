@@ -1,0 +1,375 @@
+/**
+ * "Cycles" tab: cycle-to-cycle statistics, an IMEP-vs-cycle sparkline and the
+ * per-cycle results table (metrics as rows, most recent cycles as columns).
+ */
+import type { CycleSummary } from '../physics/core/snapshot';
+import { SERIES, STATUS, INK, withAlpha } from './charts/theme';
+import { computeCycleStats, CYCLE_METRICS, cyclesToCsv, formatMetric, metricMean, type CycleStats } from './cycle-stats';
+import { RingBuffer } from './ring-buffer';
+import { fmt, paToBar } from './units';
+
+const TABLE_COLS = 8;
+const HISTORY = 300;
+const SPARK_CYCLES = 150;
+
+export class CyclesView {
+  readonly el: HTMLElement;
+  private readonly cycles = new RingBuffer<CycleSummary>(HISTORY);
+  private readonly statEls = new Map<string, HTMLElement>();
+  private readonly canvas: HTMLCanvasElement;
+  private readonly headCells: HTMLTableCellElement[] = [];
+  private readonly meanCells: HTMLTableCellElement[] = [];
+  private readonly cells: HTMLTableCellElement[][] = []; // [metric][col]
+  private readonly empty: HTMLElement;
+  private dirty = true;
+  private readonly ro: ResizeObserver | null = null;
+
+  constructor(host: HTMLElement) {
+    this.el = document.createElement('div');
+    this.el.className = 'oct-cycles';
+    host.appendChild(this.el);
+
+    // --- stat tiles ---
+    const stats = document.createElement('div');
+    stats.className = 'oct-stats';
+    const tiles: [string, string, string][] = [
+      ['imep', 'IMEP net [bar]', 'Mean net IMEP ± standard deviation'],
+      ['cov', 'COV of IMEP', 'Coefficient of variation of net IMEP (cyclic variability)'],
+      ['lnv', 'LNV of IMEP', 'Lowest normalised value: min IMEP / mean IMEP'],
+      ['eta', 'η indicated', 'Mean net indicated efficiency'],
+      ['ca50', 'CA50 mean', 'Mean 50 % burn angle'],
+      ['knock', 'Knocking cycles', 'Share of cycles with end-gas autoignition'],
+      ['mis', 'Misfires', 'Cycles whose spark kernel failed'],
+      ['n', 'Cycles in window', 'Cycles in the statistics window'],
+    ];
+    for (const [k, label, hint] of tiles) {
+      const t = document.createElement('div');
+      t.className = 'oct-stat';
+      t.title = hint;
+      t.innerHTML = `<div class="oct-stat-label"></div><div class="oct-stat-value">—</div>`;
+      (t.firstElementChild as HTMLElement).textContent = label;
+      this.statEls.set(k, t.lastElementChild as HTMLElement);
+      stats.appendChild(t);
+    }
+    this.el.appendChild(stats);
+
+    // --- sparkline ---
+    const sw = document.createElement('div');
+    sw.className = 'oct-sparkline';
+    const cap = document.createElement('div');
+    cap.className = 'oct-sparkline-cap';
+    cap.innerHTML =
+      `<span>IMEP net vs cycle</span>` +
+      `<span class="oct-swatch" style="--sw:${SERIES.blue}">IMEP</span>` +
+      `<span class="oct-swatch is-dashed" style="--sw:${INK.secondary}">mean ± σ</span>` +
+      `<span class="oct-swatch is-dot" style="--sw:${STATUS.serious}">knock</span>` +
+      `<span class="oct-swatch is-dot" style="--sw:${STATUS.critical}">misfire</span>`;
+    this.canvas = document.createElement('canvas');
+    this.canvas.className = 'oct-sparkline-canvas';
+    this.canvas.setAttribute('role', 'img');
+    this.canvas.setAttribute('aria-label', 'Net IMEP of recent cycles');
+    sw.append(cap, this.canvas);
+    this.el.appendChild(sw);
+
+    // --- actions ---
+    const actions = document.createElement('div');
+    actions.className = 'oct-table-actions';
+    const csv = document.createElement('button');
+    csv.type = 'button';
+    csv.className = 'oct-mini-btn';
+    csv.textContent = 'Export CSV';
+    csv.title = 'Download all recorded cycles as CSV';
+    csv.addEventListener('click', () => this.exportCsv());
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'oct-mini-btn';
+    clear.textContent = 'Clear';
+    clear.title = 'Forget recorded cycles';
+    clear.addEventListener('click', () => this.clear());
+    const note = document.createElement('span');
+    note.className = 'oct-toolbar-hint';
+    note.textContent = `newest first · last ${TABLE_COLS} cycles`;
+    actions.append(note, csv, clear);
+    this.el.appendChild(actions);
+
+    // --- table ---
+    const wrap = document.createElement('div');
+    wrap.className = 'oct-table-wrap';
+    const table = document.createElement('table');
+    table.className = 'oct-table';
+    const thead = table.createTHead();
+    const hr = thead.insertRow();
+    const th0 = document.createElement('th');
+    th0.textContent = 'Metric';
+    th0.className = 'oct-col-metric';
+    hr.appendChild(th0);
+    const thMean = document.createElement('th');
+    thMean.textContent = 'mean';
+    thMean.className = 'oct-col-mean';
+    thMean.title = 'Mean over the statistics window';
+    hr.appendChild(thMean);
+    for (let j = 0; j < TABLE_COLS; j++) {
+      const th = document.createElement('th');
+      th.textContent = '';
+      hr.appendChild(th);
+      this.headCells.push(th);
+    }
+    const tbody = table.createTBody();
+    for (const def of CYCLE_METRICS) {
+      if (def.group) {
+        const gr = tbody.insertRow();
+        gr.className = 'oct-group-row';
+        const gc = gr.insertCell();
+        gc.colSpan = TABLE_COLS + 2;
+        gc.textContent = def.group;
+      }
+      const row = tbody.insertRow();
+      const name = row.insertCell();
+      name.className = 'oct-col-metric';
+      name.title = def.hint;
+      name.innerHTML = `<span class="oct-metric-name"></span><span class="oct-metric-unit"></span>`;
+      (name.firstElementChild as HTMLElement).textContent = def.label;
+      (name.lastElementChild as HTMLElement).textContent = def.unit;
+      const mc = row.insertCell();
+      mc.className = 'oct-col-mean';
+      this.meanCells.push(mc);
+      const rowCells: HTMLTableCellElement[] = [];
+      for (let j = 0; j < TABLE_COLS; j++) rowCells.push(row.insertCell());
+      this.cells.push(rowCells);
+    }
+    wrap.appendChild(table);
+    this.el.appendChild(wrap);
+
+    this.empty = document.createElement('div');
+    this.empty.className = 'oct-empty';
+    this.empty.textContent = 'No complete cycles yet — results appear after each 720° cycle.';
+    this.el.appendChild(this.empty);
+
+    if (typeof ResizeObserver !== 'undefined') {
+      this.ro = new ResizeObserver(() => {
+        this.dirty = true;
+      });
+      this.ro.observe(this.canvas);
+    }
+  }
+
+  get latest(): CycleSummary | null {
+    return this.cycles.latest() ?? null;
+  }
+
+  get all(): CycleSummary[] {
+    return this.cycles.toArray();
+  }
+
+  push(c: CycleSummary): void {
+    this.cycles.push(c);
+    this.dirty = true;
+  }
+
+  clear(): void {
+    this.cycles.clear();
+    this.dirty = true;
+  }
+
+  stats(): CycleStats {
+    return computeCycleStats(this.window());
+  }
+
+  private window(): CycleSummary[] {
+    const all = this.cycles.toArray();
+    return all.slice(Math.max(0, all.length - SPARK_CYCLES));
+  }
+
+  /** Re-render if something changed and the tab is visible. */
+  render(visible: boolean): void {
+    if (!visible || !this.dirty) return;
+    this.dirty = false;
+    const win = this.window();
+    const n = win.length;
+    this.empty.style.display = n ? 'none' : '';
+
+    const st = computeCycleStats(win);
+    const set = (k: string, v: string): void => {
+      const el = this.statEls.get(k);
+      if (el && el.textContent !== v) el.textContent = v;
+    };
+    set('imep', n ? `${fmt(st.imepMean, 2)} ± ${fmt(st.imepStd, 2)}` : '—');
+    set('cov', `${fmt(st.imepCov, 2)} %`);
+    set('lnv', `${fmt(st.imepLnv, 1)} %`);
+    set('eta', `${fmt(st.etaMean, 1)} %`);
+    set('ca50', `${fmt(st.ca50Mean, 1)}°`);
+    set('knock', n ? `${fmt(st.knockFraction * 100, 0)} %` : '—');
+    set('mis', String(st.misfires));
+    set('n', String(n));
+    this.statEls.get('knock')?.classList.toggle('is-alert', st.knockFraction > 0);
+    this.statEls.get('mis')?.classList.toggle('is-alert', st.misfires > 0);
+
+    // Table: newest first.
+    for (let j = 0; j < TABLE_COLS; j++) {
+      const c = this.cycles.latest(j);
+      this.headCells[j].textContent = c ? `#${c.cycle}` : '';
+      this.headCells[j].classList.toggle('is-newest', j === 0 && !!c);
+      for (let r = 0; r < CYCLE_METRICS.length; r++) {
+        const def = CYCLE_METRICS[r];
+        const cell = this.cells[r][j];
+        const txt = c ? formatMetric(def, c) : '';
+        if (cell.textContent !== txt) cell.textContent = txt;
+        const flag = c && def.flag ? def.flag(c) : null;
+        cell.className = flag ? `is-${flag}` : '';
+      }
+    }
+    for (let r = 0; r < CYCLE_METRICS.length; r++) {
+      const def = CYCLE_METRICS[r];
+      const txt = def.noMean || !n ? '' : fmt(metricMean(def, win), def.decimals);
+      if (this.meanCells[r].textContent !== txt) this.meanCells[r].textContent = txt;
+    }
+    this.drawSparkline(win, st);
+  }
+
+  private drawSparkline(win: CycleSummary[], st: CycleStats): void {
+    const cv = this.canvas;
+    const dpr = globalThis.devicePixelRatio || 1;
+    const w = Math.max(100, cv.clientWidth);
+    const h = Math.max(40, cv.clientHeight);
+    if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+      cv.width = Math.round(w * dpr);
+      cv.height = Math.round(h * dpr);
+    }
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const n = win.length;
+    const padL = 40;
+    const padR = 6;
+    const padT = 6;
+    const padB = 14;
+    const pw = w - padL - padR;
+    const ph = h - padT - padB;
+    ctx.font = '10px ui-monospace, Menlo, monospace';
+    ctx.fillStyle = INK.muted;
+    if (n === 0) {
+      ctx.fillText('waiting for cycles…', padL, padT + ph / 2);
+      return;
+    }
+    let lo = Infinity;
+    let hi = -Infinity;
+    const ys = win.map((c) => paToBar(c.imepNet));
+    for (const y of ys) {
+      if (!Number.isFinite(y)) continue;
+      lo = Math.min(lo, y);
+      hi = Math.max(hi, y);
+    }
+    if (!(hi >= lo)) {
+      lo = 0;
+      hi = 1;
+    }
+    if (hi - lo < 0.2) {
+      const m = (hi + lo) / 2;
+      lo = m - 0.1;
+      hi = m + 0.1;
+    }
+    const span = hi - lo;
+    lo -= span * 0.08;
+    hi += span * 0.08;
+    // Newest cycle at the right edge; at least 30 slots so early points don't stretch.
+    const slots = Math.max(n, 30);
+    const X = (i: number): number => padL + ((slots - n + i) / (slots - 1)) * pw;
+    const Y = (v: number): number => padT + (1 - (v - lo) / (hi - lo)) * ph;
+
+    // axes labels
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(fmt(hi, 2), padL - 4, padT + 4);
+    ctx.fillText(fmt(lo, 2), padL - 4, padT + ph - 4);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(`#${win[0].cycle}`, padL, h - 2);
+    ctx.textAlign = 'right';
+    ctx.fillText(`#${win[n - 1].cycle}  (bar)`, w - padR, h - 2);
+
+    // mean ± σ band
+    if (Number.isFinite(st.imepMean)) {
+      if (Number.isFinite(st.imepStd)) {
+        ctx.fillStyle = withAlpha('#a3acb9', 0.08);
+        const y0 = Y(st.imepMean + st.imepStd);
+        const y1 = Y(st.imepMean - st.imepStd);
+        ctx.fillRect(padL, y0, pw, y1 - y0);
+      }
+      ctx.strokeStyle = INK.secondary;
+      ctx.setLineDash([4, 3]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padL, Y(st.imepMean));
+      ctx.lineTo(padL + pw, Y(st.imepMean));
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // IMEP line
+    ctx.strokeStyle = SERIES.blue;
+    ctx.lineWidth = 1.5;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    let pen = false;
+    for (let i = 0; i < n; i++) {
+      const y = ys[i];
+      if (!Number.isFinite(y)) {
+        pen = false;
+        continue;
+      }
+      if (pen) ctx.lineTo(X(i), Y(y));
+      else {
+        ctx.moveTo(X(i), Y(y));
+        pen = true;
+      }
+    }
+    ctx.stroke();
+
+    // knock / misfire markers
+    for (let i = 0; i < n; i++) {
+      const c = win[i];
+      const y = Number.isFinite(ys[i]) ? ys[i] : lo;
+      if (c.misfire) {
+        ctx.strokeStyle = STATUS.critical;
+        ctx.lineWidth = 1.5;
+        const x = X(i);
+        const yy = Y(y);
+        ctx.beginPath();
+        ctx.moveTo(x - 3, yy - 3);
+        ctx.lineTo(x + 3, yy + 3);
+        ctx.moveTo(x + 3, yy - 3);
+        ctx.lineTo(x - 3, yy + 3);
+        ctx.stroke();
+      } else if (Number.isFinite(c.knockOnsetDeg)) {
+        ctx.fillStyle = STATUS.serious;
+        ctx.beginPath();
+        ctx.arc(X(i), Y(y), 2.5, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+    }
+  }
+
+  private exportCsv(): void {
+    const all = this.cycles.toArray();
+    if (!all.length) return;
+    const blob = new Blob([cyclesToCsv(all)], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `octane-cycles-${all[0].cycle}-${all[all.length - 1].cycle}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  invalidate(): void {
+    this.dirty = true;
+  }
+
+  dispose(): void {
+    this.ro?.disconnect();
+    this.el.remove();
+  }
+}

@@ -1,0 +1,4 @@
+# DTU Orbit terms of use: one private copy for study; not for redistribution. Fetch it from
+# https://backend.orbit.dtu.dk/ws/files/236274325/KM_Investigation_CFR_Engine_SAE_Journal_Final.pdf
+# (tools/reference/cfr_data_rockstroh2018.py skips cleanly when it is absent).
+rockstroh2018_sae2018-01-0210_dtu.pdf
