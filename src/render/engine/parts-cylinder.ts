@@ -510,7 +510,10 @@ function buildRocker(v: ValveLayout, M: EngineMaterials, w: number, hubR: number
   return g;
 }
 
-export function buildSparkPlug(L: EngineLayout, M: EngineMaterials): THREE.Group {
+/** What buildSparkPlug reads from a layout (any engine's layout can supply it). */
+export type SparkPlugLayout = Pick<EngineLayout, 'plug' | 'spec'>;
+
+export function buildSparkPlug(L: SparkPlugLayout, M: EngineMaterials): THREE.Group {
   const pl = L.plug;
   const sp = L.spec.sparkPlug;
   const g = new THREE.Group();
