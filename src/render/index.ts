@@ -19,3 +19,6 @@ export {
   registerEngineModel,
   type EngineRenderModel,
 } from './engine-model';
+// Side effect: registers the Ford Model T builder with createEngineModel (spec id 'ford-model-t').
+import './engine-modelt/index';
+export { ModelTEngineModel, computeModelTLayout, type ModelTLayout } from './engine-modelt/index';

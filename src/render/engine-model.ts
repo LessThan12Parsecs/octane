@@ -78,7 +78,11 @@ export class CfrEngineRenderModel implements EngineRenderModel {
   }
 }
 
-/** Builders of non-CFR engines, keyed by EngineSpec.id (registered by their modules). */
+/**
+ * Builders of non-CFR engines, keyed by EngineSpec.id (registered by their modules: the Ford Model T
+ * ('ford-model-t') by render/engine-modelt/index.ts, which the render barrel render/index.ts imports for
+ * that side effect — import createEngineModel from the barrel, or import the engine module yourself).
+ */
 const BUILDERS = new Map<string, (spec: EngineSpec, op: OperatingPoint) => EngineRenderModel>();
 
 /** Register the render-model builder of an engine id (called by e.g. render/engine-modelt). */
