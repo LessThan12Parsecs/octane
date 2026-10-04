@@ -31,6 +31,7 @@ import { engineChoices, initialOperatingPoint, isEngineId, resolveEngine } from 
 import { ViewportOverlay, type StatusAction } from './overlay';
 import './register-engines';
 import { EngineSession } from './session';
+import type { SimClientConfig } from './sim-client';
 import { clampOperatingPoint, errorSummary, framingDistanceScale, parseUrlOptions, searchWithEngine, type Framing } from './sync';
 
 /** Default playback speed: 1/50 of real time (a 600 rpm burn of ~5 ms takes ~¼ s). */
@@ -69,6 +70,8 @@ export interface AppOptions {
   search?: string;
   /** Write the engine choice back to the address bar (history.replaceState) on a switch (default true). */
   syncUrl?: boolean;
+  /** SimClient configuration of every session (e.g. a custom worker factory for dev pages and tests). */
+  simClientConfig?: SimClientConfig;
 }
 
 export class App {
@@ -77,6 +80,7 @@ export class App {
   private readonly overlay: ViewportOverlay;
   private readonly uiContainer: HTMLElement;
   private readonly simulatorOptions: SimulatorOptions;
+  private readonly simClientConfig: SimClientConfig | undefined;
   private readonly syncUrl: boolean;
   private framing: Framing;
   private focus = 0;
@@ -97,6 +101,7 @@ export class App {
     const url = parseUrlOptions(opts.search ?? '');
     this.uiContainer = opts.uiContainer;
     this.syncUrl = opts.syncUrl ?? true;
+    this.simClientConfig = opts.simClientConfig;
     this.framing = url.framing ?? 'chamber';
     const base = opts.simulatorOptions ?? DEFAULT_SIMULATOR_OPTIONS;
     // ?sim=mock: the lightweight single-cylinder stand-in (extra fields pass through to the worker).
@@ -203,13 +208,22 @@ export class App {
     this.stage.setFraming(this.framingView(), animate);
   }
 
-  /** Focus cylinder (0-based): UI readouts and charts, and the 'chamber' close-up. */
+  /**
+   * Focus cylinder (0-based): UI readouts and charts, the 'chamber' close-up, and the featured
+   * in-cylinder visuals (flow tracers and chamber light follow the focus).
+   */
   setFocusCylinder(index: number, animate = true): void {
     const n = this.session.spec.cylinders;
     const i = Math.max(0, Math.min(n - 1, Math.floor(index)));
     if (i === this.focus) return;
     this.focus = i;
     this.session.ui.setFocusCylinder(i);
+    try {
+      this.session.setFeaturedCylinder(i);
+    } catch (err) {
+      // The visuals keep featuring the previous cylinder; readouts and framing still follow the focus.
+      console.error('[octane] could not move the flow tracers to the focus cylinder', err);
+    }
     if (this.framing === 'chamber') this.stage.setFraming(this.framingView(), animate);
   }
 
@@ -273,10 +287,17 @@ export class App {
         onFirstSnapshot: () => this.onData(session),
       },
       onReset: () => {
+        if (session !== this.session) return;
         this.hasData = false;
         this.startedAt = NaN;
+        if (this.failed) {
+          // The simulator restarts (re-initialised if it could not be built): give it a fresh chance.
+          this.failed = false;
+          if (!this.notice) this.overlay.setStatus('Restarting the simulator…', 'Running the first cycle again with the current settings.');
+        }
       },
       onFocusCylinder: (i) => this.setFocusCylinder(i),
+      simClientConfig: this.simClientConfig,
     });
     const s = session;
     s.sim.onError((message) => {

@@ -83,6 +83,7 @@ export class TracePanel {
   private lastOverlayVersion = -1;
   private readonly io: IntersectionObserver | null = null;
   private readonly ro: ResizeObserver | null = null;
+  private resizeHandle = 0;
   private readonly viewButtons: HTMLButtonElement[] = [];
   private lastVersion = -1;
   private lastPlayheadT = NaN;
@@ -321,7 +322,15 @@ export class TracePanel {
       for (const c of this.cards) this.io.observe(c.el);
     }
     if (typeof ResizeObserver !== 'undefined') {
-      this.ro = new ResizeObserver(() => this.resize());
+      // Resize the plots on the next frame: resizing them inside the observer callback changes the
+      // observed layout again ("ResizeObserver loop completed with undelivered notifications").
+      this.ro = new ResizeObserver(() => {
+        if (this.resizeHandle) return;
+        this.resizeHandle = requestAnimationFrame(() => {
+          this.resizeHandle = 0;
+          this.resize();
+        });
+      });
       this.ro.observe(this.el);
     }
   }
@@ -500,6 +509,8 @@ export class TracePanel {
   dispose(): void {
     this.io?.disconnect();
     this.ro?.disconnect();
+    if (this.resizeHandle) cancelAnimationFrame(this.resizeHandle);
+    this.resizeHandle = 0;
     for (const { plot } of this.thetaPlots) plot.dispose();
     this.allPlot?.dispose();
     this.pv.dispose();

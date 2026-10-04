@@ -19,10 +19,17 @@
  *
  * Multi-cylinder engines: the mechanism animates every cylinder from the one
  * snapshot, and a GasFanOut drives one in-cylinder visual per cylinder.
+ *
+ * Cutaway: engines whose chamber is not convex (the Model T's L-head) report the
+ * housings' cut-away region per cylinder frame (MechanismPort.cutRegion); the
+ * conductor hands it to the in-cylinder visuals on every cutaway change, so gas
+ * behind cut-away metal is drawn exactly where the metal is gone. Engines without
+ * it (the CFR) never set a cut region.
  */
 import { hasVariableCompressionRatio, type EngineSpec } from '../physics/core/engine-spec';
 import type { OperatingPoint } from '../physics/core/operating-point';
 import type { CycleSummary, EngineSnapshot } from '../physics/core/snapshot';
+import type { CutPlanes } from '../render/combustion/index';
 import { compressionRatioFromSnapshot, FrameClock, RecentWindow } from './sync';
 
 export type RenderMode = 'physical' | 'temperature';
@@ -59,24 +66,63 @@ export interface MechanismPort {
   readonly compressionRatio: number;
   /** Operating-point inputs that move parts (spark lever, hand throttle); called on every change. */
   setControls?(op: Partial<OperatingPoint>): void;
+  /** Cut-away region in cylinder `cylinder`'s frame (null: cutaway off). Optional (EngineRenderModel.cutRegion). */
+  cutRegion?(cylinder: number): CutPlanes | null;
 }
 
 /** What the conductor needs from CombustionVisuals. */
 export interface GasPort {
   update(s: EngineSnapshot, dtWall: number, timeScale: number): void;
   setMode(mode: RenderMode): void;
+  /**
+   * The mechanism's cut-away region changed: `region(i)` is the region in cylinder i's frame (null: nothing
+   * cut). Optional; GasFanOut forwards it to every per-cylinder visual (CylinderGasPort).
+   */
+  setCutRegions?(region: (cylinder: number) => CutPlanes | null): void;
+}
+
+/** One cylinder's in-cylinder visual (CombustionVisuals satisfies it structurally). */
+export interface CylinderGasPort extends GasPort {
+  readonly cylinder: number;
+  setCutRegion(planes: CutPlanes | null): void;
+}
+
+function isCylinderGasPort(p: GasPort): p is CylinderGasPort {
+  const c = p as Partial<CylinderGasPort>;
+  return typeof c.cylinder === 'number' && typeof c.setCutRegion === 'function';
 }
 
 /** One GasPort driving several (one CombustionVisuals per cylinder; each reads its own cylinder). */
 export class GasFanOut implements GasPort {
-  constructor(readonly ports: readonly GasPort[]) {}
+  private readonly list: GasPort[];
+
+  constructor(ports: readonly GasPort[]) {
+    this.list = ports.slice();
+  }
+
+  get ports(): readonly GasPort[] {
+    return this.list;
+  }
+
+  /** Swap the port at `index` (a rebuilt visual, e.g. when the featured cylinder changes). */
+  replace(index: number, port: GasPort): void {
+    if (index < 0 || index >= this.list.length) throw new RangeError(`GasFanOut: no port ${index}`);
+    this.list[index] = port;
+  }
 
   update(s: EngineSnapshot, dtWall: number, timeScale: number): void {
-    for (let i = 0; i < this.ports.length; i++) this.ports[i].update(s, dtWall, timeScale);
+    for (let i = 0; i < this.list.length; i++) this.list[i].update(s, dtWall, timeScale);
   }
 
   setMode(mode: RenderMode): void {
-    for (const p of this.ports) p.setMode(mode);
+    for (const p of this.list) p.setMode(mode);
+  }
+
+  setCutRegions(region: (cylinder: number) => CutPlanes | null): void {
+    for (const p of this.list) {
+      if (isCylinderGasPort(p)) p.setCutRegion(region(p.cylinder));
+      else p.setCutRegions?.(region);
+    }
   }
 }
 
@@ -124,6 +170,7 @@ export class Conductor {
     this.clock = new FrameClock(maxFrameSeconds);
     this.variableCR = hasVariableCompressionRatio(spec);
     sim.onCycle((c) => this.ui?.pushCycle(c));
+    this.syncCutRegion();
   }
 
   /** Connect the UI (created after the conductor because its callbacks point here). */
@@ -173,6 +220,7 @@ export class Conductor {
   readonly handleView = (v: ViewState): void => {
     this._view = { cutaway: v.cutaway, mode: v.mode };
     this.engine.setCutaway(v.cutaway);
+    this.syncCutRegion();
     this.gas.setMode(v.mode);
     this.hooks.onView?.(this._view);
   };
@@ -210,6 +258,13 @@ export class Conductor {
     }
     this._frames++;
     return s;
+  }
+
+  /** Hand the mechanism's current cut-away region to the in-cylinder visuals (engines that report one). */
+  private syncCutRegion(): void {
+    const engine = this.engine;
+    if (!engine.cutRegion || !this.gas.setCutRegions) return;
+    this.gas.setCutRegions((i) => engine.cutRegion!(i));
   }
 
   private syncCompressionRatio(s: EngineSnapshot): void {

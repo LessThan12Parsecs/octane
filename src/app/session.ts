@@ -4,16 +4,20 @@
  * Conductor and the UI. The App keeps the Stage, overlay, animation loop and keyboard alive and swaps
  * whole sessions when the user picks another engine (App.setEngine).
  *
+ * Featured cylinder (multi-cylinder engines): only its visuals run the flow tracers and carry the
+ * chamber light; setFeaturedCylinder moves both (CylinderVisuals, cylinder-visuals.ts).
+ *
  * Construction is all-or-nothing: if any part throws (no render model registered for the engine yet,
  * no WebGL, …) everything already built is released and the stage is left as it was.
  */
 import * as THREE from 'three';
 import type { OperatingPoint } from '../physics/core/operating-point';
 import type { EngineDefinition } from '../physics/engines/index';
-import { CombustionVisuals, createEngineModel, type EngineRenderModel, type Stage } from '../render/index';
+import { createEngineModel, type CombustionVisuals, type EngineRenderModel, type Stage } from '../render/index';
 import { UIController } from '../ui/index';
 import type { SimulatorOptions } from '../worker/protocol';
-import { Conductor, GasFanOut, type ConductorHooks, type PlaybackState } from './conductor';
+import { Conductor, type ConductorHooks, type PlaybackState } from './conductor';
+import { CylinderVisuals } from './cylinder-visuals';
 import { SimClient, type SimClientConfig } from './sim-client';
 import type { Framing } from './sync';
 
@@ -38,11 +42,10 @@ export interface EngineSessionOptions {
 export class EngineSession {
   readonly def: EngineDefinition;
   readonly engine: EngineRenderModel;
-  /** One per cylinder frame (index = cylinder − 1). */
-  readonly gas: readonly CombustionVisuals[];
   readonly sim: SimClient;
   readonly conductor: Conductor;
   readonly ui: UIController;
+  private readonly visuals: CylinderVisuals;
   private disposed = false;
 
   constructor(o: EngineSessionOptions) {
@@ -61,20 +64,12 @@ export class EngineSession {
       root = engine.root;
       o.stage.scene.add(engine.root);
       engine.setControls?.(op);
-      const frames = engine.cylinderFrames;
-      const gas: CombustionVisuals[] = [];
-      for (let i = 0; i < frames.length; i++) {
-        const g = track(new CombustionVisuals(spec, { cylinder: i, tracers: i === o.focusCylinder || frames.length === 1 }));
-        frames[i].add(g.root);
-        o.stage.addEmitters(g.root); // flame, spark, tracers: the only bloom sources
-        gas.push(g);
-      }
-      this.gas = gas;
+      const visuals = (this.visuals = track(new CylinderVisuals(spec, engine, (r) => o.stage.addEmitters(r), o.focusCylinder)));
       engine.root.updateMatrixWorld(true);
 
       // ---- simulation ----
       this.sim = track(new SimClient(spec, op, o.simulatorOptions, o.simClientConfig));
-      this.conductor = new Conductor(spec, this.sim, engine, gas.length === 1 ? gas[0] : new GasFanOut(gas), o.hooks, o.playback);
+      this.conductor = new Conductor(spec, this.sim, engine, visuals.port, o.hooks, o.playback);
 
       // ---- UI ----
       this.ui = track(
@@ -112,6 +107,26 @@ export class EngineSession {
     return this.def.spec;
   }
 
+  /** One in-cylinder visual per cylinder frame (index = cylinder − 1; replaced by setFeaturedCylinder). */
+  get gas(): readonly CombustionVisuals[] {
+    return this.visuals.visuals;
+  }
+
+  /** Cylinder (0-based) whose visuals run the flow tracers and carry the chamber light. */
+  get featuredCylinder(): number {
+    return this.visuals.featured;
+  }
+
+  /**
+   * Feature another cylinder (clamped): its visuals take over the flow tracers and the chamber light;
+   * only the previous and the new featured cylinder's visuals are rebuilt (render mode and cut region
+   * carried over). Throws (leaving everything as it was) if a replacement cannot be built.
+   */
+  setFeaturedCylinder(index: number): void {
+    if (this.disposed) return;
+    if (this.visuals.setFeatured(index, this.conductor.view.mode)) this.engine.root.updateMatrixWorld(true);
+  }
+
   /** World bounds of the mechanism (for Stage.fitToBounds). */
   bounds(): THREE.Box3 {
     this.engine.root.updateMatrixWorld(true);
@@ -128,10 +143,7 @@ export class EngineSession {
     this.disposed = true;
     this.ui.dispose();
     this.sim.dispose();
-    for (const g of this.gas) {
-      g.root.removeFromParent();
-      g.dispose();
-    }
+    this.visuals.dispose();
     this.engine.root.removeFromParent();
     this.engine.dispose();
   }

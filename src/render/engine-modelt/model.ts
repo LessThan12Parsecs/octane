@@ -8,6 +8,7 @@
  *              curve learned from cylinder 1 (the cam model until learned)
  *   tappets ride their lobes (cam geometry at θ/2), so lobe and tappet always touch
  *   setControls(op): sparkAdvanceDeg → timer case, throttle → carburettor butterfly
+ * cutRegion(i) hands the in-cylinder visuals the housings' cut-away quadrant in cylinder i's frame.
  * The compression ratio is fixed (setCompressionRatio is a no-op, chamberShift 0).
  *
  * Frames: `root` = ROOT/world. cylinderFrames[i] = the physics L-head cylinder frame of cylinder i
@@ -22,6 +23,7 @@ import { cylinderAngleDeg } from '../../physics/core/engine-spec';
 import type { OperatingPoint } from '../../physics/core/operating-point';
 import type { EngineSnapshot } from '../../physics/core/snapshot';
 import { throttlePlateAngle } from '../../physics/gas-exchange/throttle';
+import type { CutPlanes } from '../combustion/index';
 import type { EngineRenderModel } from '../engine-model';
 import type { CameraView } from '../engine/index';
 import { LiftProfileLearner } from '../engine/cam-profile';
@@ -59,6 +61,8 @@ export class ModelTEngineModel implements EngineRenderModel {
   private readonly input: ModelTKinematicInput;
   private readonly _pose: ModelTPose;
   private readonly learners: [LiftProfileLearner, LiftProfileLearner] = [new LiftProfileLearner(), new LiftProfileLearner()];
+  /** Per cylinder: the housings' cut-away quadrant in that cylinder's frame (see cutRegion). */
+  private readonly cutPlanes: readonly CutPlanes[];
   private cutaway = true;
 
   constructor(spec: EngineSpec, op?: Partial<OperatingPoint>) {
@@ -81,6 +85,12 @@ export class ModelTEngineModel implements EngineRenderModel {
       frames.push(f);
     }
     this.cylinderFrames = frames;
+    // The block/head/pan/cover quadrant {cutSide·x > 0, z > cutZ} (ROOT; FrameSet at z = cutZ) in each
+    // cylinder frame p_ROOT = (x, cylOriginY + y, axisZ[i] + s_z·z), s_z = −1 where mirrored.
+    this.cutPlanes = frames.map((_, i): CutPlanes => [
+      [L.cutSide, 0, 0, 0],
+      [0, 0, L.mirror[i] ? -1 : 1, L.cutZ - L.axisZ[i]],
+    ]);
 
     // ---- static housings: block + head (+ pan, cover, manifolds) and the transmission cover ----
     const set = new FrameSet([0, 0, L.cutZ]);
@@ -226,6 +236,16 @@ export class ModelTEngineModel implements EngineRenderModel {
     this.blockSet.cut.visible = on;
     this.bellSet.full.visible = !on;
     this.bellSet.cut.visible = on;
+  }
+
+  /**
+   * The cut-away region in cylinder `cylinder`'s frame for CombustionVisuals.setCutRegion: the removed
+   * quadrant of block and head, {p : n·p > d for both planes}; null while the cutaway is off (and for an
+   * index outside the engine). The transmission-cover half section is far from every chamber and is not
+   * included. The returned planes are shared; do not modify them.
+   */
+  cutRegion(cylinder: number): CutPlanes | null {
+    return this.cutaway ? (this.cutPlanes[cylinder] ?? null) : null;
   }
 
   cameraView(framing: 'engine' | 'chamber', cylinder = 0): CameraView {

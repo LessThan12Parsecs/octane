@@ -80,6 +80,7 @@ export class UIController {
   private pending: Partial<OperatingPoint> | null = null;
   private flushHandle = 0;
   private readonly ro: ResizeObserver | null = null;
+  private hudSizeHandle = 0;
   private disposed = false;
   private lastAdvance = NaN;
   private lastMarker = NaN;
@@ -166,7 +167,14 @@ export class UIController {
 
     if (typeof ResizeObserver !== 'undefined') {
       this.ro = new ResizeObserver(() => {
-        document.documentElement.style.setProperty('--oct-hud-h', `${Math.ceil(this.hud.el.offsetHeight)}px`);
+        // On the next frame: the variable re-lays out the page, which inside the observer callback trips
+        // the browser's "ResizeObserver loop completed with undelivered notifications" error.
+        if (this.hudSizeHandle) return;
+        this.hudSizeHandle = requestAnimationFrame(() => {
+          this.hudSizeHandle = 0;
+          if (this.disposed) return;
+          document.documentElement.style.setProperty('--oct-hud-h', `${Math.ceil(this.hud.el.offsetHeight)}px`);
+        });
       });
       this.ro.observe(this.hud.el);
     }
@@ -294,6 +302,7 @@ export class UIController {
     this.disposed = true;
     window.removeEventListener('keydown', this.onKey);
     if (this.flushHandle) cancelAnimationFrame(this.flushHandle);
+    if (this.hudSizeHandle) cancelAnimationFrame(this.hudSizeHandle);
     this.ro?.disconnect();
     this.traces.dispose();
     this.cycles.dispose();
