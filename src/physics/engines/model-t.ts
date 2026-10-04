@@ -291,6 +291,11 @@ export const MODEL_T_LAYOUT: CylinderLayoutSpec = {
  * 30 × 3-1/2 in rear tyres, rolling radius ≈ 0.379 m (Ford: 40 rpm per mph in high [FSB dyno table]).
  * UNVERIFIED: driveline efficiency 0.8 (chassis vs engine dyno: 15.1 hp at the wheels vs ≈ 20 hp
  * [Tulsa]); C_rr 0.012 (0.01–0.015 high-pressure tyres); C_d·A 1.86 m² (open car, C_d 0.8 × 2.32 m²).
+ * Checks with the 'vehicle' load model (mechanics/load.test.ts): 40.96 rpm/mph in high; reflected inertia
+ * 9.8 kg m² in high (15× J_rot), 1.3 kg m² in low; top speed on Ford's WOT torque curve 44.1 mph at 1806 rpm
+ * (target 42–45 mph at ≈ 1720–1845 rpm); with Tulsa's 850 kg / C_rr 0.01 it reproduces their Ford-curve
+ * road calculation (44.6 / 34.3 / 28.7 mph level / 5 % / 6.7 % vs 45 / 35 / 30; 8.1 % maximum grade in high).
+ * Wheel rotary inertia (≈ 4 % of the car's mass, UNVERIFIED) is not in VehicleSpec (LoadModel option).
  */
 export const MODEL_T_VEHICLE: VehicleSpec = {
   mass: 900,
@@ -316,10 +321,19 @@ export const MODEL_T_OIL_TEMPERATURE = 343.15;
  * 2-3/16, 3-1/8 in (mean used); rod bearings 1.495–1.505 in long [DB23; Page29 p. 403]; 3 cam bearings,
  * 8 valves, flat (mushroom) followers acting directly on the stems [DB23]; 3 rings (2 compression + 1 oil)
  * = PNH's basis [Dyke24]. No oil pump, no water pump; the belt fan and (1919+) generator are the only
- * auxiliaries → auxiliaryFactor UNVERIFIED 0.3. valvetrain: PNH has no side-valve type; 'SOHC-direct'
- * (direct-acting flat follower, no rocker or pushrod) is the closest — UNVERIFIED mapping. PNH was fitted
- * on 1980s engines at ≳ 1000 rpm: the FMEP of a babbitt-bearing 1920s engine at 400–2000 rpm is an
- * extrapolation (model-only).
+ * auxiliaries → auxiliaryFactor UNVERIFIED 0.3. valvetrain 'L-head' (mechanics/friction.ts): PNH has no
+ * side-valve type; it maps to the direct-acting flat-follower constants (no rocker or pushrod) — UNVERIFIED
+ * mapping; the Model T's light valve springs (24–28 lb installed) suggest even less. PNH was fitted on 1980s
+ * engines at ≳ 1000 rpm: the FMEP of a babbitt-bearing 1920s engine at 400–2000 rpm is an extrapolation
+ * (model-only). Result (WOT, p_i = p_a): 0.60 / 0.58 / 0.66 / 0.73 bar at 400 / 1000 / 1600 / 2000 rpm
+ * (piston group ≈ 60–70 %), η_m 0.85 / 0.89 / 0.85 / 0.76 against Ford's WOT brake table. Consistent with that
+ * table only if the WOT net IMEP is 0.33 / 0.45 / 0.37 / 0.26 of the ideal fuel–air-cycle IMEP (12.0 bar for a
+ * full cylinder at CR 3.98, φ 1.15, 330 K, 0.95 bar; Cantera, tools/reference/cycle_fuel_air_oracle.py), e.g.
+ * volumetric efficiency ≈ 0.45–0.65 at 400–1600 rpm with η_i ≈ 0.75 η_fa; the period ALAM/SAE rating
+ * assumption (η_m 0.75 at 1000 ft/min [Good22 pp. 37–38]) would mean ≈ 1.37 bar at 1500 rpm, about twice PNH.
+ * Not in PNH and included in Ford's data (measured at the transmission output [Tulsa]): churning of the
+ * magneto flywheel and the planetary gear in the oil bath, and the wide (1/4 in) cast-iron rings. Decide any
+ * extra loss against the cycle model's own WOT IMEP, not here (friction.test.ts prints the comparison).
  */
 export const MODEL_T_FRICTION: PnhFrictionInputs = {
   bore: BORE,
@@ -331,7 +345,7 @@ export const MODEL_T_FRICTION: PnhFrictionInputs = {
   camBearings: 3,
   valves: 8,
   maxValveLift: VALVE_LIFT,
-  valvetrain: 'SOHC-direct',
+  valvetrain: 'L-head',
   follower: 'flat',
   ringTensionFactor: 1,
   auxiliaryFactor: 0.3,

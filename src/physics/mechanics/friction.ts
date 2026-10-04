@@ -40,8 +40,13 @@
  *    torque; ring friction as a Coulomb-type force of constant magnitude opposing
  *    piston motion (crank torque F_c|dx/dθ|); piston-skirt friction as a viscous
  *    force ∝ piston velocity. All are normalised so that the cycle-mean torque
- *    equals FMEP·V_d/(4π) (four-stroke, per cylinder) at the reference speed, up to the
- *    sign smoothing 1 − ω/√(ω² + ε²) (3e-5 at 600 rpm with ε = 0.5 rad/s).
+ *    equals FMEP·V_d,total/(4π) (four-stroke; FMEP is the whole-engine value PNH returns,
+ *    V_d,total = N·V_d) at the reference speed, up to the sign smoothing
+ *    1 − ω/√(ω² + ε²) (3e-5 at 600 rpm with ε = 0.5 rad/s). For N cylinders the constant
+ *    part carries the total displacement and the piston terms act on every cylinder at
+ *    its own phase: T = −sgn(ω)[T_c + F_c Σ_i|x′(θ_i)|] − c_v Σ_i x′(θ_i)² ω with the
+ *    per-cylinder F_c and c_v of the single-cylinder normalisation (⟨|x′|⟩ and ⟨x′²⟩ do
+ *    not depend on the phase, so the cycle mean is exact for any firing offsets).
  *    The Coulomb term F_c|x′| has a slope discontinuity (not a jump) in θ at TDC/BDC,
  *    where the piston reverses — physical, and harmless for an explicit RK integrator.
  *    Modelling choice (documented, not from PNH): ring gas-loading friction is
@@ -59,8 +64,11 @@ const KPA = 1e3;
 /** m → mm. */
 const MM = 1e3;
 
-/** Valvetrain layouts of PNH (Sandoval 2002, Table 4.2). */
-export type ValvetrainType = 'SOHC-finger' | 'SOHC-rocker' | 'SOHC-direct' | 'DOHC-finger' | 'DOHC-direct' | 'OHV';
+/**
+ * Valvetrain layouts of PNH (Sandoval 2002, Table 4.2), plus 'L-head' (side valves: cam in the block
+ * lifting each valve directly through a flat-footed "mushroom" tappet; no pushrod, no rocker).
+ */
+export type ValvetrainType = 'SOHC-finger' | 'SOHC-rocker' | 'SOHC-direct' | 'DOHC-finger' | 'DOHC-direct' | 'OHV' | 'L-head';
 
 /**
  * PNH valvetrain constants [C_ff flat follower (kPa·mm), C_rf roller follower
@@ -71,6 +79,14 @@ export type ValvetrainType = 'SOHC-finger' | 'SOHC-rocker' | 'SOHC-direct' | 'DO
  * clearly a typo (the other C_rf are 0.005–0.0227; 0.5 would give an OHV roller follower
  * ≈ 30× the SOHC value); set to NaN here — use flat followers for OHV (the CFR has
  * flat tappets).
+ * UNVERIFIED mapping 'L-head' = 'SOHC-direct' (PNH has no side-valve type). Reasoning: a side valve is
+ * opened by a flat tappet sliding in a block bore and bearing directly on the valve stem — one
+ * cam/flat-follower contact per valve at a motion ratio of 1, the follower side load taken by the
+ * tappet bore, and the stem in a plain guide — which is the kinematics of a direct-acting (bucket)
+ * follower, not of the OHV train (lifter + pushrod + rocker, motion ratio ≈ 1.5, extra pivots: C_ff 400,
+ * C_om 32.1). PNH's constants embed 1980s spring loads; a light-spring engine (Ford Model T: 24–28 lb
+ * installed, ≈ 32 lb open [Ford drawing T-431; Ford Service par. 258]) probably has less valvetrain
+ * friction than this, a heavy-spring flathead more.
  */
 export const PNH_VALVETRAIN_CONSTANTS: Readonly<Record<ValvetrainType, readonly [number, number, number, number]>> = {
   'SOHC-finger': [600, 0.0227, 0.2, 42.8],
@@ -79,6 +95,7 @@ export const PNH_VALVETRAIN_CONSTANTS: Readonly<Record<ValvetrainType, readonly 
   'DOHC-finger': [600, 0.0227, 0.2, 25.8],
   'DOHC-direct': [133, 0.005, 0.5, 10.7],
   OHV: [400, Number.NaN, 0.5, 32.1],
+  'L-head': [200, 0.0076, 0.5, 10.7],
 };
 
 /** Reference kinematic viscosity of the PNH calibration oil (10W-30 at 90 °C), cSt (Sandoval 2002 §3.2). */
@@ -299,24 +316,30 @@ export function meanFrictionTorque(fmep: number, displacedVolume: number): numbe
  * Instantaneous friction torque on the crank, distributed over the cycle
  * (see file header, item 3). Allocation-free after construction.
  *
- *   T_f(θ, ω) = −sgn(ω)·[T_c + F_c |x′|] − c_v x′² ω
+ *   T_f(θ, ω) = −sgn(ω)·[T_c + F_c Σ_i |x′_i|] − c_v Σ_i x′_i² ω
  *
- * T_c: constant part (bearings, valvetrain, auxiliaries); F_c: Coulomb-type piston
- * friction force (ring tension + ring gas loading, mixed/boundary lubrication);
- * c_v: viscous piston-skirt coefficient (hydrodynamic, force ∝ piston velocity, so
- * its FMEP ∝ S̄p as in PNH). x′ = dx/dθ from the kinematics.
+ * T_c: constant part (bearings, valvetrain, auxiliaries) of the whole engine; F_c: Coulomb-type
+ * piston friction force per cylinder (ring tension + ring gas loading, mixed/boundary lubrication);
+ * c_v: viscous piston-skirt coefficient per cylinder (hydrodynamic, force ∝ piston velocity, so
+ * its FMEP ∝ S̄p as in PNH). x′_i = dx/dθ of cylinder i at its own phase (single cylinder: the
+ * kinematics' dx/dθ). Single-cylinder engines may use `torque(x′, ω)`; engines with N > 1 must use
+ * `torqueCylinders` (one x′ would apply one piston's friction only).
  */
 export class FrictionTorqueModel {
-  /** Constant (crank-angle-independent) friction torque magnitude T_c, N m. */
+  /** Constant (crank-angle-independent) friction torque magnitude T_c of the whole engine, N m. */
   constantTorque = 0;
-  /** Coulomb-type piston friction force magnitude F_c, N. */
+  /** Coulomb-type piston friction force magnitude F_c per cylinder, N. */
   coulombForce = 0;
-  /** Viscous piston friction coefficient c_v (force = c_v·dx/dt), N s/m. */
+  /** Viscous piston friction coefficient c_v per cylinder (force = c_v·dx/dt), N s/m. */
   viscousCoefficient = 0;
   /** Speed below which the Coulomb sign is smoothed, rad/s (avoids a discontinuity at ω = 0). */
   smoothingOmega: number;
+  /** Number of cylinders N (identical, sharing the slider-crank). */
+  readonly cylinders: number;
   /** Displaced volume per cylinder, m³. */
   readonly displacedVolume: number;
+  /** Displaced volume of the engine N·V_d, m³ (the FMEP normalisation volume). */
+  readonly totalDisplacedVolume: number;
   /** ⟨|x′|⟩ over a revolution = travel/π, m. */
   readonly meanAbsDxdTheta: number;
   /** ⟨x′²⟩ over a revolution, m². */
@@ -325,10 +348,15 @@ export class FrictionTorqueModel {
   /**
    * @param kin the engine's slider-crank (for the cycle normalisation of the piston terms)
    * @param smoothingOmega sign smoothing speed, rad/s
+   * @param cylinders number of identical cylinders (EngineSpec.cylinders); FMEPs passed to setFmep /
+   *   setFromPnh are whole-engine values normalised by N·V_d
    */
-  constructor(kin: SliderCrank, smoothingOmega = 0.5) {
+  constructor(kin: SliderCrank, smoothingOmega = 0.5, cylinders = 1) {
+    if (!(Number.isInteger(cylinders) && cylinders >= 1)) throw new RangeError('FrictionTorqueModel: cylinders must be an integer ≥ 1');
     this.smoothingOmega = smoothingOmega;
+    this.cylinders = cylinders;
     this.displacedVolume = kin.displacedVolume;
+    this.totalDisplacedVolume = kin.displacedVolume * cylinders;
     this.meanAbsDxdTheta = kin.pistonTravel / Math.PI;
     // periodic integrand → the rectangle rule is spectrally accurate
     const n = 2048;
@@ -341,13 +369,14 @@ export class FrictionTorqueModel {
   }
 
   /**
-   * Set the friction level from FMEP components (Pa) evaluated at crank speed
-   * `omegaRef` (rad/s). Each component's cycle-mean torque equals fmep·V_d/(4π) at ω = omegaRef:
-   *   T_c = fmep_c V_d/(4π),  F_c = fmep_coul V_d/(4π⟨|x′|⟩),  c_v = fmep_visc V_d/(4π ω_ref ⟨x′²⟩).
+   * Set the friction level from whole-engine FMEP components (Pa) evaluated at crank speed
+   * `omegaRef` (rad/s). Each component's cycle-mean torque equals fmep·N·V_d/(4π) at ω = omegaRef:
+   *   T_c = fmep_c N V_d/(4π),  F_c = fmep_coul V_d/(4π⟨|x′|⟩),  c_v = fmep_visc V_d/(4π ω_ref ⟨x′²⟩)
+   * (the per-cylinder piston terms act N times, once per cylinder).
    */
   setFmep(fmepConstant: number, fmepCoulomb: number, fmepViscous: number, omegaRef: number): void {
     const k = this.displacedVolume / (4 * Math.PI);
-    this.constantTorque = fmepConstant * k;
+    this.constantTorque = fmepConstant * (this.totalDisplacedVolume / (4 * Math.PI));
     this.coulombForce = (fmepCoulomb * k) / this.meanAbsDxdTheta;
     this.viscousCoefficient = (fmepViscous * k) / (Math.abs(omegaRef) * this.meanSqDxdTheta);
   }
@@ -358,7 +387,8 @@ export class FrictionTorqueModel {
   }
 
   /**
-   * Friction torque on the crank in the rotation direction, N m (negative for ω > 0).
+   * Friction torque on the crank in the rotation direction, N m (negative for ω > 0), of a
+   * SINGLE-cylinder engine (cylinders = 1; use torqueCylinders otherwise).
    * @param dxdTheta kinematic dx/dθ at the current angle (SliderCrank.dxdTheta), m/rad
    * @param omega crank angular velocity, rad/s
    */
@@ -366,5 +396,27 @@ export class FrictionTorqueModel {
     const e = this.smoothingOmega;
     const coul = this.constantTorque + this.coulombForce * Math.abs(dxdTheta);
     return (-coul * omega) / Math.sqrt(omega * omega + e * e) - this.viscousCoefficient * dxdTheta * dxdTheta * omega;
+  }
+
+  /**
+   * Friction torque of all cylinders on the crank in the rotation direction, N m (negative for ω > 0):
+   *   T = −sgn_ε(ω)[T_c + F_c Σ_i |x′_i|] − Σ_i c_v x′_i² ω
+   * Bit-identical to `torque(x′, ω)` for one cylinder.
+   * @param dxdThetas per-cylinder dx/dθ at each cylinder's own phase, m/rad (first `cylinders` entries
+   *   used; MultiCylinderCrankTrain.update(θ) returns exactly this array)
+   * @param omega crank angular velocity, rad/s
+   */
+  torqueCylinders(dxdThetas: ArrayLike<number>, omega: number): number {
+    const e = this.smoothingOmega;
+    const cv = this.viscousCoefficient;
+    let sa = 0;
+    let sv = 0;
+    for (let i = 0; i < this.cylinders; i++) {
+      const d = dxdThetas[i];
+      sa += Math.abs(d);
+      sv += cv * d * d;
+    }
+    const coul = this.constantTorque + this.coulombForce * sa;
+    return (-coul * omega) / Math.sqrt(omega * omega + e * e) - sv * omega;
   }
 }
