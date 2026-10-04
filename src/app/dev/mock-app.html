@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Octane · mock-stream app (dev)</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0b0e12; }
+      #dev-badge { position: fixed; right: 8px; bottom: 6px; z-index: 50; font: 11px ui-monospace, Menlo, monospace; color: #f5b86a; pointer-events: none; text-shadow: 0 0 3px #000; }
+    </style>
+  </head>
+  <body>
+    <main class="oct-viewport" id="viewport" aria-label="3D engine view"></main>
+    <div id="ui"></div>
+    <div id="dev-badge">DEV · synthetic stream (no physics)</div>
+    <script type="module" src="./mock-app.ts"></script>
+  </body>
+</html>

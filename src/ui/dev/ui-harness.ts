@@ -4,7 +4,8 @@
  * Mimics the SimClient contract loosely: raw snapshots at an adaptive cadence
  * (finer around the spark and knock), played back at timeScale × wall time.
  * ?engine=ford-model-t drives the multi-cylinder UI from MultiMockStream (phase-shifted
- * single-cylinder cartoons with a trembler-shower cartoon).
+ * single-cylinder cartoons with a trembler-shower cartoon). The same streams drive the whole app — real
+ * 3D model and in-cylinder visuals included — in src/app/dev/mock-app.html.
  */
 import '../../style.css';
 import { CFR_F1 } from '../../physics/engines/cfr';

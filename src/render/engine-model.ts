@@ -12,6 +12,7 @@ import type * as THREE from 'three';
 import type { EngineSpec } from '../physics/core/engine-spec';
 import type { OperatingPoint } from '../physics/core/operating-point';
 import type { EngineSnapshot } from '../physics/core/snapshot';
+import type { CutPlanes } from './combustion/index';
 import { EngineModel, recommendedCameraView, type CameraView } from './engine/index';
 
 export type { CameraView } from './engine/index';
@@ -32,6 +33,13 @@ export interface EngineRenderModel {
   /** No-op for fixed-CR engines. */
   setCompressionRatio(cr: number): void;
   setCutaway(on: boolean): void;
+  /**
+   * The cut-away region of the housings in cylinder `cylinder`'s frame (0-based), for the in-cylinder
+   * visuals (CombustionVisuals.setCutRegion): {p : n·p > d for every plane [nx, ny, nz, d]}, mirrored
+   * frames included; null while the cutaway is off. Optional: engines whose chamber is convex (the CFR
+   * disc) need not provide it, and the app then never sets a cut region.
+   */
+  cutRegion?(cylinder: number): CutPlanes | null;
   /** Camera framing: 'engine' = whole machine, 'chamber' = close-up of cylinder `cylinder` (0-based, default 0). */
   cameraView(framing: 'engine' | 'chamber', cylinder?: number): CameraView;
   /** Vertical shift of the chamber when the CR changes from `previous` to `cr`, m (0 for fixed-CR engines). */

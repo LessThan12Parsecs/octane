@@ -4,6 +4,7 @@ export {
   Conductor,
   GasFanOut,
   type ConductorHooks,
+  type CylinderGasPort,
   type GasPort,
   type MechanismPort,
   type PlaybackState,
@@ -11,6 +12,7 @@ export {
   type UiPort,
   type ViewState,
 } from './conductor';
+export { CylinderVisuals, type CylinderFrameHost } from './cylinder-visuals';
 export { engineChoices, initialOperatingPoint, isEngineId, resolveEngine } from './engines';
 export { ViewportOverlay, type EngineChoice, type StatusAction } from './overlay';
 export { EngineSession, type EngineSessionOptions } from './session';

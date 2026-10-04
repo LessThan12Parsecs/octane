@@ -175,9 +175,22 @@ function lerpOpt(x: number | undefined, y: number | undefined, u: number): numbe
 }
 
 /**
+ * True when the spark record of `b` belongs to a later ignition event than `a`'s: the cumulative
+ * per-event breakdown counter (snapshot.ts spark.breakdownCount, reset at the next event's dwell / timer
+ * make) went DOWN. Streams without the counter (the CFR) never report a restart.
+ */
+export function sparkEventRestarted(a: EngineSnapshot['spark'], b: EngineSnapshot['spark']): boolean {
+  const na = a.breakdownCount;
+  const nb = b.breakdownCount;
+  return na !== undefined && nb !== undefined && nb < na;
+}
+
+/**
  * Per-cylinder fields of a → b into `out`: scalars linear, discrete fields (phase, flame stage, spark
  * phase and the trembler flags/counters, autoignited) from `d`, the sample on the same side of this
- * cylinder's cycle wrap as the interpolated angle.
+ * cylinder's cycle wrap as the interpolated angle. The spark record is the exception across an ignition
+ * event restart (sparkEventRestarted: its discrete fields come from b, the new event, once past a) and its
+ * cumulative energyDelivered is never blended across a decrease (it takes b's value).
  */
 function lerpCylinderFields(a: CylinderFields, b: CylinderFields, d: CylinderFields, u: number, out: CylinderFields): void {
   out.pistonDisplacement = lerp(a.pistonDisplacement, b.pistonDisplacement, u);
@@ -211,13 +224,19 @@ function lerpCylinderFields(a: CylinderFields, b: CylinderFields, d: CylinderFie
 
   const sa = a.spark;
   const sb = b.spark;
-  const sd = d.spark;
+  // A new ignition event between a and b (sparkEventRestarted): the spark record's discrete state is
+  // the NEW event's, so phase, counters and timer/points flags stay one consistent event.
+  const restarted = u > 0 && sparkEventRestarted(sa, sb);
+  const sd = restarted ? sb : d.spark;
   const so = out.spark;
   so.phase = sd.phase;
   so.primaryCurrent = lerp(sa.primaryCurrent, sb.primaryCurrent, u);
   so.secondaryVoltage = lerp(sa.secondaryVoltage, sb.secondaryVoltage, u);
   so.secondaryCurrent = lerp(sa.secondaryCurrent, sb.secondaryCurrent, u);
-  so.energyDelivered = lerp(sa.energyDelivered, sb.energyDelivered, u);
+  // Cumulative per-event counter: never blended across its restart (a blend would invent delivered
+  // energy that consumers differencing the counter — render/combustion/state.ts — would draw).
+  so.energyDelivered =
+    restarted || (u > 0 && sb.energyDelivered < sa.energyDelivered) ? sb.energyDelivered : lerp(sa.energyDelivered, sb.energyDelivered, u);
   so.breakdownVoltage = lerp(sa.breakdownVoltage, sb.breakdownVoltage, u);
   so.breakdownCount = sd.breakdownCount;
   so.pointsOpen = sd.pointsOpen;
@@ -268,7 +287,9 @@ export function interpolateCylinder(a: CylinderSnapshot, b: CylinderSnapshot, al
  * linear for scalars, wrap-aware for thetaDeg; discrete fields (phase, flame
  * stage, spark phase, autoignited) and `cycle` come from the earlier sample —
  * or from the later one when the interpolated angle has crossed the cycle wrap,
- * so the result is always consistent with its own (cycle, thetaDeg).
+ * so the result is always consistent with its own (cycle, thetaDeg). The
+ * spark record's per-event counters are never blended across an ignition-event
+ * restart (lerpCylinderFields).
  *
  * Multi-cylinder streams: `cylinders[i]` is interpolated the same way, each with its own cycle wrap
  * (into `out.cylinders`, preallocated by createEmptySnapshot(n); allocated once here otherwise).
@@ -514,6 +535,11 @@ export class SimClient {
   readonly ready: Promise<void>;
 
   private readonly worker: WorkerLike;
+  private readonly spec: EngineSpec;
+  /** The operating point the simulator was started with, with every patch since merged in. */
+  private op: OperatingPoint;
+  /** The simulator could not be constructed (error before 'ready'): reset() re-initialises it. */
+  private initFailed = false;
   private readonly options: SimulatorOptions;
   private readonly historyCycles: number;
   private readonly aheadWall: number;
@@ -541,6 +567,8 @@ export class SimClient {
   private _error: string | null = null;
 
   constructor(spec: EngineSpec, op: OperatingPoint, options: SimulatorOptions, config: SimClientConfig = {}) {
+    this.spec = spec;
+    this.op = { ...op };
     this.options = { ...options };
     this.historyCycles = Math.max(1, config.historyCycles ?? 4);
     this.aheadWall = Math.max(0, config.aheadWallSeconds ?? 0.5);
@@ -603,12 +631,18 @@ export class SimClient {
   }
 
   setOperatingPoint(patch: Partial<OperatingPoint>): void {
+    this.op = { ...this.op, ...patch };
     this.post({ type: 'set-operating-point', patch });
   }
 
-  /** Restart the simulation at t = 0; buffered data and pending summaries are discarded. */
+  /**
+   * Restart the simulation at t = 0; buffered data and pending summaries are discarded. If the simulator
+   * could not be constructed (an engine/operating-point combination it rejects), the worker is asked to
+   * construct it again with the current operating point instead (e.g. after picking a supported preset).
+   */
   reset(): void {
-    this.post({ type: 'reset' });
+    const reinit = this.initFailed;
+    this.initFailed = false;
     this.buffer.clear();
     this.pendingCycles = [];
     this.lastEmitted = [];
@@ -616,6 +650,9 @@ export class SimClient {
     this._starved = false;
     this.awaitingReady = true;
     this.lastDemand = NaN;
+    // Posted after the local reset, so a transport that answers synchronously (tests) keeps its 'ready'.
+    if (reinit) this.post({ type: 'init', spec: this.spec, operatingPoint: this.op, options: this.options });
+    else this.post({ type: 'reset' });
     this.maybeDemand(true);
   }
 
@@ -732,7 +769,10 @@ export class SimClient {
 
   private reportError(message: string): void {
     if (this._error === null) this._error = message;
-    if (!this.isReady) this.rejectReady(new Error(message));
+    if (!this.isReady) {
+      this.initFailed = true; // before 'ready': the simulator could not be constructed
+      this.rejectReady(new Error(message));
+    }
     for (const cb of this.errorListeners) cb(message);
   }
 
