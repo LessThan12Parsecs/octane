@@ -58,14 +58,26 @@
  * ∫Hψ_iψ_j dA = V⟨ψ_iψ_j⟩, so the Galerkin projection above holds with volume means (⟨ψ_j⟩_eg =
  * (1/V_eg)∫H_eg ψ_j dA, H_eg the end-gas length of each column). With a constant depth it is the disc
  * problem exactly (tested: α_mn within 0.2 %, GridModeSet). The approximation degrades where a depth step
- * meets a short wavelength: the Model T modes above ≈ 15 kHz are qualitative. Not modelled: the
- * inertance of the window between the bore column and the pocket (at TDC the crown stands 7.9 mm above
- * the deck, leaving a ≈ 5 mm opening between 25.4 and 12.9 mm tall columns) — an O(kH) end correction that
- * would lower the bore↔pocket modes by an estimated few per cent (UNVERIFIED estimate: slit end
- * correction ≈ 2–5 mm per side on a ≈ 140 mm half-wavelength).
- * Model T (engines/model-t.ts, at TDC): fundamental α = 1.20, f = α c/(πB) = 3.8 kHz at c = 950 m/s (the
- * bore's own (1,0) mode would ring at 5.8 kHz), a bore↔pocket sloshing mode largest at the plug; 26 modes
- * up to α 7.1. Grid modes are damped by the same δ ∝ √ω law with α_ref = the bore's α_10 (the decay rate
+ * meets a short wavelength: the Model T modes above ≈ 15 kHz are qualitative.
+ * WINDOW JUNCTIONS: where two columns meet only through an opening lower than both (the L-head at TDC: the
+ * crown stands 7.9 mm above the deck, so the 25.4 mm bore column and the 12.9 mm pocket share a ≈ 5 mm window
+ * across the bore circle, the rest of the pocket's side facing the piston), the flow contracts through the
+ * window, and the inertance of its near field is missing from the long-wave equations (ψ and H ∂ψ/∂n
+ * continuous). It enters as the junction condition [ψ] = r H ∂ψ/∂n with the dimensionless junction resistance r
+ * of the vertical section (windowResistance: a variational solution of the 2-D potential flow; Model T r = 1.23
+ * at TDC, 0.85 at 15° ATDC, i.e. a throat ≈ 6 mm long at the window height), applied on the grid as a series
+ * resistance on the faces between bore-side and pocket-side cells (ChamberPlanform.interfaceResistance). A 3-D
+ * finite-volume Helmholtz solve of the same flat-roofed columns (no depth averaging;
+ * tools/reference/chemistry_knock_lhead_modes.py) measures the effect: without the window term the Model T
+ * fundamental came out 17.5 % high at TDC (13 % at 15° ATDC), α_3 and α_4 6–7 % and α_2, α_5 2 % high; with it
+ * α_1…α_5 lie within 1 % of the 3-D values at both depths (the depth-averaged model on the 3-D solve's own
+ * staircase within 0.4 %). The static (k → 0) r serves every mode: the near field's decay rates
+ * √((nπ/H)² − k²) make the true r grow with frequency, an effect inside that 3-D agreement for α ≤ 3.1.
+ * Model T (engines/model-t.ts, at TDC): fundamental α = 1.03, f = α c/(πB) = 3.3 kHz at c = 950 m/s
+ * (2.8–3.5 kHz for c = 800–1000 m/s; the bore's own (1,0) mode would ring at 5.8 kHz), a bore↔pocket sloshing
+ * mode largest at the plug; 27 modes up to α 7.1. At 15° ATDC the window has opened to 7.2 mm and the
+ * fundamental is 5 % higher (the 3-D solve: +5 %; the depth-averaged model without the window term: +1 %).
+ * Grid modes are damped by the same δ ∝ √ω law with α_ref = the bore's α_10 (the decay rate
  * is the same function of frequency as the CFR's); the side-valve chamber's larger surface/volume ratio
  * would raise boundary-layer losses (UNVERIFIED, not modelled).
  *
@@ -1202,6 +1214,17 @@ export interface ChamberPlanform {
    * depth step), m: grid cells farther than this from every boundary are uniform.
    */
   boundaryDistance(x: number, z: number): number;
+  /**
+   * Optional: the lumped junction resistance (dimensionless) between regions r0 and r1 across a grid face at
+   * (x, z) whose normal is the unit vector (ex, ez). Where two regions join through a window lower than the
+   * columns it connects (windowResistance: the L-head's bore column and valve pocket), the long-wave model
+   * needs a series resistance r per unit junction length on top of ∫ds/H; the face gets r/|n·e| (n: the
+   * junction's unit normal there) — the path length of the face's centre-to-centre line through a thin
+   * resistive layer — so that a uniform flux across a straight junction meets exactly r per unit length on any
+   * grid (per unit junction length a staircase crosses |n_x|/Δ x-faces and |n_z|/Δ z-faces: Σ n_e² = 1).
+   * 0 for an ordinary depth step. Absent: every region boundary is an ordinary depth step.
+   */
+  interfaceResistance?(r0: number, r1: number, x: number, z: number, ex: number, ez: number): number;
 }
 
 /** The flat-disc chamber of radius R and depth h (head face y = 0) as a ChamberPlanform. */
@@ -1234,11 +1257,123 @@ export function roundedRectDistance(x: number, z: number, xMin: number, xMax: nu
   return Math.hypot(Math.max(qx, 0), Math.max(qz, 0)) + Math.min(Math.max(qx, qz), 0) - cornerRadius;
 }
 
+/** Ritz basis size and Gauss–Chebyshev node count of windowResistance (r within ≈ 1e-4 of N = 24, Q = 1024). */
+const WINDOW_RITZ_BASIS = 12;
+const WINDOW_RITZ_NODES = 256;
+
+/**
+ * Junction resistance of two flat gas layers joined through a window, dimensionless: the inertance the
+ * depth-averaged (long-wave) model misses where a column meets a lower opening. In the vertical section normal
+ * to the junction, layer 1 (x < 0) holds gas over lo1 ≤ y ≤ hi1 and layer 2 (x > 0) over lo2 ≤ y ≤ hi2; the
+ * plane x = 0 is a rigid wall of zero thickness except over the window [wLo, wHi] (default: the overlap of the
+ * two layers — the L-head's bore column and valve pocket at a crown above the deck). For an incompressible
+ * potential flow carrying the volume flux q per unit junction length, φ → q x/H_k + C_k far from the junction
+ * in layer k (H_k = hi_k − lo_k), and r = (C_2 − C_1)/q is the potential drop beyond the uniform-layer value:
+ * across the junction the long-wave field keeps H ∂ψ/∂n continuous and jumps by [ψ] = r H ∂ψ/∂n (a series
+ * resistance r: the pressure drop across the junction is ρ r ∂q/∂t, an inertance ρ r per unit length).
+ * Method (Thomson's principle — the potential flow has the least kinetic energy among flows of the same flux):
+ * r = min E(u) over window velocity profiles u(y) with ∫u dy = 1, where E(u) = ∫∫ u(y) u(y′) [G_1 + G_2] dy dy′
+ * is the energy of the evanescent fields u drives into the two layers and
+ * G_k(y, y′) = −(1/π)[ln|2 sin(π(y − y′)/2H_k)| + ln|2 sin(π(y + y′ − 2 lo_k)/2H_k)|] is the layer's Neumann
+ * Green's function (cosine modes e^{−nπ|x|/H_k}; Σ_n cos nθ/n = −ln|2 sin(θ/2)|, Gradshteyn & Ryzhik 1.441.2 —
+ * UNVERIFIED number, from memory). Ritz with u = Σ_j c_j T_j(t)/√(1 − t²), y = mid + half·t: the logarithmic
+ * singularity −(2/π) ln|y − y′| is diagonal in this basis (∫ ln|t − s| T_j(s) ds/√(1 − s²) = −π ln 2 for j = 0,
+ * −(π/j) T_j(t) for j ≥ 1: the classical Chebyshev expansion of the logarithmic kernel, e.g. Mason & Handscomb
+ * 2003, Chebyshev Polynomials — UNVERIFIED section, from memory; the analytic checks below exercise it), the
+ * smooth remainder and the image terms (log-singular at a window edge that meets a layer's floor or roof, a
+ * 3π/2 corner) are integrated by Gauss–Chebyshev quadrature; r = 1/(s·M⁻¹s), s_j = ∫ basis_j dy. The Ritz value
+ * converges from above. Checks (knock-lhead.test.ts, tools/reference/chemistry_knock_lhead_modes.py): a slit in a
+ * zero-thickness diaphragm across one layer (mirror symmetry, equipotential window, exact by conformal mapping:
+ * r = −(2/π) ln[(cos(π y0/H) − cos(π y1/H))/2], (4/π) ln csc(πa/2H) for a slit of height a at one wall) to 1e-5;
+ * independent 2-D finite-volume section solves within 0.3 %. Infinity without a window; 0 when the two layers
+ * coincide and the window spans them. Not a hot-path routine (≈ 10 ms; once per planform).
+ */
+export function windowResistance(lo1: number, hi1: number, lo2: number, hi2: number, wLo = Math.max(lo1, lo2), wHi = Math.min(hi1, hi2)): number {
+  if (!(hi1 > lo1) || !(hi2 > lo2)) throw new RangeError('windowResistance: each layer must have a positive height');
+  if (!(wHi > wLo)) return Infinity;
+  if (wLo < Math.max(lo1, lo2) || wHi > Math.min(hi1, hi2)) throw new RangeError('windowResistance: the window must lie within both layers');
+  if (lo1 === lo2 && hi1 === hi2 && wLo === lo1 && wHi === hi1) return 0;
+  const N = WINDOW_RITZ_BASIS;
+  const Q = WINDOW_RITZ_NODES;
+  const mid = 0.5 * (wLo + wHi);
+  const half = 0.5 * (wHi - wLo);
+  const H1 = hi1 - lo1;
+  const H2 = hi2 - lo2;
+  // Gauss–Chebyshev nodes t_q = cos((q + ½)π/Q) and T_j(t_q) = cos(j (q + ½)π/Q)
+  const T = new Float64Array(N * Q);
+  const y = new Float64Array(Q);
+  for (let q = 0; q < Q; q++) {
+    const th = ((q + 0.5) * Math.PI) / Q;
+    y[q] = mid + half * Math.cos(th);
+    for (let j = 0; j < N; j++) T[j * Q + q] = Math.cos(j * th);
+  }
+  // remainder S(y, y′) = G_1 + G_2 + (2/π) ln|y − y′|; V[j][p] = Σ_q S(y_p, y_q) T_j(t_q)
+  const S = (yp: number, yq: number): number => {
+    const d = yp - yq;
+    let s = 0;
+    for (let k = 0; k < 2; k++) {
+      const H = k === 0 ? H1 : H2;
+      const lo = k === 0 ? lo1 : lo2;
+      const a = (Math.PI * d) / (2 * H);
+      // ln(|2 sin a|/|d|) → ln(π/H) at d = 0 (|d| < 2H inside the window)
+      s -= Math.log(Math.abs(d) > 1e-12 * H ? Math.abs(2 * Math.sin(a)) / Math.abs(d) : Math.PI / H);
+      s -= Math.log(Math.abs(2 * Math.sin((Math.PI * (yp + yq - 2 * lo)) / (2 * H))));
+    }
+    return s / Math.PI;
+  };
+  const V = new Float64Array(N * Q);
+  for (let p = 0; p < Q; p++) {
+    for (let q = 0; q < Q; q++) {
+      const s = S(y[p], y[q]);
+      for (let j = 0; j < N; j++) V[j * Q + p] += s * T[j * Q + q];
+    }
+  }
+  const M = new Float64Array(N * N);
+  const w = (half * Math.PI) / Q;
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j <= i; j++) {
+      let m = 0;
+      for (let p = 0; p < Q; p++) m += T[i * Q + p] * V[j * Q + p];
+      M[i * N + j] = M[j * N + i] = w * w * m;
+    }
+  }
+  // logarithmic part −(2/π) ln|y − y′| = −(2/π)[ln(half) + ln|t − s|]
+  M[0] += -2 * Math.PI * half * half * Math.log(half / 2);
+  for (let j = 1; j < N; j++) M[j * N + j] += (Math.PI * half * half) / j;
+  // r = 1/(s·M⁻¹s), s = (π·half, 0, …): Cholesky of the (positive definite) Ritz matrix, then (M⁻¹)_00
+  for (let j = 0; j < N; j++) {
+    let d = M[j * N + j];
+    for (let k = 0; k < j; k++) d -= M[j * N + k] * M[j * N + k];
+    if (!(d > 0)) throw new Error('windowResistance: Ritz matrix not positive definite');
+    const l = Math.sqrt(d);
+    M[j * N + j] = l;
+    for (let i = j + 1; i < N; i++) {
+      let s = M[i * N + j];
+      for (let k = 0; k < j; k++) s -= M[i * N + k] * M[j * N + k];
+      M[i * N + j] = s / l;
+    }
+  }
+  // (M⁻¹)_00 = |L⁻¹ e_0|²: forward substitution of e_0
+  let inv00 = 0;
+  const z = new Float64Array(N);
+  for (let i = 0; i < N; i++) {
+    let s = i === 0 ? 1 : 0;
+    for (let k = 0; k < i; k++) s -= M[i * N + k] * z[k];
+    z[i] = s / M[i * N + i];
+    inv00 += z[i] * z[i];
+  }
+  return 1 / ((Math.PI * half) ** 2 * inv00);
+}
+
 /**
  * The side-valve chamber of engine-spec.ts LHeadChamberSpec as a ChamberPlanform: region 0 = the bore
  * column x² + z² ≤ (B/2)², −h ≤ y ≤ 0 (h: roof-to-crown depth, default TDC); region 1 = the valve pocket
- * (rounded rectangle minus the bore disc), deckY ≤ y ≤ pocket.roofY. The two connect across the bore
- * circle; in the depth-averaged model only their heights matter (file header).
+ * (rounded rectangle minus the bore disc), deckY ≤ y ≤ pocket.roofY. The two connect across the arc of the bore
+ * circle inside the pocket outline, only through the window max(deckY, −h) ≤ y ≤ min(0, roofY) (at TDC the crown
+ * stands above the deck: a ≈ 5 mm opening between the 25.4 mm bore column and the 12.9 mm pocket; below it
+ * the pocket faces the side of the piston). interfaceResistance puts that window's junction resistance
+ * windowResistance(−h, 0, deckY, roofY) on every grid face between a bore and a pocket cell (file header).
+ * Throws when the crown stands above the pocket roof (no window: the pocket would be a separate chamber).
  */
 export function lHeadPlanform(bore: number, lHead: LHeadChamberSpec, depth = lHeadDepthAtTDC(lHead)): ChamberPlanform {
   const R = bore / 2;
@@ -1247,6 +1382,8 @@ export function lHeadPlanform(bore: number, lHead: LHeadChamberSpec, depth = lHe
   if (!(depth > 0)) throw new RangeError(`lHeadPlanform: bore-column depth ${depth} m must be positive`);
   if (!(p.roofY > lHead.deckY)) throw new RangeError('lHeadPlanform: pocket roof must lie above the deck');
   if (!(rc >= 0) || 2 * rc > p.xMax - p.xMin || 2 * rc > p.zMax - p.zMin) throw new RangeError('lHeadPlanform: invalid pocket corner radius');
+  const rWin = windowResistance(-depth, 0, lHead.deckY, p.roofY);
+  if (!Number.isFinite(rWin)) throw new RangeError(`lHeadPlanform: at bore-column depth ${depth} m the crown stands above the pocket roof (no window to the pocket)`);
   const r2 = R * R;
   return {
     xMin: Math.min(-R, p.xMin),
@@ -1257,6 +1394,13 @@ export function lHeadPlanform(bore: number, lHead: LHeadChamberSpec, depth = lHe
     yHi: [0, p.roofY],
     region: (x, z) => (x * x + z * z <= r2 ? 0 : roundedRectDistance(x, z, p.xMin, p.xMax, p.zMin, p.zMax, rc) <= 0 ? 1 : -1),
     boundaryDistance: (x, z) => Math.min(Math.abs(Math.hypot(x, z) - R), Math.abs(roundedRectDistance(x, z, p.xMin, p.xMax, p.zMin, p.zMax, rc))),
+    // bore ↔ pocket faces lie along the window arc; n = the bore circle's radial direction at the face
+    interfaceResistance: (r0, r1, x, z, ex, ez) => {
+      if (r0 === r1 || r0 < 0 || r1 < 0 || !(rWin > 0)) return 0;
+      const rho = Math.hypot(x, z);
+      const ne = rho > 0 ? Math.abs(x * ex + z * ez) / rho : 1;
+      return rWin / Math.max(ne, 1e-12);
+    },
   };
 }
 
@@ -1285,15 +1429,19 @@ const GRID_UNIFORM_DISTANCE = 0.75;
  * discretised by cut-cell finite volumes on a Cartesian grid of cell size Δ:
  *  - capacity of a cell c_i = ∫_cell H dA (exact for uniform cells; 8 × 8 midpoint sub-samples where an
  *    outline or a depth step crosses it) — the gas volume of the cell column;
- *  - conductance of the face between neighbours G = (1/Δ)∫_face H_h ds, H_h = harmonic mean of H along the
- *    segment joining the two cell centres (series resistance across a depth step), face points outside
- *    the chamber contributing nothing (the rigid outline: Neumann condition with no extra term);
+ *  - conductance of the face between neighbours G = (1/Δ)∫_face H_h ds, H_h = Δ/(Δ⟨1/H⟩ + r_J): ⟨1/H⟩ the
+ *    mean of 1/H along the segment joining the two cell centres (series resistance across a depth step), r_J
+ *    the planform's junction resistance (interfaceResistance) when the two cells lie on the two sides of a
+ *    window — a cell's side is the region holding most of its plan area, so that no sample line can bypass
+ *    the window through a cut cell's single ψ; face points outside the chamber contribute nothing (the rigid
+ *    outline: Neumann condition with no extra term);
  *  - K ψ = k² C ψ (K: the conductance Laplacian, C = diag c_i) — symmetric, with the constant ψ_0 for
  *    k = 0, so every other mode satisfies Σ c_i ψ_j,i = 0 exactly (a uniform release excites nothing).
  * The lowest modes come from a shift-invert block Lanczos iteration with full reorthogonalisation on an
  * envelope Cholesky factor of C^{-½}(K − σC)C^{-½} (σ < 0), Rayleigh–Ritz by Householder + implicit QL.
- * Accuracy (knock-lhead.test.ts): the disc's α_mn within 0.2 % at Δ = B/64, the two-depth channel within
- * 0.2 % of its analytic roots, the Model T α_j within 0.3 % of a B/192 scipy solution.
+ * Accuracy (knock-lhead.test.ts) — numerical, of the depth-averaged problem: the disc's α_mn within 0.2 % at
+ * Δ = B/64, the two-depth channel within 0.2 % of its analytic roots, the Model T α_j within 0.5 % of a B/192
+ * scipy solution. Physical, against the 3-D Helmholtz solve: see the file header (WINDOW JUNCTIONS).
  * Mode shapes are normalised to max |ψ_j| = 1 over the cells (largest entry positive). Immutable.
  */
 export class GridModeSet implements AcousticModeSet {
@@ -1361,6 +1509,7 @@ export class GridModeSet implements AcousticModeSet {
     const capList: number[] = [];
     const cxList: number[] = [];
     const czList: number[] = [];
+    const sideList: number[] = []; // the region holding most of the cell's plan area: its side of a junction
     const col = { x: [] as number[], z: [] as number[], area: [] as number[], yLo: [] as number[], yHi: [] as number[], cell: [] as number[] };
     const nReg = planform.yLo.length;
     const cnt = new Float64Array(nReg);
@@ -1372,9 +1521,11 @@ export class GridModeSet implements AcousticModeSet {
         const x = this.gx0 + (i + 0.5) * dx;
         const z = this.gz0 + (k + 0.5) * dx;
         const first = col.x.length;
+        let side = -1;
         if (planform.boundaryDistance(x, z) > dUni) {
           const r = planform.region(x, z);
           if (r >= 0) pushColumn(col, x, z, dx * dx, planform.yLo[r], planform.yHi[r]);
+          side = r;
         } else {
           cnt.fill(0);
           sx.fill(0);
@@ -1392,6 +1543,7 @@ export class GridModeSet implements AcousticModeSet {
           }
           for (let r = 0; r < nReg; r++) {
             if (cnt[r] > 0) pushColumn(col, sx[r] / cnt[r], sz[r] / cnt[r], cnt[r] * subArea, planform.yLo[r], planform.yHi[r]);
+            if (cnt[r] > 0 && (side < 0 || cnt[r] > cnt[side])) side = r;
           }
         }
         let cap = 0;
@@ -1402,6 +1554,7 @@ export class GridModeSet implements AcousticModeSet {
           capList.push(cap);
           cxList.push(x);
           czList.push(z);
+          sideList.push(side);
           for (let q = first; q < col.x.length; q++) col.cell[q] = c;
         } else {
           col.x.length = col.z.length = col.area.length = col.yLo.length = col.yHi.length = col.cell.length = first;
@@ -1428,8 +1581,15 @@ export class GridModeSet implements AcousticModeSet {
     // ---- faces: conductances to the +x and +z neighbours ----
     const gxp = new Float64Array(nC); // to (i+1, k)
     const gzp = new Float64Array(nC); // to (i, k+1)
-    const face = (xf: number, zf: number, ex: number, ez: number): number => {
-      if (planform.boundaryDistance(xf, zf) > dUni) return hOf(planform.region(xf, zf));
+    const hasJunctions = typeof planform.interfaceResistance === 'function';
+    // rJ: lumped junction resistance of the face (cells on two sides of a window), in series with Δ·⟨1/H⟩ on
+    // every centre-to-centre line. The cells' sides — not the sample lines — decide: a cut cell holds one ψ for
+    // all its gas, so a line that missed the junction would short-circuit the window.
+    const face = (xf: number, zf: number, ex: number, ez: number, rJ: number): number => {
+      if (planform.boundaryDistance(xf, zf) > dUni) {
+        const h = hOf(planform.region(xf, zf));
+        return rJ > 0 && h > 0 ? dx / (dx / h + rJ) : h;
+      }
       let tot = 0;
       for (let a = 0; a < ns; a++) {
         const u = ((a + 0.5) / ns - 0.5) * dx;
@@ -1447,7 +1607,8 @@ export class GridModeSet implements AcousticModeSet {
             nIn++;
           }
         }
-        tot += nIn > 0 ? nIn / inv : hf;
+        if (nIn === 0) tot += rJ > 0 ? dx / (dx / hf + rJ) : hf;
+        else tot += rJ > 0 ? dx / ((dx * inv) / nIn + rJ) : nIn / inv;
       }
       return tot / ns;
     };
@@ -1457,8 +1618,16 @@ export class GridModeSet implements AcousticModeSet {
         if (c < 0) continue;
         const x = cxList[c];
         const z = czList[c];
-        if (i + 1 < nx && cellIndex[i + 1 + nx * k] >= 0) gxp[c] = face(x + 0.5 * dx, z, 1, 0);
-        if (k + 1 < nz && cellIndex[i + nx * (k + 1)] >= 0) gzp[c] = face(x, z + 0.5 * dx, 0, 1);
+        const cx = i + 1 < nx ? cellIndex[i + 1 + nx * k] : -1;
+        const cz = k + 1 < nz ? cellIndex[i + nx * (k + 1)] : -1;
+        if (cx >= 0) {
+          const rJ = hasJunctions && sideList[cx] !== sideList[c] ? planform.interfaceResistance!(sideList[c], sideList[cx], x + 0.5 * dx, z, 1, 0) : 0;
+          gxp[c] = face(x + 0.5 * dx, z, 1, 0, rJ);
+        }
+        if (cz >= 0) {
+          const rJ = hasJunctions && sideList[cz] !== sideList[c] ? planform.interfaceResistance!(sideList[c], sideList[cz], x, z + 0.5 * dx, 0, 1) : 0;
+          gzp[c] = face(x, z + 0.5 * dx, 0, 1, rJ);
+        }
       }
     }
     // ---- eigen-solve ----
@@ -2137,7 +2306,8 @@ export interface LHeadKnockAcousticsOptions extends GridModeSetOptions {
   /**
    * Bore-column depth (roof of the head cavity → piston crown) at which the modes and the end-gas
    * geometry are evaluated, m (default TDC, lHeadDepthAtTDC). Knock occurs near TDC; the Model T
-   * fundamental moves +1 % from TDC to 15° ATDC (knock-lhead.test.ts).
+   * fundamental moves +5 % from TDC to 15° ATDC as the bore ↔ pocket window opens from 5.0 to 7.2 mm
+   * (knock-lhead.test.ts; the 3-D Helmholtz solve agrees).
    */
   depth?: number;
 }
@@ -2183,8 +2353,8 @@ export function lHeadKnockAcoustics(spec: EngineSpec, opts: LHeadKnockAcousticsO
  * pickup exists, so the band only has to contain the chamber's modes up to the CFR convention's upper edge
  * (18 kHz, Hoth 2021 / SON 2023 — which is also about the first axial resonance c/(2h) ≈ 18.7 kHz of the
  * Model T bore column at TDC, where the depth-averaged modes lose validity). The lower edge sits below the
- * Model T fundamental (α ≈ 1.20: 3.2–4.0 kHz for c = 800–1000 m/s; 2 kHz needs c < 500 m/s) — the
- * CFR's 4 kHz would cut it off.
+ * Model T fundamental (α ≈ 1.03 at TDC, 1.08 at 15° ATDC: 2.8–3.6 kHz for c = 800–1000 m/s; 2 kHz needs
+ * c < 580 m/s) — the CFR's 4 kHz would cut it off.
  */
 export const L_HEAD_MAPO_BAND: readonly [number, number] = Object.freeze([2000, 18000]) as readonly [number, number];
 
