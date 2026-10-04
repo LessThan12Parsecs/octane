@@ -46,6 +46,7 @@ function emptySpark(): EngineSnapshot['spark'] {
     breakdownVoltage: 0,
     // Optional trembler fields, declared up front so the scratch objects keep one shape.
     breakdownCount: undefined,
+    reignitionCount: undefined,
     pointsOpen: undefined,
     timerClosed: undefined,
     firstSparkDeg: undefined,
@@ -239,6 +240,7 @@ function lerpCylinderFields(a: CylinderFields, b: CylinderFields, d: CylinderFie
     restarted || (u > 0 && sb.energyDelivered < sa.energyDelivered) ? sb.energyDelivered : lerp(sa.energyDelivered, sb.energyDelivered, u);
   so.breakdownVoltage = lerp(sa.breakdownVoltage, sb.breakdownVoltage, u);
   so.breakdownCount = sd.breakdownCount;
+  so.reignitionCount = sd.reignitionCount;
   so.pointsOpen = sd.pointsOpen;
   so.timerClosed = sd.timerClosed;
   so.firstSparkDeg = sd.firstSparkDeg;

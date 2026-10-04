@@ -36,6 +36,7 @@ function fullSpark(): FullSpark {
     energyDelivered: 0,
     breakdownVoltage: 0,
     breakdownCount: 0,
+    reignitionCount: 0,
     pointsOpen: true,
     timerClosed: true,
     firstSparkDeg: 0,
@@ -94,7 +95,7 @@ function fullSnapshot(): FullSnapshot {
 }
 
 /** Leaves whose numeric value is discrete (taken from one sample, never blended). */
-const DISCRETE_NUMERIC = /(^|\.)(cycle|index|breakdownCount|firingCylinder|firstSparkDeg)$/;
+const DISCRETE_NUMERIC = /(^|\.)(cycle|index|breakdownCount|reignitionCount|firingCylinder|firstSparkDeg)$/;
 /** Crank angles (wrap-aware lerp; the test keeps them away from the wrap). */
 const ANGLE = /(^|\.)thetaDeg$/;
 

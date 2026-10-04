@@ -114,6 +114,8 @@ export interface EngineSnapshot {
      * the FIRST breakdown of the event (NaN before it).
      */
     breakdownCount?: number;
+    /** Re-ignitions of a spark at the current zeros of its condenser ring (not counted as breakdowns). Optional. */
+    reignitionCount?: number;
     pointsOpen?: boolean;
     timerClosed?: boolean;
     firstSparkDeg?: number;
@@ -263,8 +265,10 @@ export interface CycleSummary {
   cylinder?: number;
   /** Local crank angle of the first spark (gap breakdown) of the cycle, deg (NaN: none). Optional. */
   sparkDeg?: number;
-  /** Gap breakdowns in the cycle's ignition event. Optional. */
+  /** Gap breakdowns (distinct sparks) in the cycle's ignition event. Optional. */
   sparkCount?: number;
+  /** Re-ignitions at current zeros in the cycle's ignition event (trembler; not sparks). Optional. */
+  reignitionCount?: number;
   /** Engine-level results, attached to cylinder 1's summary at the end of each engine cycle. Optional. */
   engine?: EngineCycleSummary;
 }

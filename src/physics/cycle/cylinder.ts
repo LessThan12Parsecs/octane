@@ -2884,6 +2884,7 @@ export class Cylinder {
       const st = this.ign && this.dwellSeen ? this.ign.state : null;
       s.sparkDeg = st ? st.firstSparkDeg : Number.NaN;
       s.sparkCount = st ? st.breakdownCount : 0;
+      s.reignitionCount = st ? st.reignitionCount : 0;
     }
     return s;
   }

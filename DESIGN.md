@@ -223,7 +223,11 @@ Implementers may add exports but must provide at least these. All inputs/outputs
   battery or the AC flywheel magneto E = kω sin(N(θ − φ)) behind R_s + L_s; a 1-DOF vibrator armature
   (pull ∝ I₁²/(g₀ − x)²) opens the points (events in the coil sub-step), the condenser rings, the gap
   fires — a spark TRAIN for as long as the timer contact lasts. One ignition event = one timer contact;
-  the kernel is not declared misfired between sparks and can be re-seeded. `tremblerTimerCommand(spec,
+  the kernel is not declared misfired between sparks and can be re-seeded. Each points opening gives ONE
+  spark (breakdown) whose condenser ring re-ignites the recovering channel at its current zeros at
+  V_r(t) = V_ri + (V_bd − V_ri)(1 − e^{−t/τ_rec}) (discharge.ts, τ_rec 30 µs UNVERIFIED; counted in
+  `reignitionCount`, booked as arc energy); only a breakdown — including the timer-break spark within
+  0.5 ms — re-seeds a quenched kernel. `tremblerTimerCommand(spec,
   lever)`: the spark lever sets the timer MAKE; the first spark is an output (coil firing time).
 
 ### gas-exchange (`src/physics/gas-exchange/`)
@@ -390,14 +394,20 @@ the deck to the pocket roof; the Model T crown rises 5/16 in above the deck at T
 cycle counter and gas torque); the top-level per-cylinder fields are cylinder 1, and the engine-level
 fields are `gasTorque` (sum), `netTorque`, `frictionTorque` (> 0 opposing), `loadTorque`, `vehicleSpeed`,
 `firingCylinder`, `magnetoEmf`. Each cylinder emits its own `CycleSummary` (`summary.cylinder`);
-cylinder 1's carries `summary.engine` (brake torque, power, BMEP, FMEP, η_v over N·V_d, bsfc). The CFR's
+cylinder 1's carries `summary.engine` (brake torque, power, BMEP, FMEP, η_v over N·V_d, bsfc). Brake
+torque is the ENGINE output, indicated − friction − (J_rot + ΣJ_m)·ω̇: the car's inertia is downstream of
+the clutch and appears separately (`loadInertiaTorque`; a gear change is an inelastic clutch engagement
+conserving angular momentum through the gear train, its loss in `clutchLoss`). The CFR's
 snapshot stream is unchanged (no `cylinders`).
 
 **Engine registry and app.** `src/physics/engines/index.ts` maps ids to {spec, default operating point,
 presets, UI profile}. The app shell (`src/app/app.ts`) keeps the WebGL stage alive and swaps a disposable
 `EngineSession` (render model from `createEngineModel(spec, op)`, one CombustionVisuals per cylinder frame
 with tracers and the chamber light on the featured cylinder, SimClient, Conductor, UI). The worker needs
-no engine knowledge: the spec it receives selects the physics defaults.
+no engine knowledge: the spec it receives selects the physics defaults. The Model T cutaway's quarter
+section follows the focus cylinder (`EngineRenderModel.setSectionCylinder`). `?engine=<id>` selects the
+engine; a link with operating-point knobs but no engine opens the default engine (the knobs were written
+for it), otherwise the last engine used is remembered.
 
 **Validation.** `test/fixtures/modelt_period_data.json` (`tools/reference/modelt_data_period.py`, README
 alongside): Ford's WOT brake torque table, Upton's MBT relation, compression pressure, trembler-coil and

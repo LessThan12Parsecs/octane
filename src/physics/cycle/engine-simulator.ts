@@ -57,8 +57,8 @@ export const DENSE_KNOCK_DT = 10e-6;
 export const DENSE_KNOCK_DURATION = 3e-3;
 /**
  * Knock ringing of a MULTI-cylinder engine: 20 µs for 2 ms (every cylinder may knock in every cycle — four
- * 10 µs × 3 ms windows doubled the snapshot stream of the Model T at WOT; 20 µs still gives ≈ 13 samples per
- * period of the L-head's ≈ 3.8 kHz fundamental). MAPO itself is sampling-independent (cycle model).
+ * 10 µs × 3 ms windows doubled the snapshot stream of the Model T at WOT; 20 µs still gives ≈ 15 samples per
+ * period of the L-head's ≈ 3.3 kHz fundamental). MAPO itself is sampling-independent (cycle model).
  */
 export const DENSE_KNOCK_DT_MULTI = 20e-6;
 export const DENSE_KNOCK_DURATION_MULTI = 2e-3;
@@ -405,6 +405,7 @@ export class EngineSimulator {
       if (c.trembler) {
         // the spark train of this cycle's timer contact (counters 0 / NaN until the make)
         spark.breakdownCount = c.dwellSeen ? s.breakdownCount : 0;
+        spark.reignitionCount = c.dwellSeen ? s.reignitionCount : 0;
         spark.pointsOpen = s.pointsOpen;
         spark.timerClosed = s.timerClosed;
         spark.firstSparkDeg = c.dwellSeen ? s.firstSparkDeg : Number.NaN;
