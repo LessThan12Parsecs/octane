@@ -180,7 +180,10 @@ export interface TremblerVibratorSpec {
 export interface MagnetoSpec {
   /** Electrical cycles per crank revolution (Model T: 16 magnets, 16 coils → 8). */
   cyclesPerRevolution: number;
-  /** Open-circuit EMF amplitude per crank speed, V_peak per (rad/s): E = k·ω·sin(N·θ + φ). */
+  /**
+   * Open-circuit EMF amplitude per crank speed, V_peak per (rad/s): E = k·ω·sin(N·(θ − phaseDeg)·π/180), θ the
+   * engine crank angle in degrees (modulo 360°).
+   */
   emfConstant: number;
   /**
    * Phase φ of the EMF zero crossing, crank degrees: E = k ω sin(N (θ_crank − phaseDeg)·π/180), with
