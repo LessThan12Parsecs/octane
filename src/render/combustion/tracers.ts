@@ -5,19 +5,24 @@
  * |ṁ_valve| / m_parcel — the particle count is the integrated mass flow.
  * Everything advances in SIMULATED time (slow motion shows true velocities).
  *
- * Paths (cylinder frame, valves open downward to y = −lift):
- *  - inflow  (intake ṁ > 0, exhaust ṁ < 0): down the port (radius D_v/2 above
- *    the seat) at Q/A_port, then out through the open arc of the curtain as a
- *    jet along the seat cone at v_jet = Q/(C_d A_curtain); the jet decays by
- *    quadratic drag into the bulk flow (swirl + axial compression) plus an
- *    Ornstein–Uhlenbeck turbulent velocity with u' and T_L = L_I/u'.
+ * Paths, in each valve's SEAT FRAME: seat plane y_s (ValveSpec.seatY, 0 for
+ * overhead valves) and opening direction d (liftDirection: −1 = down into the
+ * bore, +1 = up out of the block deck into the L-head pocket); the port runs
+ * away from the chamber (−d) from the seat:
+ *  - inflow  (intake ṁ > 0, exhaust ṁ < 0): along the port (radius D_v/2
+ *    beyond the seat) at Q/A_port, then out through the open arc of the curtain
+ *    as a jet along the seat cone at v_jet = Q/(C_d A_curtain); the jet decays
+ *    by quadratic drag into the bulk flow (swirl + compression/transfer) plus
+ *    an Ornstein–Uhlenbeck turbulent velocity with u' and T_L = L_I/u'.
  *  - outflow (exhaust ṁ > 0, intake backflow ṁ < 0): hemispherical sink
- *    flow Q/(2π r²) toward the curtain, then up the port.
+ *    flow Q/(2π r²) toward the curtain, then back along the port.
  * Particles crossing the flame sphere ∩ chamber are marked burned (and flash
- * as the front passes).
+ * as the front passes). Walls: the flat disc's liner/head/crown clamp, or the
+ * nearest interior point of the L-head union (chamber.ts projectIntoChamber).
  */
 import type { EngineSpec, ValveSpec } from '../../physics/core/engine-spec';
 import type { EngineSnapshot } from '../../physics/core/snapshot';
+import { chamberDepth, chamberShapeOf, insideBurnedShape, projectIntoChamber, type ChamberShape } from './chamber';
 import {
   TRACER_CAPACITY,
   TRACER_INTAKE_LIFE_REVS,
@@ -43,12 +48,12 @@ interface FlowSample {
   mi: number; me: number; li: number; le: number; h: number; rho: number; pim: number; pem: number; p: number; T: number;
 }
 
-function sampleFrom(s: EngineSnapshot, out: FlowSample): FlowSample {
+function sampleFrom(s: EngineSnapshot, shape: ChamberShape, out: FlowSample): FlowSample {
   out.mi = s.intakeMassFlow;
   out.me = s.exhaustMassFlow;
   out.li = s.intakeLift;
   out.le = s.exhaustLift;
-  out.h = s.clearanceHeight;
+  out.h = chamberDepth(shape, s.clearanceHeight, s.pistonDisplacement);
   out.rho = s.volume > 0 ? s.mass / s.volume : RHO_REF;
   out.pim = s.intakeManifoldPressure;
   out.pem = s.exhaustManifoldPressure;
@@ -105,8 +110,15 @@ export class TracerSystem {
 
   private readonly R: number;
   private readonly valves: [ValveSpec, ValveSpec];
-  /** Length of the port section above each valve seat (intake, exhaust), m. */
+  readonly shape: ChamberShape;
+  private readonly lhead: boolean;
+  /** Length of the port section beyond each valve seat (intake, exhaust), m. */
   readonly portLen: [number, number];
+  /** Seat-plane y of each valve (intake, exhaust), m. */
+  readonly seatY: [number, number];
+  /** Opening direction of each valve along y (−1 down into the bore, +1 up into an L-head pocket). */
+  readonly openDir: [number, number];
+  private readonly qtmp: V3 = [0, 0, 0];
   private readonly accum = [0, 0];
   private prev: FlowSample = newSample();
   private cur: FlowSample = newSample();
@@ -119,6 +131,10 @@ export class TracerSystem {
     this.capacity = capacity;
     this.R = spec.geometry.bore / 2;
     this.valves = [spec.intakeValve, spec.exhaustValve];
+    this.shape = chamberShapeOf(spec);
+    this.lhead = this.shape.kind === 'l-head';
+    this.seatY = [spec.intakeValve.seatY ?? 0, spec.exhaustValve.seatY ?? 0];
+    this.openDir = [spec.intakeValve.liftDirection ?? -1, spec.exhaustValve.liftDirection ?? -1];
     this.portLen = [
       TRACER_PORT_LENGTH_DIAMETERS * spec.intakeValve.seatInnerDiameter,
       TRACER_PORT_LENGTH_DIAMETERS * spec.exhaustValve.seatInnerDiameter,
@@ -167,8 +183,8 @@ export class TracerSystem {
     flameCenter: ArrayLike<number>, flameRadius: number, allBurned: boolean,
   ): void {
     if (!this.hasPrev || dtSim <= 0) {
-      sampleFrom(s, this.cur);
-      if (!this.hasPrev) sampleFrom(s, this.prev);
+      sampleFrom(s, this.shape, this.cur);
+      if (!this.hasPrev) sampleFrom(s, this.shape, this.prev);
       this.hasPrev = true;
       this.t = s.t;
       return;
@@ -176,7 +192,7 @@ export class TracerSystem {
     // rotate samples
     const tmp = this.prev;
     this.prev = this.cur;
-    this.cur = sampleFrom(s, tmp);
+    this.cur = sampleFrom(s, this.shape, tmp);
 
     const n = Math.min(TRACER_MAX_SUBSTEPS, Math.max(1, Math.ceil(dtSim / TRACER_MAX_DT)));
     const dt = dtSim / n;
@@ -209,6 +225,7 @@ export class TracerSystem {
     const a = v.seatInnerDiameter / 2;
     const [vx, vz] = v.position;
     const portLen = this.portLen[vi];
+    const sy = this.seatY[vi], d = this.openDir[vi];
     const P = this.position;
     while (nNew-- > 0 && this.count < this.capacity) {
       const i = this.count++;
@@ -220,31 +237,37 @@ export class TracerSystem {
       this.turb[i3] = this.turb[i3 + 1] = this.turb[i3 + 2] = 0;
       this.spawnT[i] = smp.T;
       if (inflow) {
-        // enters from the top of the port above its curtain angle
+        // enters from the far end of the port, in line with its curtain angle
         const psi = vi === 0 ? sampleOpenArc(v, this.rand()) : 2 * Math.PI * this.rand();
         this.psi[i] = psi;
         const rr = a * (0.55 + 0.4 * this.rand());
         P[i3] = vx + rr * Math.cos(psi);
-        P[i3 + 1] = portLen * (0.9 + 0.1 * this.rand());
+        P[i3 + 1] = sy - d * (portLen * (0.9 + 0.1 * this.rand()));
         P[i3 + 2] = vz + rr * Math.sin(psi);
         this.state[i] = TracerState.PortIn;
         this.life[i] = intakeLife;
         // intake charge is fresh; exhaust backflow is hot residual
         this.hot[i] = vi === 1 ? 1 : 0;
       } else {
-        // outflow: start on a lower half-shell around the curtain centre
+        // outflow: start on the chamber-side half-shell around the curtain centre
         const r0 = a * (1.3 + 1.4 * this.rand());
         const th = 2 * Math.PI * this.rand();
-        const cz = this.rand(); // cos of polar angle from −y
+        const cz = this.rand(); // cos of polar angle from the opening direction
         const sz = Math.sqrt(1 - cz * cz);
         let x = vx + r0 * sz * Math.cos(th);
         let z = vz + r0 * sz * Math.sin(th);
-        let y = -lift / 2 - r0 * cz;
-        const rxz = Math.hypot(x, z);
-        const lim = 0.97 * this.R;
-        if (rxz > lim) { x *= lim / rxz; z *= lim / rxz; }
-        if (y < -smp.h) y = -smp.h * (0.2 + 0.7 * this.rand());
-        if (y > 0) y = 0;
+        let y = sy + d * (lift / 2) + d * (r0 * cz);
+        if (this.lhead) {
+          const q = this.qtmp;
+          projectIntoChamber(x, y, z, this.shape, smp.h, q);
+          x = q[0]; y = q[1]; z = q[2];
+        } else {
+          const rxz = Math.hypot(x, z);
+          const lim = 0.97 * this.R;
+          if (rxz > lim) { x *= lim / rxz; z *= lim / rxz; }
+          if (y < -smp.h) y = -smp.h * (0.2 + 0.7 * this.rand());
+          if (y > 0) y = 0;
+        }
         P[i3] = x; P[i3 + 1] = y; P[i3 + 2] = z;
         this.psi[i] = Math.atan2(z - vz, x - vx);
         this.state[i] = TracerState.ToValve;
@@ -296,6 +319,7 @@ export class TracerSystem {
       const inflow = vi === 0 ? mdot > 0 : mdot < 0;
       const a = valve.seatInnerDiameter / 2;
       const [vx, vz] = valve.position;
+      const sy = this.seatY[vi], d = this.openDir[vi];
       // port density: manifold pressure at cylinder temperature (approximate)
       const pm = vi === 0 ? smp.pim : smp.pem;
       const rhoPort = smp.p > 0 ? smp.rho * (pm / smp.p) : smp.rho;
@@ -306,18 +330,18 @@ export class TracerSystem {
       this.age[i] += dt;
       switch (this.state[i]) {
         case TracerState.PortIn: {
-          if (lift > 1e-6 && inflow) P[i3 + 1] -= vPort * dt;
-          if (P[i3 + 1] <= 0) {
+          if (lift > 1e-6 && inflow) P[i3 + 1] += d * (vPort * dt);
+          if (d < 0 ? P[i3 + 1] <= sy : P[i3 + 1] >= sy) {
             // exit through the curtain as a jet along the seat cone
             const psi = this.psi[i];
             const c = Math.cos(psi), sn = Math.sin(psi);
             P[i3] = vx + a * c;
-            P[i3 + 1] = -Math.max(lift, 1e-5) * this.rand();
+            P[i3 + 1] = sy + d * (Math.max(lift, 1e-5) * this.rand());
             P[i3 + 2] = vz + a * sn;
             const vj = curtainJetSpeed(mdot, inflow ? rhoPort : smp.rho, openCurtainArea(valve, lift));
             const cb = Math.cos(valve.seatAngle), sb = Math.sin(valve.seatAngle);
             this.jet[i3] = vj * cb * c;
-            this.jet[i3 + 1] = -vj * sb;
+            this.jet[i3 + 1] = d * vj * sb;
             this.jet[i3 + 2] = vj * cb * sn;
             this.state[i] = TracerState.InCylinder;
           }
@@ -328,11 +352,11 @@ export class TracerSystem {
             this.state[i] = TracerState.InCylinder;
             break;
           }
-          const dx = vx - P[i3], dy = -lift / 2 - P[i3 + 1], dz = vz - P[i3 + 2];
+          const dx = vx - P[i3], dy = sy + d * (lift / 2) - P[i3 + 1], dz = vz - P[i3 + 2];
           const r = Math.hypot(dx, dy, dz);
           if (r < 0.9 * a) {
             this.state[i] = TracerState.PortOut;
-            P[i3 + 1] = 0;
+            P[i3 + 1] = sy;
             break;
           }
           const sp = Math.min(Q / (2 * Math.PI * r * r), MAX_JET_SPEED);
@@ -340,11 +364,16 @@ export class TracerSystem {
           P[i3] += (dx / r) * stepLen;
           P[i3 + 1] += (dy / r) * stepLen;
           P[i3 + 2] += (dz / r) * stepLen;
+          if (this.lhead) {
+            const q = this.qtmp;
+            projectIntoChamber(P[i3], P[i3 + 1], P[i3 + 2], this.shape, h, q);
+            P[i3] = q[0]; P[i3 + 1] = q[1]; P[i3 + 2] = q[2];
+          }
           break;
         }
         case TracerState.PortOut: {
-          P[i3 + 1] += vPort * dt;
-          if (P[i3 + 1] > this.portLen[vi]) dead = true;
+          P[i3 + 1] -= d * (vPort * dt);
+          if ((P[i3 + 1] - sy) * -d > this.portLen[vi]) dead = true;
           break;
         }
         case TracerState.InCylinder: {
@@ -372,12 +401,13 @@ export class TracerSystem {
             const outw = w === 0 ? mw < 0 : mw > 0;
             if (!outw || !(lw > 1e-6)) continue;
             const aw = vw.seatInnerDiameter / 2;
-            const dx = vw.position[0] - x, dy = -lw / 2 - y, dz = vw.position[1] - z;
+            const syw = this.seatY[w];
+            const dx = vw.position[0] - x, dy = syw + this.openDir[w] * (lw / 2) - y, dz = vw.position[1] - z;
             const r = Math.hypot(dx, dy, dz);
             if (r < 0.9 * aw) {
               this.state[i] = TracerState.PortOut;
               this.valve[i] = w;
-              P[i3 + 1] = 0;
+              P[i3 + 1] = syw;
               break;
             }
             const sp = Math.min(Math.abs(mw) / Math.max(smp.rho, 1e-3) / (2 * Math.PI * r * r), MAX_JET_SPEED);
@@ -385,6 +415,23 @@ export class TracerSystem {
           }
           if (this.state[i] !== TracerState.InCylinder) break;
           let nx = x + ux * dt, ny = y + uy * dt, nz = z + uz * dt;
+          if (this.lhead) {
+            // walls of the bore column ∪ pocket: back to the nearest interior point, reflecting the
+            // outward (non-bulk) velocity components about the wall normal ∝ (p − q)
+            const q = this.qtmp;
+            const d2 = projectIntoChamber(nx, ny, nz, this.shape, h, q);
+            if (d2 > 0) {
+              const dn = Math.sqrt(d2);
+              const ex = (nx - q[0]) / dn, ey = (ny - q[1]) / dn, ez = (nz - q[2]) / dn;
+              const jn = this.jet[i3] * ex + this.jet[i3 + 1] * ey + this.jet[i3 + 2] * ez;
+              if (jn > 0) { this.jet[i3] -= 2 * jn * ex; this.jet[i3 + 1] -= 2 * jn * ey; this.jet[i3 + 2] -= 2 * jn * ez; }
+              const tn = this.turb[i3] * ex + this.turb[i3 + 1] * ey + this.turb[i3 + 2] * ez;
+              if (tn > 0) { this.turb[i3] -= 2 * tn * ex; this.turb[i3 + 1] -= 2 * tn * ey; this.turb[i3 + 2] -= 2 * tn * ez; }
+              nx = q[0]; ny = q[1]; nz = q[2];
+            }
+            P[i3] = nx; P[i3 + 1] = ny; P[i3 + 2] = nz;
+            break;
+          }
           // walls: liner, head, piston (reflect the non-bulk velocities)
           const rxz = Math.hypot(nx, nz);
           const lim = 0.995 * R;
@@ -413,7 +460,9 @@ export class TracerSystem {
       const st = this.state[i];
       if ((st === TracerState.InCylinder || st === TracerState.ToValve) && Number.isNaN(this.burnTime[i])) {
         if (allBurned) this.burnTime[i] = tNow - 1;
-        else if (fr > 0 && insideBurnedRegion(P[i3], P[i3 + 1], P[i3 + 2], R, h, fc, fr)) this.burnTime[i] = tNow;
+        else if (fr > 0 && (this.lhead
+          ? insideBurnedShape(P[i3], P[i3 + 1], P[i3 + 2], this.shape, h, fc, fr)
+          : insideBurnedRegion(P[i3], P[i3 + 1], P[i3 + 2], R, h, fc, fr))) this.burnTime[i] = tNow;
       }
       if (dead || this.age[i] > this.life[i]) {
         this.kill(i);

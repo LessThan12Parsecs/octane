@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { EngineSnapshot } from '../../physics/core/snapshot';
+import { MODEL_T } from '../../physics/engines/model-t';
+import { chamberShapeOf, insideChamberShape, projectIntoChamber } from './chamber';
 import { GasFlowModel } from './flow';
 import { insideChamber } from './geometry';
-import { snap, testSpec, TEST_R } from './test-utils';
+import { modelTSnap, snap, testSpec, TEST_R } from './test-utils';
 import { TracerState, TracerSystem } from './tracers';
 
 const spec = testSpec();
@@ -179,5 +181,143 @@ describe('TracerSystem', () => {
     expect(sys.count).toBe(64);
     sys.reset();
     expect(sys.count).toBe(0);
+  });
+});
+
+describe('TracerSystem, L-head side valves (Model T)', () => {
+  const T = chamberShapeOf(MODEL_T);
+  const iv = MODEL_T.intakeValve, ev = MODEL_T.exhaustValve;
+  const seat = iv.seatY!;
+  const x = 0.06; // piston 60 mm down
+  const h = T.depthTDC + x;
+  const q: [number, number, number] = [0, 0, 0];
+  /** Inside the chamber up to the Float32Array position rounding (1 µm). */
+  const inChamber = (px: number, py: number, pz: number, hh: number): boolean =>
+    projectIntoChamber(px, py, pz, T, hh, q, 0) < 1e-12;
+  const intakeT = (mdot: number) => (t: number) =>
+    modelTSnap({ t, phase: 'gas-exchange', intakeLift: 5e-3, intakeMassFlow: mdot, pressure: 0.8e5, intakeManifoldPressure: 0.85e5, temperatureMean: 320, mass: 2e-4 }, x);
+  function driveT(gen: (t: number) => EngineSnapshot, T1: number, dt: number, sys = new TracerSystem(MODEL_T), flow = new GasFlowModel(MODEL_T)) {
+    let t = 0;
+    let s = gen(0);
+    flow.update(s, 0);
+    sys.update(s, 0, flow, NONE, 0, false);
+    while (t < T1 - 1e-12) {
+      t += dt;
+      s = gen(t);
+      flow.update(s, dt);
+      sys.update(s, dt, flow, NONE, 0, false);
+    }
+    return { sys, flow };
+  }
+
+  it('seat frames from the spec: seats on the deck, valves open upward', () => {
+    const sys = new TracerSystem(MODEL_T);
+    expect(sys.seatY).toEqual([seat, ev.seatY]);
+    expect(sys.openDir).toEqual([1, 1]);
+    const cfr = new TracerSystem(spec);
+    expect(cfr.seatY).toEqual([0, 0]);
+    expect(cfr.openDir).toEqual([-1, -1]);
+  });
+
+  it('intake comes UP the port below the deck and jets upward out of the curtain into the pocket', () => {
+    const sys = new TracerSystem(MODEL_T);
+    const flow = new GasFlowModel(MODEL_T);
+    let t = 0, s = intakeT(0.02)(0);
+    flow.update(s, 0);
+    sys.update(s, 0, flow, NONE, 0, false);
+    let firstOut = -1;
+    while (t < 6e-3 && (firstOut < 0 || t < firstOut + 6e-5)) {
+      t += 1e-5;
+      s = intakeT(0.02)(t);
+      flow.update(s, 1e-5);
+      sys.update(s, 1e-5, flow, NONE, 0, false);
+      if (firstOut < 0) for (let i = 0; i < sys.count; i++) if (sys.state[i] === TracerState.InCylinder) { firstOut = t; break; }
+    }
+    expect(firstOut).toBeGreaterThan(0);
+    let portIn = 0, jets = 0;
+    for (let i = 0; i < sys.count; i++) {
+      const px = sys.position[3 * i], py = sys.position[3 * i + 1], pz = sys.position[3 * i + 2];
+      expect(sys.valve[i]).toBe(0);
+      if (sys.state[i] === TracerState.PortIn) {
+        portIn++;
+        expect(py).toBeLessThan(seat); // in the block port under the seat
+        expect(Math.hypot(px - iv.position[0], pz - iv.position[1])).toBeLessThan(iv.seatInnerDiameter / 2);
+      } else if (sys.state[i] === TracerState.InCylinder) {
+        expect(inChamber(px, py, pz, h)).toBe(true);
+        if (sys.jet[3 * i + 1] > 0) jets++;
+        expect(py).toBeGreaterThanOrEqual(seat - 1e-7);
+      }
+    }
+    expect(portIn).toBeGreaterThan(0);
+    expect(jets).toBeGreaterThan(0);
+  });
+
+  it('backflow leaves through the intake valve and goes DOWN the port; exhaust drains to its valve', () => {
+    const { sys } = driveT(intakeT(-0.02), 4e-3, 1e-4);
+    let out = 0;
+    for (let i = 0; i < sys.count; i++) {
+      if (sys.state[i] === TracerState.PortOut) {
+        out++;
+        expect(sys.position[3 * i + 1]).toBeLessThanOrEqual(seat + 1e-7);
+      }
+      expect(sys.state[i]).not.toBe(TracerState.PortIn);
+    }
+    expect(out).toBeGreaterThan(0);
+    const exh = (t: number) => modelTSnap({ t, phase: 'gas-exchange', exhaustLift: 5e-3, exhaustMassFlow: 0.04, temperatureMean: 1200, mass: 3e-4 }, x);
+    const ex = driveT(exh, 2e-3, 1e-4).sys;
+    expect(ex.count).toBeGreaterThan(10);
+    for (let i = 0; i < ex.count; i++) {
+      expect(ex.valve[i]).toBe(1);
+      const st = ex.state[i];
+      expect(st === TracerState.PortOut || st === TracerState.ToValve).toBe(true);
+      if (st === TracerState.ToValve) {
+        expect(inChamber(ex.position[3 * i], ex.position[3 * i + 1], ex.position[3 * i + 2], h)).toBe(true);
+      }
+    }
+  });
+
+  it('in-chamber tracers stay inside the bore column ∪ pocket under compression to TDC (crown above the deck)', () => {
+    const sys = new TracerSystem(MODEL_T);
+    const flow = new GasFlowModel(MODEL_T);
+    driveT(intakeT(0.03), 5e-3, 1e-4, sys, flow);
+    let t = 5e-3;
+    for (let k = 1; k <= 120; k++) {
+      const xk = x * (1 - k / 120);
+      const s = modelTSnap({ t: t + 1e-4, flame: { turbulenceIntensity: 6 } }, xk);
+      flow.update(s, 1e-4);
+      sys.update(s, 1e-4, flow, NONE, 0, false);
+      t += 1e-4;
+    }
+    let n = 0, inPocket = 0;
+    for (let i = 0; i < sys.count; i++) {
+      if (sys.state[i] !== TracerState.InCylinder) continue;
+      n++;
+      const px = sys.position[3 * i], py = sys.position[3 * i + 1], pz = sys.position[3 * i + 2];
+      expect(inChamber(px, py, pz, T.depthTDC)).toBe(true);
+      if (px * px + pz * pz > T.R * T.R) inPocket++;
+    }
+    expect(n).toBeGreaterThan(50);
+    expect(inPocket).toBeGreaterThan(10);
+  });
+
+  it('the flame marks parcels in sphere ∩ L-head chamber only', () => {
+    const sys = new TracerSystem(MODEL_T);
+    const flow = new GasFlowModel(MODEL_T);
+    driveT(intakeT(0.03), 5e-3, 1e-4, sys, flow);
+    const c = MODEL_T.sparkPlug.gapCenter;
+    const r = 0.04;
+    const s = modelTSnap({ t: 5.1e-3 }, x);
+    flow.update(s, 1e-4);
+    sys.update(s, 1e-4, flow, c, r, false);
+    let burned = 0, unburned = 0;
+    for (let i = 0; i < sys.count; i++) {
+      if (sys.state[i] !== TracerState.InCylinder) continue;
+      const px = sys.position[3 * i], py = sys.position[3 * i + 1], pz = sys.position[3 * i + 2];
+      const inside = Math.hypot(px - c[0], py - c[1], pz - c[2]) <= r && insideChamberShape(px, py, pz, T, h);
+      expect(Number.isNaN(sys.burnTime[i])).toBe(!inside);
+      if (inside) burned++; else unburned++;
+    }
+    expect(burned).toBeGreaterThan(0);
+    expect(unburned).toBeGreaterThan(0);
   });
 });

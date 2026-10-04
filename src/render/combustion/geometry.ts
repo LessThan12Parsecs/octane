@@ -4,7 +4,10 @@
  * fire-deck face, +y toward the head, gas in x²+z² ≤ R², −h ≤ y ≤ 0.
  *
  * The GLSL in volume-shader.ts mirrors `rayChamberInterval`, `raySphere`,
- * `besselJ1` and the brush model; tests exercise the TypeScript versions.
+ * `besselJ1`, `axialModeShape` and the brush model; tests exercise the
+ * TypeScript versions. The disc helpers here are the flat-disc special case;
+ * the general chamber shape (the L-head's bore column ∪ valve pocket) and its
+ * ray intervals live in chamber.ts.
  */
 import type { ValveSpec } from '../../physics/core/engine-spec';
 import type { EngineSnapshot } from '../../physics/core/snapshot';
@@ -214,6 +217,24 @@ export function soundSpeed(T: number, molarMass: number, gamma = KNOCK_GAMMA): n
 export function knockModeShape(x: number, z: number, R: number, axisAngle: number): number {
   const r = Math.min(Math.sqrt(x * x + z * z) / R, 1);
   return (besselJ1(ALPHA_10 * r) / besselJ1(ALPHA_10)) * Math.cos(Math.atan2(z, x) - axisAngle);
+}
+
+/**
+ * Lowest non-trivial acoustic mode of a rigid-walled duct of length L (Neumann ends): p ∝ cos(π s/L),
+ * f = c/(2L) (Rayleigh, The Theory of Sound, 1896, §255; Kinsler et al., Fundamentals of Acoustics,
+ * 4th ed. 2000, §9.2), Hz. Used for the L-head footprint (bore + valve pocket, length L along the
+ * bore → pocket axis): exact for a rectangular footprint of uniform depth; UNVERIFIED for the real
+ * chamber, whose depth differs between the bore column and the pocket (the physics' own L-head modes,
+ * when they exist, should replace it).
+ */
+export function axialModeFrequency(soundSpeed: number, length: number): number {
+  return soundSpeed / (2 * length);
+}
+
+/** Normalised axial mode cos(π (s − s0)/L) along the unit axis (ex, ez), clamped to [s0, s0 + L] (mirrored in GLSL). */
+export function axialModeShape(x: number, z: number, ex: number, ez: number, s0: number, L: number): number {
+  const u = Math.min(Math.max((x * ex + z * ez - s0) / L, 0), 1);
+  return Math.cos(Math.PI * u);
 }
 
 // ---------------------------------------------------------------------------
