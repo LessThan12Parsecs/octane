@@ -20,6 +20,7 @@ import {
   lHeadPlanform,
   symmetricEigen,
   virtualKnockSensor,
+  windowResistance,
 } from './knock';
 
 const now = (): number => performance.now();
@@ -54,6 +55,68 @@ describe('symmetric eigen-solver (Householder + implicit QL)', () => {
         }
       }
     }
+  });
+});
+
+describe('windowResistance: junction of two gas layers through a window (vertical-section potential flow)', () => {
+  it('mirror-symmetric slits: the exact conformal-map value −(2/π) ln[(cos πy0/H − cos πy1/H)/2] to 1e-5', () => {
+    const slits = fx.window.cases.filter((c) => c.exact !== null);
+    expect(slits.length).toBe(2);
+    for (const c of slits) {
+      const r = windowResistance(c.lo1, c.hi1, c.lo2, c.hi2, c.wLo, c.wHi);
+      expect(Math.abs(r / c.exact! - 1)).toBeLessThan(1e-5);
+    }
+    // a slit of height a at one wall: (4/π) ln csc(πa/2H) (both sides of the diaphragm)
+    const H = 0.02;
+    const a = 0.003;
+    expect(Math.abs(windowResistance(0, H, 0, H, H - a, H) / ((4 / Math.PI) * Math.log(1 / Math.sin((Math.PI * a) / (2 * H)))) - 1)).toBeLessThan(1e-5);
+  });
+
+  it('every oracle case: the scipy re-implementation to 1e-9, an independent 2-D finite-volume solve within 0.3 %', () => {
+    for (const c of fx.window.cases) {
+      const r = windowResistance(c.lo1, c.hi1, c.lo2, c.hi2, c.wLo, c.wHi);
+      expect(Math.abs(r / c.ritz - 1)).toBeLessThan(1e-9);
+      expect(Math.abs(r / c.fv - 1)).toBeLessThan(3e-3);
+      expect(Math.abs(r / c.ritzFine - 1)).toBeLessThan(2e-4); // Ritz basis converged (N = 12 vs 24)
+    }
+    // the Model T window at TDC: about 1.23 — a long-wave throat ≈ 1.23 × 5 mm ≈ 6 mm long at the window height
+    const tdc = fx.window.cases.find((c) => c.deg === 0)!;
+    expect(windowResistance(-lHeadDepthAtTDC(lHead), 0, lHead.deckY, lHead.pocket.roofY)).toBeCloseTo(tdc.ritz, 12);
+    expect(tdc.ritz).toBeGreaterThan(1.2);
+    expect(tdc.ritz).toBeLessThan(1.25);
+    // the window opens as the piston descends: r falls monotonically (0, 15, 25, 30, 40° ATDC)
+    const mt = fx.window.cases.filter((c) => c.deg !== null);
+    for (let i = 1; i < mt.length; i++) expect(mt[i].ritz).toBeLessThan(mt[i - 1].ritz);
+  });
+
+  it('physical invariances and limits: dimensionless, reciprocal, shift-invariant; closed window ∞, no wall 0', () => {
+    const r = windowResistance(-0.0254, 0, -0.0333, -0.0204);
+    expect(Math.abs(windowResistance(-2.54, 0, -3.33, -2.04) / r - 1)).toBeLessThan(1e-12); // lengths × 100
+    expect(Math.abs(windowResistance(-0.0333, -0.0204, -0.0254, 0) / r - 1)).toBeLessThan(1e-12); // layers swapped
+    expect(Math.abs(windowResistance(0.0746, 0.1, 0.0667, 0.0796) / r - 1)).toBeLessThan(1e-9); // y shifted by 0.1 m
+    expect(windowResistance(0, 0.01, 0.02, 0.03)).toBe(Infinity);
+    expect(windowResistance(0, 0.01, 0, 0.01)).toBe(0);
+    expect(() => windowResistance(0, 0, 0, 0.01)).toThrow(RangeError);
+    expect(() => windowResistance(0, 0.01, 0, 0.02, 0, 0.015)).toThrow(RangeError); // window outside a layer
+    // a lower window or a taller layer costs more
+    expect(windowResistance(-0.0254, 0, -0.0333, -0.022)).toBeGreaterThan(r);
+    expect(windowResistance(-0.0254, 0.01, -0.0333, -0.0204)).toBeGreaterThan(r);
+  });
+
+  it('lHeadPlanform puts r/|n·e| on bore ↔ pocket faces (n radial); none elsewhere; a closed window throws', () => {
+    const pf = lHeadPlanform(B, lHead);
+    const r = windowResistance(-lHeadDepthAtTDC(lHead), 0, lHead.deckY, lHead.pocket.roofY);
+    const R = B / 2;
+    expect(pf.interfaceResistance!(0, 1, -R, 0, 1, 0)).toBeCloseTo(r, 14); // radial face at the arc's middle
+    expect(pf.interfaceResistance!(1, 0, -R, 0, 1, 0)).toBeCloseTo(r, 14);
+    const c45 = Math.SQRT1_2 * R;
+    expect(pf.interfaceResistance!(0, 1, -c45, -c45, 1, 0)).toBeCloseTo(r * Math.SQRT2, 12); // |n·e| = cos 45°
+    expect(pf.interfaceResistance!(0, 0, -R, 0, 1, 0)).toBe(0);
+    expect(pf.interfaceResistance!(1, 1, -R, 0, 1, 0)).toBe(0);
+    expect(pf.interfaceResistance!(0, -1, -R, 0, 1, 0)).toBe(0);
+    // the crown above the pocket roof seals the pocket off
+    expect(() => lHeadPlanform(B, lHead, -lHead.pocket.roofY - 1e-3)).toThrow(RangeError);
+    expect(() => lHeadPlanform(B, lHead, -lHead.pocket.roofY + 1e-3)).not.toThrow();
   });
 });
 
@@ -142,6 +205,27 @@ describe('Model T L-head modes (oracle: scipy on the same grid and on finer grid
     s.alpha.forEach((a, j) => expect(Math.abs(g.alpha[j] / a - 1)).toBeLessThan(1e-9));
     s.meanSquare.forEach((m, j) => expect(Math.abs(g.meanSquare[j] / m - 1)).toBeLessThan(1e-7));
     expect(g.stats.maxResidual).toBeLessThan(1e-10);
+    // a planform without interfaceResistance is the former model (every region boundary an ordinary depth step)
+    const plain = new GridModeSet(B, { ...lHeadPlanform(B, lHead), interfaceResistance: undefined });
+    fx.sameGridNoWindow.alpha.forEach((a, j) => expect(Math.abs(plain.alpha[j] / a - 1)).toBeLessThan(1e-9));
+  });
+
+  it('3-D Helmholtz oracle (no depth averaging): α_1…α_5 within 1.5 % at TDC and 15° ATDC; without the window term +17 %', () => {
+    const g15 = new GridModeSet(B, lHeadPlanform(B, lHead, fx.depth15.depth), { maxAlpha: 3.5 });
+    for (const t of fx.threeD) {
+      // the depth-averaged model on the 3-D solve's own staircase: within 0.5 % with the window, far off without it
+      for (let j = 0; j < 5; j++) expect(Math.abs(t.alphaLongWaveWindow[j] / t.alpha3d[j] - 1)).toBeLessThan(5e-3);
+      expect(t.alphaLongWave[0] / t.alpha3d[0] - 1).toBeGreaterThan(t.deg === 0 ? 0.15 : 0.1);
+      if (t.cellsPerBore !== 96) continue;
+      const m = t.deg === 0 ? g : t.deg === 15 ? g15 : null;
+      expect(m).not.toBeNull();
+      expect(Math.abs(t.depth - (t.deg === 0 ? lHeadDepthAtTDC(lHead) : fx.depth15.depth))).toBeLessThan(1e-15);
+      for (let j = 0; j < 5; j++) expect(Math.abs(m!.alpha[j] / t.alpha3d[j] - 1)).toBeLessThan(0.015);
+    }
+    // the bias the window term removes: the former model's fundamental vs the 3-D one at TDC
+    const plain = fx.sameGridNoWindow.alpha[0] / fx.threeD.find((t) => t.deg === 0 && t.cellsPerBore === 96)!.alpha3d[0];
+    console.log(`[knock] Model T vs 3-D at TDC: α1 ${g.alpha[0].toFixed(4)} (window) / ${fx.sameGridNoWindow.alpha[0].toFixed(4)} (none, ${(100 * (plain - 1)).toFixed(1)} % high)`);
+    expect(plain - 1).toBeGreaterThan(0.15);
   });
 
   it('chamber volume = clearance volume − crevice (exact geometry within 0.02 %)', () => {
@@ -149,10 +233,10 @@ describe('Model T L-head modes (oracle: scipy on the same grid and on finer grid
     expect(Math.abs(g.volume / fx.endGasVolume.volume - 1)).toBeLessThan(2e-4);
   });
 
-  it('grid-converged: α_j within 0.3 % of the B/192 solution; fundamental ≈ 3.8 kHz at 950 m/s (2–4 kHz expected)', () => {
+  it('grid-converged: α_j within 0.5 % of the B/192 solution; fundamental ≈ 3.3 kHz at 950 m/s (2–4 kHz expected)', () => {
     const fine = fx.converged[1];
     expect(fine.cellsPerBore).toBe(192);
-    for (let j = 0; j < 12; j++) expect(Math.abs(g.alpha[j] / fine.alpha[j] - 1)).toBeLessThan(3e-3);
+    for (let j = 0; j < 12; j++) expect(Math.abs(g.alpha[j] / fine.alpha[j] - 1)).toBeLessThan(5e-3);
     const f1 = (g.alpha[0] * 950) / (Math.PI * B);
     console.log(
       `[knock] Model T L-head modes (B/64, ${g.nCells} cells, ${g.nModes} modes, build ${g.stats.buildMs.toFixed(0)} ms, Krylov ${g.stats.krylovDimension}): ` +
@@ -161,18 +245,24 @@ describe('Model T L-head modes (oracle: scipy on the same grid and on finer grid
     );
     expect(f1).toBeGreaterThan(2000);
     expect(f1).toBeLessThan(4000);
-    expect(f1).toBeCloseTo(3812, -1);
-    // depth weighting matters: the uniform-depth planform's fundamental is 7.5 % lower
-    const flat = new GridModeSet(B, { ...lHeadPlanform(B, lHead), yLo: [-0.01, -0.01], yHi: [0, 0] }, { maxAlpha: 2 });
-    expect(flat.alpha[0] / g.alpha[0]).toBeLessThan(0.95);
+    expect(f1).toBeCloseTo(3277, -1);
+    // depth weighting matters: without the window term, the uniform-depth planform's fundamental is 7.5 % lower
+    const plain = new GridModeSet(B, { ...lHeadPlanform(B, lHead), interfaceResistance: undefined }, { maxAlpha: 2 });
+    const flat = new GridModeSet(B, { ...lHeadPlanform(B, lHead), yLo: [-0.01, -0.01], yHi: [0, 0], interfaceResistance: undefined }, { maxAlpha: 2 });
+    expect(flat.alpha[0] / plain.alpha[0]).toBeLessThan(0.95);
+    // and the window: the bore ↔ pocket sloshing fundamental falls 14 %
+    expect(g.alpha[0] / plain.alpha[0]).toBeLessThan(0.87);
   });
 
-  it('bore-column depth at 15° ATDC moves the fundamental by +1 % (scipy B/96)', () => {
+  it('bore-column depth at 15° ATDC moves the fundamental by ≈ +5 % (scipy B/96; the 3-D solve agrees)', () => {
     const d15 = fx.depth15;
     const g15 = new GridModeSet(B, lHeadPlanform(B, lHead, d15.depth), { maxAlpha: 3.5 });
-    for (let j = 0; j < 6; j++) expect(Math.abs(g15.alpha[j] / d15.alpha[j] - 1)).toBeLessThan(2e-3);
-    expect(g15.alpha[0] / g.alpha[0] - 1).toBeGreaterThan(0.005);
-    expect(g15.alpha[0] / g.alpha[0] - 1).toBeLessThan(0.02);
+    for (let j = 0; j < 6; j++) expect(Math.abs(g15.alpha[j] / d15.alpha[j] - 1)).toBeLessThan(4e-3);
+    const shift = g15.alpha[0] / g.alpha[0] - 1;
+    expect(shift).toBeGreaterThan(0.04);
+    expect(shift).toBeLessThan(0.065);
+    const t3 = (deg: number): number => fx.threeD.find((t) => t.deg === deg && t.cellsPerBore === 96)!.alpha3d[0];
+    expect(Math.abs(shift - (t3(15) / t3(0) - 1))).toBeLessThan(5e-3);
   });
 });
 
@@ -215,7 +305,15 @@ describe('GridEndGasProjector (depth-weighted end gas outside the flame ball abo
     const w = Array.from(ko.sourceShape, (s, j) => s * ko.psiSensor[j]);
     fx.sameGrid.weights.forEach((ref, j) => expect(Math.abs(w[j] - ref)).toBeLessThan(1e-6 * Math.max(1, Math.abs(ref))));
     const fine = fx.converged[1].weights;
-    for (let j = 0; j < 12; j++) expect(Math.abs(w[j] - fine[j])).toBeLessThan(0.04 * Math.max(Math.abs(fine[j]), 0.1));
+    // modes 4 and 6 (α 3.07 / 3.18, 3.5 % apart) mix with the grid near the window: their individual weights
+    // converge O(Δ) (B/64 → 128 → 192: −0.069 → −0.092 → −0.099 and 0.184 → 0.206 → 0.215), their sum within 2 %
+    const pair = [4, 6];
+    for (let j = 0; j < 12; j++) {
+      if (pair.includes(j)) expect(Math.abs(w[j] - fine[j])).toBeLessThan(0.04);
+      else expect(Math.abs(w[j] - fine[j])).toBeLessThan(0.04 * Math.max(Math.abs(fine[j]), 0.1));
+    }
+    expect(Math.abs(w[4] + w[6] - (fine[4] + fine[6]))).toBeLessThan(0.04 * Math.abs(fine[4] + fine[6]));
+    expect(Math.abs(g.alpha[6] / g.alpha[4] - 1)).toBeLessThan(0.05);
     // the plug sits on the planform's mirror plane z = 0: modes odd in z neither ring there nor are excited
     expect(Math.abs(ko.psiSensor[1])).toBeLessThan(1e-9);
     expect(Math.abs(ko.sourceShape[1])).toBeLessThan(1e-9);
@@ -320,7 +418,10 @@ describe('Model T knock event and the engine factory', () => {
     // band: every mode ≤ 18 kHz at the reference sound speed counts, including the fundamental
     ko.setBandReference(950);
     expect(ko.bandGain(0, 950)).toBe(1);
-    expect(L_HEAD_MAPO_BAND[0]).toBeLessThan(ko.modeFrequency(0, 600));
+    // the fundamental (α ≈ 1.03, 2.8–3.5 kHz) stays inside the band over c = 800–1000 m/s, down to c ≈ 580 m/s
+    for (const c of [580, 800, 1000]) expect(L_HEAD_MAPO_BAND[0]).toBeLessThan(ko.modeFrequency(0, c));
+    expect(ko.modeFrequency(0, 1000)).toBeLessThan(L_HEAD_MAPO_BAND[1]);
+    expect(ko.modeFrequency(0, 560)).toBeLessThan(L_HEAD_MAPO_BAND[0]);
     const unfiltered = createKnockOscillator(MODEL_T, { band: null });
     unfiltered.setBandReference(950);
     expect(unfiltered.bandGain(ko.nModes - 1, 950)).toBe(1);
