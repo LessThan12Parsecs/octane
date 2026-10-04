@@ -179,26 +179,47 @@ const VALVE_Z = 0.024;
  * turns, 3,300 Ω, 22.0 H; condenser ".40 – .45 MFD" (Ford spec). RL back-solves of independent
  * oscillograms give 3.1–3.9 mH [Cool; ECCT], supporting 3.3 mH.
  *  - couplingCoefficient: 1 − k² = 0.6/3.3 → k ≈ 0.90 (primary side) — derived; the secondary-side ratio
- *    gives ≈ 0.70 (UNVERIFIED which the coupled-circuit model should use; 0.90 reproduces the 300–400 V
- *    primary peaks [Cool] with the condenser).
+ *    gives ≈ 0.70 (UNVERIFIED which the coupled-circuit model should use). Kept at 0.90: with the condenser
+ *    and C₂ the open-circuit ring after a 6 V fire peaks at 412 V on the points / 34 kV on the plug
+ *    (12 V: 512 V / 42 kV) in ignition/trembler-coil.ts and its Radau oracle — the ≈ 300–400 V primary
+ *    peak [Cool] including reflected C₂ (≈ 400 V lossless estimate, research verification) and ≥ the
+ *    8–20 kV Ford quotes for the HT output; k = 0.85 / 0.95 change the peak by < 7 % (not refitted). The
+ *    model has no core loss, so the open-circuit peaks are upper bounds.
  *  - secondaryCapacitance: UNVERIFIED typical 20–50 pF (winding + HT lead + plug).
  *  - vibrator: point gap 1/32 in with the armature held down, cushion-spring clearance 0.005 in [FM19;
  *    ECCT; BP] → breakTravel 0.127 mm, maxTravel ≈ 0.127 + 0.794 mm. pullCurrent, naturalFrequency,
- *    dampingRatio and airGap are UNVERIFIED first estimates, to be fitted (ignition tests) to: first fire
- *    3.5 ms after timer make at ≈ 5.0–5.4 A on 6 V, 2.5 ms / 6.2 A on 9 V, 2.0 ms / 6–7 A on 12 V
- *    [ECCT; Cool]; HCCT fires at 3.0–4.4 A on slow magneto pulses [Kossor]; points re-close ≈ 1.8 ms after
- *    the fire on 6 V (buzz ≈ 190 Hz) [Cool].
+ *    dampingRatio and airGap are FITTED (UNVERIFIED as individual numbers: no mechanical data exist) with
+ *    the 1-DOF armature model of ignition/vibrator.ts (preload deflection g₀/2, i.e. pullCurrent is the
+ *    static pull-in current) by least squares (tools/reference/ignition_trembler_oracle.py --fit, Radau
+ *    model of the full circuit: battery + 0.05 Ω, no timer, 10 kV bench gap) to the DC coil-tester data
+ *    [ECCT; Cool]: first fire after the make 3.5 ms on 6 V, 2.5 ms on 9 V, 2.0 ms on 12 V, points re-closing
+ *    1.8 ms after the 6 V fire. Achieved (oracle): 3.503 / 2.496 / 1.998 ms at 5.34 / 5.96 / 6.52 A
+ *    (targets ≈ 5.0–5.4 / 6.2 / 6–7 A — the currents are not fitted, they follow from the RL ramp),
+ *    re-close 1.813 ms; emergent: buzz period 5.0 ms on 6 V (≈ 200 Hz; ≈ 190 Hz [Cool]), points open longer
+ *    at higher current (2.3 ms at 9 V, 2.7 ms at 12 V; "higher firing current throws the vibrator open
+ *    wider" [Kossor]), fire at 4.1–4.3 A on slow 120–150 rpm magneto pulses (HCCT fires at 3.0–4.4 A
+ *    [Kossor]), ½L₁I² = 47 mJ at the 6 V fire (48–50 mJ at 5.4–5.5 A [ECCT]). The fit is degenerate along
+ *    (f_n ↓, ζ ↑, g₀ ↑) — e.g. 3.47 A / 113 Hz / 0.56 / 1.56 mm fits equally well and gives the same
+ *    observables to < 1 % — the solution with the lower damping and g₀ just above maxTravel (armature
+ *    resting ≈ 1 mm above the core) is used. A blade-spring estimate (≈ 0.5 mm × 13 mm × 40 mm spring steel,
+ *    ≈ 2 g armature) gives f_n ≈ 125 Hz (UNVERIFIED, own estimate), consistent.
  *  - magneto: 16 magnets / 16 coils, 8 cycles per crank revolution [Dyke24 pp. 248–249; FSB magneto table];
  *    open-circuit ≥ 7 V at 400 rpm (Ford service minimum), healthy ≈ 10 V at 407 rpm … 24.4 V at 1220 rpm
- *    (restorer, rms) → ≈ 0.0235 V_rms/rpm = 0.317 V_peak per rad/s; source ≈ 0.3 Ω DC [BP] + ≈ 3 mH
- *    (UNVERIFIED: |Z| from the 1976 table's short-circuit currents). phaseDeg: UNVERIFIED — the magnets are
- *    set 7° advanced (drawing T-701-C [BP]); to be fitted to Patterson's 600 rpm spark ladder (first fire
- *    26.5° ATDC at full retard, then 4° ATDC, 18.5° BTDC, 41° BTDC, 22.5° steps) [BP].
+ *    (restorer, rms) → ≈ 0.0235 V_rms/rpm = 0.317 V_peak per rad/s; source ≈ 0.3 Ω DC [BP]. internalInductance
+ *    FITTED (UNVERIFIED: assumes the table's amperes are short-circuit currents): least squares of
+ *    |R_s + jω_e L_s| to V/I of the 1976 Gas Engine Magazine table (W. H. Payne; 400–1200 rpm) with R_s = 0.3 Ω
+ *    → 3.05 mH (residuals −0.18…+0.17 Ω of 1.24–2.91 Ω; 3.15 mH in relative terms); short-circuit current at
+ *    speed k/(N L_s) = 13 A peak = 9.2 A rms vs 7.9–9.0 A in the table. phaseDeg FITTED to Patterson's 600 rpm
+ *    magneto spark ladder [BP] with the whole system (ignition/trembler.test.ts; timer 0.1 Ω, plug at 8 kV):
+ *    first spark at full retard (make 15.5° ATDC) 26.54° ATDC (measured 26.5°); stationary first-spark angles
+ *    of the lever plateaus 26.39° ATDC, 3.89° ATDC, 18.61° BTDC, 41.11° BTDC (measured 26.5, 4, −18.5, −41°)
+ *    → φ = −8.5°: the EMF zero crossing 8.5° BTDC, i.e. the magneto "leads TDC" by 8.5° vs the 7° of Ford
+ *    drawing T-701-C [BP] — consistent to 1.5°.
  *  - timer: each segment grounded for 87° crank (15.5° → 102.5° ATDC at full retard, measured) [BP]; spark
  *    lever travel 80° (28 notches), make at 15.5° ATDC full retard … 64.5° BTDC full advance with Ford's
  *    2-1/2 in gauge setting (1919–27) [BP; Ford Service Par. 126]. contactResistance UNVERIFIED (roller).
  *  - battery: 6 V three-cell storage battery on starter cars from 1919 [FM19 starting-system booklet];
- *    internal resistance UNVERIFIED.
+ *    internal resistance UNVERIFIED (also the source resistance assumed for the coil-tester fit above).
  */
 export const MODEL_T_IGNITION: TremblerMagnetoIgnitionSpec = {
   type: 'trembler-magneto',
@@ -211,20 +232,20 @@ export const MODEL_T_IGNITION: TremblerMagnetoIgnitionSpec = {
     couplingCoefficient: 0.9,
     condenserCapacitance: 0.43e-6,
     vibrator: {
-      pullCurrent: 2.5, // UNVERIFIED first estimate (fit target above)
-      naturalFrequency: 300, // UNVERIFIED first estimate
-      dampingRatio: 0.1, // UNVERIFIED
+      pullCurrent: 3.53, // UNVERIFIED: fitted to the DC firing times (see above)
+      naturalFrequency: 133, // UNVERIFIED: fitted
+      dampingRatio: 0.34, // UNVERIFIED: fitted
       breakTravel: 0.005 * IN,
       maxTravel: 0.005 * IN + (1 / 32) * IN,
-      airGap: 0.04 * IN, // UNVERIFIED: armature rests just above the core end
+      airGap: 1.16e-3, // UNVERIFIED: fitted (effective gap; armature rests ≈ 0.24 mm beyond its travel to the core)
     },
   },
   magneto: {
     cyclesPerRevolution: 8,
     emfConstant: 0.317,
-    phaseDeg: -18.25, // UNVERIFIED (EMF peak 7° BTDC); fit to [BP] spark ladder
+    phaseDeg: -8.5, // UNVERIFIED: fitted to the [BP] 600 rpm spark ladder (EMF zero 8.5° BTDC; T-701-C: 7°)
     internalResistance: 0.3,
-    internalInductance: 3e-3, // UNVERIFIED
+    internalInductance: 3.05e-3, // UNVERIFIED: fitted to the 1976 table's V/I (short-circuit assumption)
   },
   battery: { voltage: 6, internalResistance: 0.05 },
   timer: { contactArcDeg: 87, advanceRangeDeg: [-15.5, 64.5], contactResistance: 0.1 },

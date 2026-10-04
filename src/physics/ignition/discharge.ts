@@ -183,6 +183,10 @@ export class SparkGap {
   extinctionTime = NaN;
   /** Voltage required at the last breakdown, V. */
   lastBreakdownVoltage = 0;
+  /** Simulated time of the last breakdown since reset, s (NaN if none). Output only. */
+  lastBreakdownTime = NaN;
+  /** Total time the gap conducted since reset (sum over all discharges of a spark train), s. Output only. */
+  conductingTime = 0;
 
   // ---- energy ledger (since reset), J ----
   /** Total electrical energy delivered to the gap (all phases). */
@@ -239,6 +243,8 @@ export class SparkGap {
     this.firstBreakdownTime = NaN;
     this.extinctionTime = NaN;
     this.lastBreakdownVoltage = 0;
+    this.lastBreakdownTime = NaN;
+    this.conductingTime = 0;
     this.energyTotal = 0;
     this.energyBreakdown = 0;
     this.energyCapacitiveArc = 0;
@@ -414,6 +420,7 @@ export class SparkGap {
     this.energyToElectrodes += eDump - gasBd - gasCap - radBd - radCap;
     this.breakdownCount++;
     this.lastBreakdownVoltage = vAbs;
+    this.lastBreakdownTime = t;
     if (Number.isNaN(this.firstBreakdownTime)) this.firstBreakdownTime = t;
     if (Number.isNaN(this.stepBreakdownTime)) this.stepBreakdownTime = t;
     this.voltage = vAfter;
@@ -442,6 +449,7 @@ export class SparkGap {
     const eGas = e - eSheath - eRad;
     this.energyTotal += e;
     this.stepElectricalEnergy += e;
+    this.conductingTime += h;
     if (arc) this.energyArc += e;
     else this.energyGlow += e;
     this.energyToGas += eGas;
