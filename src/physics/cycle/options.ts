@@ -501,8 +501,10 @@ const MAX_GRADE = 0.5;
 
 /**
  * A validated copy of a load spec, or the fallback's (copied) when it is malformed, or undefined
- * (= constant loadTorque) when neither is valid. 'vehicle' needs spec.vehicle and a gear it lists (or
- * 'neutral'); 'brake' needs refRpm > 0 and a finite exponent (clamped to [0, 4]).
+ * (= constant loadTorque) when neither is valid. 'vehicle' needs spec.vehicle and a gear it lists — an OWN
+ * property of vehicle.gears with a finite positive ratio (an inherited name such as 'toString' or
+ * '__proto__' is malformed: code review) — or 'neutral'; 'brake' needs refRpm > 0 and a finite exponent
+ * (clamped to [0, 4]).
  */
 function sanitizeLoad(spec: EngineSpec, l: LoadSpec, fb: LoadSpec | undefined): LoadSpec | undefined {
   const ok = (x: LoadSpec | undefined): LoadSpec | undefined => {
@@ -514,7 +516,11 @@ function sanitizeLoad(spec: EngineSpec, l: LoadSpec, fb: LoadSpec | undefined): 
     }
     if (x.kind === 'vehicle') {
       const v = spec.vehicle;
-      if (!v || typeof x.gear !== 'string' || !(x.gear === 'neutral' || x.gear in v.gears)) return undefined;
+      if (!v || typeof x.gear !== 'string') return undefined;
+      if (x.gear !== 'neutral') {
+        const G: unknown = Object.hasOwn(v.gears, x.gear) ? v.gears[x.gear] : undefined;
+        if (!(typeof G === 'number' && Number.isFinite(G) && G > 0)) return undefined;
+      }
       return { kind: 'vehicle', gear: x.gear, grade: Number.isFinite(x.grade) ? clamp(x.grade, -MAX_GRADE, MAX_GRADE) : 0 };
     }
     return undefined;

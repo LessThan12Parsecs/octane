@@ -177,7 +177,12 @@ export interface EngineCycleSummary {
   indicatedTorque: number;
   /** Mean friction torque, N m (positive = loss). */
   frictionTorque: number;
-  /** Mean brake torque = indicated − friction − (inertia, ≈ 0 at steady speed), N m. */
+  /**
+   * Mean brake torque = indicated − friction − (inertia, ≈ 0 at steady speed), N m: the ENGINE's output at the
+   * crankshaft. The inertia term is the kinetic-energy change of the engine's own rotating and reciprocating
+   * parts (crank + flywheel and the piston/rod mechanisms) over the cycle / 4π; a driven car's inertia is
+   * downstream of the output (see loadInertiaTorque) and the impulse of a clutch engagement is excluded.
+   */
   brakeTorque: number;
   /** Brake power, W. */
   brakePower: number;
@@ -193,9 +198,21 @@ export interface EngineCycleSummary {
   /** Brake specific fuel consumption, kg/J, and brake thermal efficiency (LHV). */
   bsfc: number;
   brakeEfficiency: number;
-  /** Mean load torque, N m; mean vehicle speed, m/s ('vehicle' load). */
+  /**
+   * Mean load torque, N m: free speed — the load model's ∫T_L ω dt / 4π (a car: road load + driveline loss
+   * while in gear, 0 in neutral); fixed speed — the dynamometer's absorbed torque (= brake). Mean vehicle speed,
+   * m/s ('vehicle' load in free speed: road distance / cycle time, coasting in neutral included).
+   */
   loadTorque: number;
   vehicleSpeed?: number;
+  /**
+   * Free speed, engines with a vehicle (EngineSpec.vehicle): the kinetic-energy change of the car while coupled
+   * to the crank (its inertia reflected through the engaged gear, ½J_L Δω² between gear changes) / 4π, N m;
+   * the energy balance closes as brakeTorque ≈ loadTorque + loadInertiaTorque. Optional.
+   */
+  loadInertiaTorque?: number;
+  /** Energy dissipated in the clutch by gear engagements during the cycle (free speed), J. Optional (as loadInertiaTorque). */
+  clutchLoss?: number;
 }
 
 export interface CycleSummary {

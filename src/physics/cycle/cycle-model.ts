@@ -22,7 +22,10 @@
  * cylinder's gas, inertia and gravity torque at its throw phase, Σ J_m), the whole-engine friction
  * (FrictionTorqueModel normalised by N·V_d, torqueCylinders) and the load model (mechanics LoadModel from
  * op.load: constant / brake / vehicle road load with the car's reflected inertia / neutral); for one
- * cylinder and a constant load this is bit for bit the former single-cylinder right-hand side. After a
+ * cylinder and a constant load this is bit for bit the former single-cylinder right-hand side. The car of a
+ * 'vehicle' load has its own road speed: k ω in gear, coasting on its road load when declutched (integrated
+ * after every step), and a gear change in free speed is an inelastic clutch engagement conserving the angular
+ * momentum through the gear train (setOperatingPoint; clutchLoss ledger). After a
  * split in a closed cylinder of a fixed-speed multi-cylinder engine only that cylinder is re-evaluated
  * (refreshCylinder).
  *
@@ -157,6 +160,7 @@ import {
   pnhFmep,
   type CrankTrainDynamics,
   type KinematicState,
+  type LoadModelKind,
   type SliderCrank,
 } from '../mechanics';
 import { completeCombustionProducts, freshCharge, fuelFromSelection, humidAir, lowerHeatingValue, type FuelBlend } from '../thermo/fuels';
@@ -196,6 +200,7 @@ import {
   OUTLET_DISCHARGE_COEFFICIENT,
   resolveDelayModel,
   stateLength,
+  TIME_TARGET_REL_TOL,
   WARMUP_EXTRA_MAX,
   WARMUP_MASS_TOL,
   newCycleTrace,
@@ -243,6 +248,8 @@ export class CycleModel {
   readonly crank: MultiCylinderCrankTrain;
   /** Load on the crank in free-speed mode (op.load / loadTorque), configured from the operating point in effect. */
   readonly load: LoadModel;
+  /** Scratch load model: setOperatingPoint validates a new load on it before committing. */
+  private readonly loadCheck: LoadModel;
   /** Venturi + butterfly carburettor (spec.manifolds.venturiDiameter), or null (the CFR venturi-as-throttle). */
   readonly carb: CarburettorFlowModel | null;
   delayModel: IgnitionDelayModel;
@@ -316,10 +323,25 @@ export class CycleModel {
   private tEngineStart = 0;
   private ventEngineStart = 0;
   private omegaEngineStart = 0;
-  /** Load-model inertia at the engine-cycle start (a gear change jumps it), kg m². */
-  private loadInertiaStart = 0;
   /** ∫ T_load ω dt over the current engine cycle (free speed), J. */
   private loadWork = 0;
+  /**
+   * Kinetic-energy change of the coupled load's reflected inertia, ½J_L(ω_b² − ω_a²), summed over the pieces of
+   * the current engine cycle between load (gear) changes, J — the piece in progress starts at loadPieceOmega.
+   * Clutch-engagement jumps fall between the pieces (excluded).
+   */
+  private loadKEPieces = 0;
+  private loadPieceOmega = 0;
+  /** Engine-side kinetic-energy jumps ½J_e(ω′² − ω²) of the clutch engagements in the current engine cycle, J. */
+  private engineKEJumps = 0;
+  /** Energy dissipated by clutch engagements since the start of the run (free speed, 'vehicle' load), J. */
+  clutchLoss = 0;
+  private clutchLossEngineStart = 0;
+  /** Road speed of the declutched car (load 'neutral'), m/s (in gear the road speed is k ω: vehicleSpeed()). */
+  private coastSpeed = 0;
+  /** Road distance of the car since the start of the run, m (engine summary: mean road speed). */
+  private roadDistance = 0;
+  private roadDistanceEngineStart = 0;
 
   // ---- trace ----
   traceCycle = -1;
@@ -374,6 +396,7 @@ export class CycleModel {
     this.friction = new FrictionTorqueModel(c0.kin, 0.5, n);
     this.crank = MultiCylinderCrankTrain.fromSpec(spec, c0.kin);
     this.load = new LoadModel(spec.vehicle);
+    this.loadCheck = new LoadModel(spec.vehicle);
     this.pCyl = new Float64Array(n);
     this.carb = hasSeparateThrottle(spec.manifolds)
       ? new CarburettorFlowModel(spec.manifolds, { venturiDischargeCoefficient: this.opts.venturiDischargeCoefficient, restrictionArea: this.opts.intakeRestrictionArea })
@@ -461,7 +484,31 @@ export class CycleModel {
   // Public control
   // ===========================================================================================
 
-  /** Change operating conditions: rpm / throttle / load / speed mode / ignition source now, the rest at the next cycle start. */
+  /**
+   * Change operating conditions: rpm / throttle / load / speed mode / ignition source now, the rest at the next
+   * cycle start. The load is validated on the candidate operating point BEFORE anything is committed: a load
+   * the model cannot configure throws here and leaves the model unchanged (code review: an inherited gear name
+   * used to poison pendingOp, and every later call threw).
+   *
+   * Gear changes of a 'vehicle' load (engaging, changing or leaving a gear, neutral included) act on the car's
+   * road speed v, a state of its own (see {@link vehicleSpeed}):
+   *  - leaving gear (to neutral or to a dynamometer load) keeps ω and the car's speed v = k_old ω — the car
+   *    then coasts (neutral) or leaves the model (a constant / brake load);
+   *  - free speed, engaging a gear while the car has a speed of its own (from a gear or from neutral): an
+   *    INELASTIC clutch engagement through the rigid gear train. The impulse conserves the generalised
+   *    momentum along the crank, J_e ω + J_L v/k = (J_e + J_L) ω′ (J_e = J_rot + Σ_i J_m(θ_i) at the current
+   *    angle, J_L and k = roadSpeedPerOmega of the new gear, signed: reverse while rolling forward gives a
+   *    negative v/k), and dissipates ½ J_e J_L/(J_e + J_L)(ω − v/k)² in the clutch (clutchLoss ledger). The
+   *    stall guard holds ω′ ≥ FREE_MODE_MIN_RPM (as in the right-hand side); the ledger books the exact
+   *    kinetic-energy change, so it then also holds the energy the guard adds. Round 1 kept ω and made the
+   *    car's speed jump (a downshift destroyed ≈ 48 kJ of the car's kinetic energy, neutral → high created it);
+   *  - engaging a gear from a dynamometer load (constant / brake: no car before) starts with the car rolling
+   *    at the gear's speed k ω — a new test set-up, not a clutch event (no ledger entry);
+   *  - fixed speed: the dynamometer is an ideal speed source; it holds ω through any gear change and the car
+   *    follows at k ω in gear (the dynamometer supplies or absorbs the impulse: no clutch ledger, nothing in
+   *    the engine summary, which in fixed speed has no kinetic-energy term).
+   * The engine summary keeps the impulsive exchange out of the brake torque (see makeEngineSummary).
+   */
   setOperatingPoint(patch: Partial<OperatingPoint>): void {
     // undefined keys of the patch keep the pending value (a spread would overwrite it with undefined);
     // non-finite values are repaired from the pending point by the sanitiser (validation round 2)
@@ -471,7 +518,10 @@ export class CycleModel {
       if (v !== undefined) (next as Record<string, unknown>)[k] = v;
     }
     if (patch.fuel) next.fuel = { ...patch.fuel };
-    this.pendingOp = sanitizeOperatingPoint(this.spec, next, this.pendingOp);
+    const pending = sanitizeOperatingPoint(this.spec, next, this.pendingOp);
+    // (validate on a scratch load model with exactly what `this.load.configure(o)` will see below; throws)
+    this.loadCheck.configure({ loadTorque: pending.loadTorque, load: pending.load, ambientPressure: this.op.ambientPressure, ambientTemperature: this.op.ambientTemperature });
+    this.pendingOp = pending;
     const o = this.op;
     o.rpm = this.pendingOp.rpm;
     o.throttle = this.pendingOp.throttle;
@@ -482,12 +532,77 @@ export class CycleModel {
     if (this.pendingOp.ignitionSource !== undefined) o.ignitionSource = this.pendingOp.ignitionSource;
     else if (o.ignitionSource !== undefined) delete o.ignitionSource;
     if (o.speedMode === 'fixed') this.y[I_OM] = (o.rpm * 2 * Math.PI) / 60;
-    // the load model follows the new load at once (a gear change makes the reflected inertia jump: an ideal
-    // slipping clutch keeps ω continuous); the ignition source switches at each coil's next timer make
-    this.load.configure(o);
+    // the load model follows the new load at once; a gear change acts through the clutch (changeGear); the
+    // ignition source switches at each coil's next timer make
+    const ld = this.load;
+    const prevKind = ld.kind;
+    const prevGear = ld.gear;
+    const prevInertia = ld.inertia();
+    const vCar = this.vehicleSpeed();
+    ld.configure(o);
+    if (ld.kind !== prevKind || ld.gear !== prevGear) this.changeGear(prevKind, prevInertia, vCar);
     this.applyIgnitionSource();
     this.updateFriction();
     this.invalidateAll();
+  }
+
+  /**
+   * Engine-side inertia about the crank at the current angle, J_e = J_rot + Σ_i J_m(θ_i), kg m² (crank +
+   * flywheel and every piston/rod mechanism; not the load's reflected inertia).
+   */
+  engineInertia(): number {
+    let J = this.c0.dyn.rotatingInertia;
+    for (const c of this.cylinders) J += c.dyn.mechanismInertia(c.theta * DEG);
+    return J;
+  }
+
+  /**
+   * Road speed of the vehicle, m/s: k ω while a gear is engaged ('vehicle' load; negative in reverse), the
+   * coasting speed when declutched (gear 'neutral': m_c dv/dt = −F_road(v), integrated with every step,
+   * LoadModel.coastSpeedAfter; the car starts at rest at a cold start in neutral), 0 for loads without a car.
+   */
+  vehicleSpeed(): number {
+    const ld = this.load;
+    if (ld.kind === 'vehicle') return ld.vehicleSpeed(this.y[I_OM]);
+    return ld.kind === 'neutral' ? this.coastSpeed : 0;
+  }
+
+  /**
+   * The load's engagement changed (setOperatingPoint; `this.load` already configured for the new load): car
+   * speed, clutch engagement and the engine-summary bookkeeping (see setOperatingPoint for the physics).
+   * @param prevKind load kind before the change
+   * @param prevInertia reflected load inertia before the change, kg m²
+   * @param vCar road speed of the car before the change, m/s (0 without a car)
+   */
+  private changeGear(prevKind: LoadModelKind, prevInertia: number, vCar: number): void {
+    const ld = this.load;
+    const y = this.y;
+    const w = y[I_OM];
+    // the piece of the coupled load's kinetic energy that ends here (engine summary: loadInertiaTorque)
+    this.loadKEPieces += 0.5 * prevInertia * (w * w - this.loadPieceOmega * this.loadPieceOmega);
+    this.loadPieceOmega = w;
+    if (ld.kind === 'neutral') {
+      // declutched: the car keeps its speed and coasts (a car new to the model starts at rest)
+      this.coastSpeed = prevKind === 'vehicle' || prevKind === 'neutral' ? vCar : 0;
+      return;
+    }
+    if (ld.kind !== 'vehicle') return; // a dynamometer load: the car leaves the model
+    const hadCar = prevKind === 'vehicle' || prevKind === 'neutral';
+    if (!hadCar || this.op.speedMode !== 'free') return; // new set-up / dynamometer-held speed: v = k ω
+    // inelastic clutch engagement: J_e ω + J_L v/k conserved
+    const k = ld.roadSpeedPerOmega;
+    const JL = ld.inertia();
+    const Je = this.engineInertia();
+    const wCar = vCar / k;
+    let w1 = (Je * w + JL * wCar) / (Je + JL);
+    if (w1 < FREE_MODE_MIN_OMEGA) w1 = FREE_MODE_MIN_OMEGA; // stall guard (numerical, as in evaluate)
+    const keBefore = 0.5 * Je * w * w + 0.5 * JL * wCar * wCar;
+    const keAfter = 0.5 * (Je + JL) * w1 * w1;
+    this.clutchLoss += keBefore - keAfter;
+    this.engineKEJumps += 0.5 * Je * (w1 * w1 - w * w);
+    this.loadPieceOmega = w1;
+    y[I_OM] = w1;
+    this.yComp[I_OM] = 0;
   }
 
   /** Trembler-magneto: request the operating point's supply (MAG / BAT) on every cylinder's ignition. */
@@ -547,7 +662,7 @@ export class CycleModel {
     this.interrupt = false;
     let guard = 0;
     while (!this.finished && guard++ < 10_000_000) {
-      if (this.t >= tTarget - 1e-14 * Math.max(1, Math.abs(tTarget))) return;
+      if (this.t >= tTarget - TIME_TARGET_REL_TOL * Math.max(1, Math.abs(tTarget))) return;
       // (θ = 360 is never "reached" without the engine wrap: a step that was limited short of a landing —
       // fine/stiffness steps that are not grid-aligned, e.g. a cylinder's fine phase across the wrap —
       // may end within 1e-9° below it, and the next step then lands on it)
@@ -574,6 +689,10 @@ export class CycleModel {
     this.stiffness = 0;
     this.alpha = 0;
     this.pInt = 0;
+    // the car (a 'vehicle' load): at rest when declutched, k ω in gear; no clutch losses yet
+    this.coastSpeed = 0;
+    this.roadDistance = 0;
+    this.clutchLoss = 0;
     this.invalidateAll();
     this.fuel = fuelFromSelection(this.op.fuel);
     y[I_OM] = (this.op.rpm * 2 * Math.PI) / 60;
@@ -887,20 +1006,32 @@ export class CycleModel {
     this.tEngineStart = this.t;
     this.ventEngineStart = this.ventMass();
     this.omegaEngineStart = this.y[I_OM];
-    this.loadInertiaStart = this.load.inertia();
     this.loadWork = 0;
+    this.loadKEPieces = 0;
+    this.loadPieceOmega = this.y[I_OM];
+    this.engineKEJumps = 0;
+    this.clutchLossEngineStart = this.clutchLoss;
+    this.roadDistanceEngineStart = this.roadDistance;
     for (const c of this.cylinders) c.wEngineStart = this.y[c.ix.W];
   }
 
   /**
    * Engine-level results of the engine cycle just completed (θ −360 → 360): mean speed, indicated torque
    * (∫p dV of all cylinders / 4π), friction torque (cycle mean of the FrictionTorqueModel at the mean
-   * speed), brake torque = indicated − friction − ΔE_kin/4π (free speed: the kinetic-energy change of the
-   * crank, the mechanisms and the load's reflected inertia, ½(J_rot + ΣJ_m + J_L)ω², over the cycle), mean
-   * effective pressures over the total displacement, carburettor air and fuel flow from the venturi ledger,
-   * η_v, BSFC (0 when the brake power is not positive) and brake efficiency (LHV of the selected fuel), and
-   * the load: in free mode the constant loadTorque, else the cycle mean ∫T_L ω dt/4π of the load model (and
-   * the mean road speed of a vehicle in gear); the dynamometer's absorbed (= brake) torque in fixed mode.
+   * speed), brake torque = indicated − friction − ΔE_kin/4π — the ENGINE's output at the crankshaft (free
+   * speed: ΔE_kin is the kinetic-energy change of the engine's own rotating and reciprocating parts,
+   * ½(J_rot + ΣJ_m)ω², over the cycle; θ wraps to the same phase, so ΣJ_m is the same at both ends; the
+   * impulsive exchange of a clutch engagement, engineKEJumps, is excluded), mean effective pressures over the
+   * total displacement, carburettor air and fuel flow from the venturi ledger, η_v, BSFC (0 when the brake
+   * power is not positive) and brake efficiency (LHV of the selected fuel), and the load: in free mode the
+   * constant loadTorque, else the cycle mean ∫T_L ω dt/4π of the load model; the dynamometer's absorbed
+   * (= brake) torque in fixed mode. Free speed with a vehicle (EngineSpec.vehicle): the mean road speed (road
+   * distance / cycle time, coasting included), the kinetic-energy change of the car while coupled
+   * (loadInertiaTorque, ½J_L Δω² per piece between gear changes / 4π) — the energy balance closes as
+   * brake ≈ load + loadInertia — and the clutch losses of the cycle.
+   * Round 1 put the car's J_L into ΔE_kin: brake torque then collapsed to the road-load torque (≈ 6 N m while
+   * the engine delivered ≈ 90 N m accelerating in low gear; BSFC ≈ 10 kg/kWh) and a gear change booked the
+   * car's kinetic-energy jump as brake work (brake 3844 N m, η_b 7.6: code review).
    */
   private makeEngineSummary(): EngineCycleSummary {
     const y = this.y;
@@ -914,16 +1045,15 @@ export class CycleModel {
     const indicated = W / (4 * Math.PI);
     const friction = this.meanFrictionTorque(om);
     let dKE = 0;
+    let dKELoad = 0;
     const free = this.op.speedMode === 'free';
     if (free) {
-      let J = this.c0.dyn.rotatingInertia;
-      for (const c of cyls) J += c.dyn.mechanismInertia(c.theta * DEG);
-      // (+ the load's reflected inertia — the car in gear; a gear change during the cycle jumps it)
-      const JL0 = this.loadInertiaStart;
-      const JL1 = this.load.inertia();
+      const J = this.engineInertia();
       const w1 = y[I_OM];
       const w0 = this.omegaEngineStart;
-      dKE = JL0 === JL1 ? 0.5 * (J + JL1) * (w1 * w1 - w0 * w0) : 0.5 * ((J + JL1) * w1 * w1 - (J + JL0) * w0 * w0);
+      dKE = 0.5 * J * (w1 * w1 - w0 * w0) - this.engineKEJumps;
+      const wp = this.loadPieceOmega;
+      dKELoad = this.loadKEPieces + 0.5 * this.load.inertia() * (w1 * w1 - wp * wp);
     }
     const brake = indicated - friction - dKE / (4 * Math.PI);
     const mV = this.ventMass() - this.ventEngineStart;
@@ -955,8 +1085,14 @@ export class CycleModel {
       brakeEfficiency: fuelFlow > 0 && lhv > 0 ? power / (fuelFlow * lhv) : 0,
       loadTorque,
     };
-    // mean road speed of the car (v = k ω is linear in ω: k × the cycle-mean speed)
-    if (free && (ld.kind === 'vehicle' || ld.kind === 'neutral')) summary.vehicleSpeed = ld.vehicleSpeed(om);
+    // mean road speed of the car: distance / time (in gear ∫k ω dt = k Δθ; coasting in neutral included)
+    if (free && (ld.kind === 'vehicle' || ld.kind === 'neutral')) {
+      summary.vehicleSpeed = dt > 0 ? (this.roadDistance - this.roadDistanceEngineStart) / dt : this.vehicleSpeed();
+    }
+    if (free && this.spec.vehicle) {
+      summary.loadInertiaTorque = dKELoad / (4 * Math.PI);
+      summary.clutchLoss = this.clutchLoss - this.clutchLossEngineStart;
+    }
     return summary;
   }
 
@@ -1116,6 +1252,15 @@ export class CycleModel {
       const w0 = this.y0[I_OM];
       const w1 = y[I_OM];
       this.loadWork += 0.5 * h * (this.load.torque(w0) * w0 + this.load.torque(w1) * w1);
+    }
+    // the car's road distance (in gear k Δθ) and, declutched, its coasting speed (independent of the engine)
+    if (this.load.kind === 'vehicle') {
+      this.roadDistance += this.load.roadSpeedPerOmega * (y[I_TH] - this.y0[I_TH]) * DEG;
+    } else if (this.load.kind === 'neutral') {
+      const v0 = this.coastSpeed;
+      const v1 = this.load.coastSpeedAfter(v0, h);
+      this.roadDistance += 0.5 * h * (v0 + v1);
+      this.coastSpeed = v1;
     }
     // ---- operator splits and bookkeeping ----
     for (let i = 0; i < n; i++) cyls[i].afterStep(h);
