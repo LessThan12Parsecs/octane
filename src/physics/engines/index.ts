@@ -97,10 +97,13 @@ export const ENGINES: Readonly<Record<EngineId, EngineDefinition>> = {
         note: 'Level road, part throttle, spark lever part-advanced, on magneto',
       },
       {
+        // Pagé 1915/1918 lever chart: "Maximum speed: spark and throttle fully advanced". The calibrated model
+        // settles at ≈ 44 mph (1800 rpm); below ≈ 1400 rpm the full lever gives spark knock (period practice:
+        // retard the spark on a hard pull) — lever 40 sits on the magneto's 13–16° BTDC step and tops out far lower.
         id: 'full-throttle',
         label: 'Full throttle, high gear',
-        op: { ...MODEL_T_CRUISE, throttle: 1, sparkAdvanceDeg: 40 },
-        note: 'Accelerate toward top speed (≈ 42–45 mph)',
+        op: { ...MODEL_T_CRUISE, throttle: 1, sparkAdvanceDeg: 64.5 },
+        note: 'Spark and throttle fully advanced: accelerate toward top speed (≈ 42–45 mph); knocks if it labours',
       },
       {
         id: 'hill-low',
@@ -109,9 +112,12 @@ export const ENGINES: Readonly<Record<EngineId, EngineDefinition>> = {
         note: '10 % grade in low (2.75:1)',
       },
       {
+        // Ford's service procedure "throttle the engine down to about 400 R.P.M." with the spark retarded: lever 5
+        // (first spark ≈ 4° ATDC on the magneto) and hand throttle 0.12 settle at ≈ 405 rpm declutched in the
+        // calibrated model (0.07 → 230, 0.11 → 370, 0.13 → 440 rpm; 0.05 stalls). Preset data, not calibration.
         id: 'idle',
         label: 'Idle (≈ 400 rpm)',
-        op: { ...MODEL_T_CRUISE, load: { kind: 'vehicle', gear: 'neutral', grade: 0 }, rpm: 400, throttle: 0.06, sparkAdvanceDeg: 0 },
+        op: { ...MODEL_T_CRUISE, load: { kind: 'vehicle', gear: 'neutral', grade: 0 }, rpm: 400, throttle: 0.12, sparkAdvanceDeg: 5 },
         note: 'Declutched, throttle nearly shut, spark retarded',
       },
       {

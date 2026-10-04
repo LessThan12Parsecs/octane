@@ -328,6 +328,20 @@ export function calibrationOptions(cal: CalibrationSet): Partial<CycleModelOptio
 }
 
 /**
+ * Model T friction inputs of the cycle model: the PNH inputs of the engine (engines/model-t.ts
+ * MODEL_T_FRICTION — geometry, oil, valvetrain; pure PNH) with the two factors of MODEL_T_CALIBRATION that
+ * account for what PNH (fitted on 1980s engines) lacks: the 1/4 in cast-iron ring pack (ringTensionFactor)
+ * and Ford's transmission-output measurement basis — fan, generator, magneto and the high-gear churning of
+ * the flywheel/planetary in the oil pit (auxiliaryFactor). WOT FMEP ≈ 1.0–1.2 bar at 500–1800 rpm
+ * (η_m 0.78 at 1500 rpm; ALAM/SAE assumption 0.75).
+ */
+export const MODEL_T_CALIBRATED_FRICTION: Readonly<PnhFrictionInputs> = Object.freeze({
+  ...MODEL_T_FRICTION,
+  ringTensionFactor: MODEL_T_CALIBRATION.ringTensionFactor.value,
+  auxiliaryFactor: MODEL_T_CALIBRATION.auxiliaryFactor.value,
+});
+
+/**
  * Per-engine option defaults, keyed by EngineSpec.id (engines/index.ts registry ids): the engine's
  * calibration set plus its hardware — friction inputs, valve lash, crankcase pressure, knock pickup
  * and MAPO band.
@@ -345,6 +359,8 @@ export const ENGINE_CYCLE_OPTION_DEFAULTS: Readonly<Record<string, Readonly<Part
   }),
   'ford-model-t': Object.freeze({
     ...calibrationOptions(MODEL_T_CALIBRATION),
+    // (calibration phase) the Model T-only closure of MODEL_T_CALIBRATION: the turbulence dissipation length
+    turbulenceLengthScaleFactor: MODEL_T_CALIBRATION.turbulenceLengthScaleFactor.value,
     ignitionDelayModel: CFR_KNOCK_DELAY_MODEL as IgnitionDelayModelId,
     // UNVERIFIED (no knock instrumentation exists for the Model T): a virtual plug-mounted transducer at the
     // spark plug's planform position over the valve pocket (chemistry/knock.ts virtualKnockSensor — the usual
@@ -357,7 +373,7 @@ export const ENGINE_CYCLE_OPTION_DEFAULTS: Readonly<Record<string, Readonly<Part
     valveLash: MODEL_T_VALVE_LASH,
     // UNVERIFIED: the crankcase breathes to the atmosphere through the oil-filler breather (no PCV, no pump)
     crankcaseGaugePressure: 0,
-    friction: MODEL_T_FRICTION,
+    friction: MODEL_T_CALIBRATED_FRICTION,
   }),
 });
 

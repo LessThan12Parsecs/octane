@@ -336,6 +336,10 @@ export const MODEL_T_OIL_TEMPERATURE = 343.15;
  * Not in PNH and included in Ford's data (measured at the transmission output [Tulsa]): churning of the
  * magneto flywheel and the planetary gear in the oil bath, and the wide (1/4 in) cast-iron rings. Decide any
  * extra loss against the cycle model's own WOT IMEP, not here (friction.test.ts prints the comparison).
+ * (Calibration phase, 2026-10) These stay the pure-PNH inputs; the cycle model's Model T default is
+ * cycle/options.ts MODEL_T_CALIBRATED_FRICTION = these with ringTensionFactor 2.5 (the 1/4 in ring pack) and
+ * auxiliaryFactor 3.0 (transmission-output basis: churning in the oil pit), both cycle/calibration.ts
+ * MODEL_T_CALIBRATION entries with their ranges and evidence: WOT FMEP ≈ 1.0–1.2 bar, η_m 0.78 at 1500 rpm.
  */
 export const MODEL_T_FRICTION: PnhFrictionInputs = {
   bore: BORE,
@@ -518,6 +522,11 @@ export const MODEL_T_PERIOD_GASOLINE_ON = 45;
  * adjustment (enrich until top speed without black smoke ≈ best power) and the period 12–14 parts air
  * [FM14; induction research] — UNVERIFIED. Intake mixture ≈ ambient + stove heating − fuel evaporation
  * (≈ 22 K, Ricardo) → UNVERIFIED 300 K at 15.6 °C ambient.
+ * Spark lever 50 (of 64.5): Ford's rule "advance the spark as far as the engine permits" [FM19 A4–A8] at part
+ * throttle, where MBT lies 10–35° beyond the WOT value [Upton Table 3]; on the magneto the first spark is then
+ * ≈ 39° BTDC at 1000–1500 rpm (the lower lever settings sit on the 13–16° BTDC step of the magneto staircase,
+ * CA50 ≈ 60° ATDC). With the calibrated model: steady 1250 rpm = 30.5 mph on a level road, no knock
+ * (calibration phase; the former lever 25 gives 25.9 mph there with a 15° BTDC first spark).
  */
 export const MODEL_T_CRUISE: OperatingPoint = {
   speedMode: 'free',
@@ -531,7 +540,7 @@ export const MODEL_T_CRUISE: OperatingPoint = {
   intakeMixtureTemperature: 300,
   fuel: { kind: 'PRF', octaneNumber: MODEL_T_PERIOD_GASOLINE_ON },
   equivalenceRatio: 1.15,
-  sparkAdvanceDeg: 25,
+  sparkAdvanceDeg: 50,
   dwellTime: 3e-3, // unused (trembler ignition)
   ignitionSource: 'magneto',
   compressionRatio: CR,
@@ -539,7 +548,13 @@ export const MODEL_T_CRUISE: OperatingPoint = {
   coolantTemperature: MODEL_T_COOLANT_TEMPERATURE,
 };
 
-/** Ford's 1918 engine-dyno condition: wide-open throttle, speed held by the brake [FSB Fig. 84]. */
+/**
+ * Ford's 1918 engine-dyno condition: wide-open throttle, speed held by the brake [FSB Fig. 84]. The calibration
+ * compares Ford's table with the model's maximum brake torque over the lever range at this condition (the lever
+ * of the best torque is 42–55 at 500–900 rpm, fully advanced from 1000 rpm; cycle/calibration.ts
+ * MODEL_T_CALIBRATION); intake as MODEL_T_CRUISE (stove-heated air, 300 K mixture — Ford's test conditions are
+ * not stated).
+ */
 export const MODEL_T_FORD_DYNO: OperatingPoint = {
   ...MODEL_T_CRUISE,
   speedMode: 'fixed',
@@ -567,3 +582,37 @@ export const MODEL_T_FORD_WOT_TABLE: readonly (readonly [number, number, number]
 export function modelTUptonMbtDeg(rpm: number): number {
   return (0.108 * rpm) / (1 + 0.001 * rpm);
 }
+
+/**
+ * Upton's Table 3 ("Optimum spark-advances on Ford engine", one day's student determinations, mixture at or near
+ * maximum power, intake air and discharge water 140 °F, barometer 29.35 inHg) [Upton, J. SAE Aug. 1923 p. 119;
+ * transcribed from the page OCR, the 1200 rpm tolerance "438" read as 43]: rpm, intake suction inHg, optimum spark
+ * advance deg BTDC, spark range for ≤ 10 % power loss. The lowest suction of each speed (600: 1.10, 800: 2.60,
+ * 1200: 4.40, 1400: 5.55 inHg) rises smoothly with speed and its optimum advance lies on Upton's wide-open curve
+ * (modelTUptonMbtDeg: 40.5 / 48 / 59 / 63°), so these are taken as the wide-open points — the carburettor and
+ * manifold restriction of a "regular Holley" carburettor at WOT (an upper bound if they were not fully open).
+ */
+export const MODEL_T_UPTON_TABLE3: readonly (readonly [number, number, number, number, number])[] = [
+  [1400, 5.55, 60, 46, 86], [1400, 8.8, 64, 48, 64], [1400, 12.0, 70, 51, 91], [1400, 14.2, 85, 72, 100],
+  [1200, 4.4, 55, 43, 81], [1200, 13.3, 63, 40, 82], [900, 10.4, 52, 36, 68], [800, 2.6, 53, 32, 72],
+  [600, 1.1, 42, 23, 63], [600, 6.7, 42, 23, 61], [600, 11.7, 58, 38, 75], [600, 16.6, 49, 37, 59],
+];
+
+/**
+ * Upton's Cornell test condition [Upton p. 119] as an operating point: wide open, intake air (electrically heated,
+ * replacing the stock heated-air horn) and discharge water at 140 °F (333.15 K), barometer 29.35 inHg (99.39 kPa),
+ * mixture at maximum power (12–13 parts air: φ 1.15). UNVERIFIED: the fresh-charge temperature 318 K (the 333 K air
+ * cooled by the partly evaporated fuel; full evaporation would give ≈ 22 K [Ricardo]). His ignition was an Atwater
+ * Kent battery-distributor system — a timed spark, not the trembler coils: run it with an inductive ignition on the
+ * Model T spec (sparkAdvanceDeg = the spark itself; test/validation/measured_modelt_data.test.ts).
+ */
+export const MODEL_T_UPTON_CONDITIONS: OperatingPoint = {
+  ...MODEL_T_FORD_DYNO,
+  rpm: 800,
+  ambientPressure: 29.35 * 3386.389,
+  ambientTemperature: 333.15,
+  intakeMixtureTemperature: 318,
+  coolantTemperature: 333.15,
+  sparkAdvanceDeg: 48,
+  dwellTime: 4e-3,
+};
