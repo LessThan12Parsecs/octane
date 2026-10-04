@@ -331,6 +331,13 @@ body {
   text-transform: uppercase;
 }
 
+/* A label and its control that wrap together. */
+.oct-toolbar-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .oct-toolbar-hint {
   margin-left: auto;
   color: var(--oct-text-3);
@@ -597,6 +604,11 @@ body {
 
 .oct-stat-value.is-alert {
   color: var(--oct-serious);
+}
+
+.oct-stat[hidden],
+.oct-table tr[hidden] {
+  display: none;
 }
 
 .oct-sparkline {
@@ -991,6 +1003,81 @@ body {
   color: var(--oct-warning);
 }
 
+/* Firing-order strip (multi-cylinder): one chip per cylinder in firing order, coloured by stroke. */
+.oct-hud-strip {
+  flex: none;
+}
+
+.oct-hud-strip-row {
+  display: flex;
+  gap: 3px;
+  margin-top: 2px;
+}
+
+.oct-cyl-chip {
+  --stroke: var(--oct-text-3);
+  position: relative;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--oct-border-strong);
+  border-radius: 5px;
+  background: var(--oct-surface-3);
+  box-shadow: inset 0 -3px 0 var(--stroke);
+  color: var(--oct-text);
+  font-family: var(--oct-mono);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.oct-cyl-chip:hover {
+  background: var(--oct-raised, #232a34);
+}
+
+.oct-cyl-chip.is-focus {
+  border-color: var(--oct-accent);
+  background: var(--oct-accent-soft);
+}
+
+.oct-cyl-n {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.oct-cyl-s {
+  margin-top: 2px;
+  color: var(--stroke);
+  font-size: 8.5px;
+  font-weight: 700;
+}
+
+/* Ignition timer grounding this cylinder's coil: a dot; gap conducting: the dot glows. */
+.oct-cyl-chip.is-timer::after,
+.oct-cyl-chip.is-spark::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #c98500;
+}
+
+.oct-cyl-chip.is-spark::after {
+  background: #ffffff;
+  box-shadow: 0 0 6px 2px rgba(255, 255, 255, 0.85);
+}
+
+.oct-cyl-chip:focus-visible {
+  outline: 2px solid var(--oct-accent);
+  outline-offset: 1px;
+}
+
 /* ------------------------------------------------------------------ responsive */
 
 @media (max-width: 1280px) {
@@ -1064,8 +1151,19 @@ body {
   }
 
   .oct-hud-T,
-  .oct-hud-xb {
+  .oct-hud-xb,
+  .oct-hud-road {
     display: none;
+  }
+
+  .oct-cyl-chip {
+    width: 22px;
+    height: 26px;
+  }
+
+  /* With the firing-order strip the readouts get a row of their own. */
+  .oct-hud:has(.oct-hud-strip) .oct-hud-cells {
+    flex-basis: 100%;
   }
 
   .oct-hud-transport {

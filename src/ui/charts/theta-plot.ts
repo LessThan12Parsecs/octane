@@ -51,7 +51,13 @@ export interface ThetaFrame {
   sparkDeg: number;
 }
 
-const X_AXIS_LABEL = 'θ [°CA]  (0 = firing TDC)';
+export const X_AXIS_LABEL = 'θ [°CA]  (0 = firing TDC)';
+
+/** x-axis label of the θ plots when they show cylinder `index` (0-based) of a multi-cylinder engine. */
+export const cylinderThetaLabel = (index: number): string => `θ, cyl ${index + 1} [°CA]  (0 = its firing TDC)`;
+
+/** x-axis label of plots against the ENGINE angle (cylinder 1's). */
+export const ENGINE_THETA_LABEL = 'θ engine = θ cyl 1 [°CA]';
 const EMPTY = new Float64Array(0);
 
 export class ThetaPlot {
@@ -235,6 +241,15 @@ export class ThetaPlot {
   resize(width: number): void {
     if (Math.abs(this.u.width - width) < 1) return;
     this.u.setSize({ width, height: this.def.height });
+  }
+
+  /** Replace the x-axis label (plots that show x labels only). */
+  setXLabel(label: string): void {
+    if (!this.def.xLabels) return;
+    const ax = this.u.axes[0];
+    if (ax.label === label) return;
+    ax.label = label;
+    this.u.redraw(false, false);
   }
 
   dispose(): void {

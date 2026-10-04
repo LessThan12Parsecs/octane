@@ -1,12 +1,35 @@
 /**
  * "Cycles" tab: cycle-to-cycle statistics, an IMEP-vs-cycle sparkline and the
  * per-cycle results table (metrics as rows, most recent cycles as columns).
+ *
+ * Multi-cylinder engines: a cylinder selector picks whose cycles the tiles,
+ * sparkline and table show; engine-level results (EngineCycleSummary: speed,
+ * brake torque and power, BMEP, FMEP, volumetric efficiency, BSFC) appear as
+ * extra tiles and an 'Engine' group of rows as soon as the simulator reports them.
  */
-import type { CycleSummary } from '../physics/core/snapshot';
+import type { CycleSummary, EngineCycleSummary } from '../physics/core/snapshot';
 import { SERIES, STATUS, INK, withAlpha } from './charts/theme';
-import { computeCycleStats, CYCLE_METRICS, cyclesToCsv, formatMetric, metricMean, type CycleStats } from './cycle-stats';
+import {
+  computeCycleStats,
+  CYCLE_METRICS,
+  cyclesToCsv,
+  ENGINE_METRICS,
+  engineMetricMean,
+  formatMetric,
+  metricMean,
+  type CycleStats,
+} from './cycle-stats';
 import { RingBuffer } from './ring-buffer';
-import { fmt, paToBar } from './units';
+import { fmt, nmToLbft, paToBar, wattsToHp, wattsToKW } from './units';
+
+export interface CyclesViewOptions {
+  /** Cylinders of the engine (> 1 adds the cylinder selector). */
+  cylinders?: number;
+  /** Initially selected cylinder, 0-based. */
+  cylinder?: number;
+  /** The user picked a cylinder. */
+  onCylinder?: (index: number) => void;
+}
 
 const TABLE_COLS = 8;
 const HISTORY = 300;
@@ -14,7 +37,16 @@ const SPARK_CYCLES = 150;
 
 export class CyclesView {
   readonly el: HTMLElement;
-  private readonly cycles = new RingBuffer<CycleSummary>(HISTORY);
+  private readonly perCylinder: RingBuffer<CycleSummary>[] = [];
+  private selected = 0;
+  /** Engine summaries by engine cycle number (attached to cylinder 1's summaries). */
+  private readonly engineByCycle = new Map<number, EngineCycleSummary>();
+  private readonly engineHistory = new RingBuffer<EngineCycleSummary>(HISTORY);
+  private readonly engineEls: HTMLElement[] = [];
+  private readonly engineCells: HTMLTableCellElement[][] = [];
+  private readonly engineMeanCells: HTMLTableCellElement[] = [];
+  private readonly cylButtons: HTMLButtonElement[] = [];
+  private engineShown = false;
   private readonly statEls = new Map<string, HTMLElement>();
   private readonly canvas: HTMLCanvasElement;
   private readonly headCells: HTMLTableCellElement[] = [];
@@ -24,10 +56,40 @@ export class CyclesView {
   private dirty = true;
   private readonly ro: ResizeObserver | null = null;
 
-  constructor(host: HTMLElement) {
+  constructor(host: HTMLElement, opts: CyclesViewOptions = {}) {
+    const nCyl = Math.max(1, Math.floor(opts.cylinders ?? 1));
+    for (let i = 0; i < nCyl; i++) this.perCylinder.push(new RingBuffer<CycleSummary>(HISTORY));
+    this.selected = Math.min(nCyl - 1, Math.max(0, opts.cylinder ?? 0));
     this.el = document.createElement('div');
     this.el.className = 'oct-cycles';
     host.appendChild(this.el);
+
+    // --- cylinder selector ---
+    if (nCyl > 1) {
+      const bar = document.createElement('div');
+      bar.className = 'oct-toolbar';
+      const lbl = document.createElement('span');
+      lbl.className = 'oct-toolbar-label';
+      lbl.textContent = 'Cylinder';
+      const seg = document.createElement('div');
+      seg.className = 'oct-seg oct-seg-cyl';
+      seg.setAttribute('role', 'group');
+      seg.setAttribute('aria-label', 'Cylinder whose cycles are shown');
+      for (let i = 0; i < nCyl; i++) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = String(i + 1);
+        b.title = `Cycle results of cylinder ${i + 1}`;
+        b.addEventListener('click', () => {
+          this.setCylinder(i);
+          opts.onCylinder?.(i);
+        });
+        seg.appendChild(b);
+        this.cylButtons.push(b);
+      }
+      bar.append(lbl, seg);
+      this.el.appendChild(bar);
+    }
 
     // --- stat tiles ---
     const stats = document.createElement('div');
@@ -49,6 +111,22 @@ export class CyclesView {
       t.innerHTML = `<div class="oct-stat-label"></div><div class="oct-stat-value">—</div>`;
       (t.firstElementChild as HTMLElement).textContent = label;
       this.statEls.set(k, t.lastElementChild as HTMLElement);
+      stats.appendChild(t);
+    }
+    // Engine tiles (hidden until the simulator reports engine-level results).
+    const engineTiles: [string, string, string][] = [
+      ['bT', 'Brake torque [N·m]', 'Mean brake torque over the statistics window (lb·ft in brackets)'],
+      ['bP', 'Brake power [kW]', 'Mean brake power over the statistics window (hp in brackets)'],
+    ];
+    for (const [k, label, hint] of engineTiles) {
+      const t = document.createElement('div');
+      t.className = 'oct-stat oct-stat-engine';
+      t.title = hint;
+      t.hidden = true;
+      t.innerHTML = `<div class="oct-stat-label"></div><div class="oct-stat-value">—</div>`;
+      (t.firstElementChild as HTMLElement).textContent = label;
+      this.statEls.set(k, t.lastElementChild as HTMLElement);
+      this.engineEls.push(t);
       stats.appendChild(t);
     }
     this.el.appendChild(stats);
@@ -137,6 +215,31 @@ export class CyclesView {
       for (let j = 0; j < TABLE_COLS; j++) rowCells.push(row.insertCell());
       this.cells.push(rowCells);
     }
+    // Engine rows: the engine summary of the same (engine) cycle as each column.
+    const egr = tbody.insertRow();
+    egr.className = 'oct-group-row';
+    egr.hidden = true;
+    const egc = egr.insertCell();
+    egc.colSpan = TABLE_COLS + 2;
+    egc.textContent = 'Engine';
+    this.engineEls.push(egr);
+    for (const def of ENGINE_METRICS) {
+      const row = tbody.insertRow();
+      row.hidden = true;
+      this.engineEls.push(row);
+      const name = row.insertCell();
+      name.className = 'oct-col-metric';
+      name.title = def.hint;
+      name.innerHTML = `<span class="oct-metric-name"></span><span class="oct-metric-unit"></span>`;
+      (name.firstElementChild as HTMLElement).textContent = def.label;
+      (name.lastElementChild as HTMLElement).textContent = def.unit;
+      const mc = row.insertCell();
+      mc.className = 'oct-col-mean';
+      this.engineMeanCells.push(mc);
+      const rowCells: HTMLTableCellElement[] = [];
+      for (let j = 0; j < TABLE_COLS; j++) rowCells.push(row.insertCell());
+      this.engineCells.push(rowCells);
+    }
     wrap.appendChild(table);
     this.el.appendChild(wrap);
 
@@ -151,23 +254,67 @@ export class CyclesView {
       });
       this.ro.observe(this.canvas);
     }
+    if (nCyl > 1) this.setCylinder(this.selected);
   }
 
+  /** Ring of the selected cylinder. */
+  private get cycles(): RingBuffer<CycleSummary> {
+    return this.perCylinder[this.selected];
+  }
+
+  /** Latest summary of the selected cylinder. */
   get latest(): CycleSummary | null {
     return this.cycles.latest() ?? null;
   }
 
+  /** Latest summary of cylinder `index` (0-based). */
+  latestFor(index: number): CycleSummary | null {
+    return this.perCylinder[index]?.latest() ?? null;
+  }
+
+  /** Latest engine-level summary, or null. */
+  get latestEngine(): EngineCycleSummary | null {
+    return this.engineHistory.latest() ?? null;
+  }
+
+  /** Recorded summaries of the selected cylinder, oldest first. */
   get all(): CycleSummary[] {
     return this.cycles.toArray();
   }
 
+  get cylinder(): number {
+    return this.selected;
+  }
+
+  /** Show cylinder `index` (0-based). */
+  setCylinder(index: number): void {
+    const i = Math.min(this.perCylinder.length - 1, Math.max(0, Math.floor(index)));
+    this.selected = i;
+    this.cylButtons.forEach((b, k) => {
+      b.classList.toggle('is-on', k === i);
+      b.setAttribute('aria-pressed', String(k === i));
+    });
+    this.dirty = true;
+  }
+
   push(c: CycleSummary): void {
-    this.cycles.push(c);
+    const k = Math.min(this.perCylinder.length - 1, Math.max(0, c.cylinder ?? 0));
+    this.perCylinder[k].push(c);
+    if (c.engine) {
+      this.engineByCycle.set(c.cycle, c.engine);
+      this.engineHistory.push(c.engine);
+      if (this.engineByCycle.size > HISTORY) {
+        const oldest = this.engineByCycle.keys().next().value;
+        if (oldest !== undefined) this.engineByCycle.delete(oldest);
+      }
+    }
     this.dirty = true;
   }
 
   clear(): void {
-    this.cycles.clear();
+    for (const r of this.perCylinder) r.clear();
+    this.engineByCycle.clear();
+    this.engineHistory.clear();
     this.dirty = true;
   }
 
@@ -204,6 +351,20 @@ export class CyclesView {
     this.statEls.get('knock')?.classList.toggle('is-alert', st.knockFraction > 0);
     this.statEls.get('mis')?.classList.toggle('is-alert', st.misfires > 0);
 
+    const eng = this.engineHistory.toArray().slice(-SPARK_CYCLES);
+    const hasEngine = eng.length > 0;
+    if (hasEngine !== this.engineShown) {
+      this.engineShown = hasEngine;
+      for (const e of this.engineEls) e.hidden = !hasEngine;
+    }
+    if (hasEngine) {
+      const def = (key: string) => ENGINE_METRICS.find((d) => d.key === key)!;
+      const tq = engineMetricMean(def('brakeTorque'), eng);
+      const pw = engineMetricMean(def('brakePower'), eng);
+      set('bT', `${fmt(tq, 1)} (${fmt(nmToLbft(tq), 1)})`);
+      set('bP', `${fmt(pw, 2)} (${fmt(wattsToHp(pw * 1e3), 1)} hp)`);
+    }
+
     // Table: newest first.
     for (let j = 0; j < TABLE_COLS; j++) {
       const c = this.cycles.latest(j);
@@ -222,6 +383,22 @@ export class CyclesView {
       const def = CYCLE_METRICS[r];
       const txt = def.noMean || !n ? '' : fmt(metricMean(def, win), def.decimals);
       if (this.meanCells[r].textContent !== txt) this.meanCells[r].textContent = txt;
+    }
+    if (hasEngine) {
+      for (let j = 0; j < TABLE_COLS; j++) {
+        const c = this.cycles.latest(j);
+        const e = c ? (c.engine ?? this.engineByCycle.get(c.cycle)) : undefined;
+        for (let r = 0; r < ENGINE_METRICS.length; r++) {
+          const txt = e ? fmt(ENGINE_METRICS[r].value(e), ENGINE_METRICS[r].decimals) : '';
+          const cell = this.engineCells[r][j];
+          if (cell.textContent !== txt) cell.textContent = txt;
+        }
+      }
+      for (let r = 0; r < ENGINE_METRICS.length; r++) {
+        const def = ENGINE_METRICS[r];
+        const txt = fmt(engineMetricMean(def, eng), def.decimals);
+        if (this.engineMeanCells[r].textContent !== txt) this.engineMeanCells[r].textContent = txt;
+      }
     }
     this.drawSparkline(win, st);
   }
@@ -351,7 +528,8 @@ export class CyclesView {
   }
 
   private exportCsv(): void {
-    const all = this.cycles.toArray();
+    // Every cylinder, in completion order (engine columns on the summaries that carry them).
+    const all = this.perCylinder.length > 1 ? this.perCylinder.flatMap((r) => r.toArray()).sort((a, b) => a.cycle - b.cycle || (a.cylinder ?? 0) - (b.cylinder ?? 0)) : this.cycles.toArray();
     if (!all.length) return;
     const blob = new Blob([cyclesToCsv(all)], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);

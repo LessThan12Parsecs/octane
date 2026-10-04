@@ -13,9 +13,14 @@
  * (h_TDC = clearanceHeight − pistonDisplacement), not the slider. The simulator
  * applies a CR change at the next cycle and playback runs behind the worker, so
  * following the data keeps the piston crown, the head and the gas volume in step
- * exactly — the view shows the CR the physics is actually running.
+ * exactly — the view shows the CR the physics is actually running. Fixed-CR
+ * engines (degenerate compressionRatioRange, e.g. the Model T's L-head, whose
+ * clearanceHeight does not define the clearance volume) skip this entirely.
+ *
+ * Multi-cylinder engines: the mechanism animates every cylinder from the one
+ * snapshot, and a GasFanOut drives one in-cylinder visual per cylinder.
  */
-import type { EngineSpec } from '../physics/core/engine-spec';
+import { hasVariableCompressionRatio, type EngineSpec } from '../physics/core/engine-spec';
 import type { OperatingPoint } from '../physics/core/operating-point';
 import type { CycleSummary, EngineSnapshot } from '../physics/core/snapshot';
 import { compressionRatioFromSnapshot, FrameClock, RecentWindow } from './sync';
@@ -43,18 +48,36 @@ export interface SimPort {
   readonly playbackTime: number;
 }
 
-/** What the conductor needs from EngineModel. */
+/**
+ * What the conductor needs from the engine render model (render/engine-model.ts EngineRenderModel
+ * satisfies it structurally).
+ */
 export interface MechanismPort {
   update(s: EngineSnapshot): void;
   setCompressionRatio(cr: number): void;
   setCutaway(on: boolean): void;
   readonly compressionRatio: number;
+  /** Operating-point inputs that move parts (spark lever, hand throttle); called on every change. */
+  setControls?(op: Partial<OperatingPoint>): void;
 }
 
 /** What the conductor needs from CombustionVisuals. */
 export interface GasPort {
   update(s: EngineSnapshot, dtWall: number, timeScale: number): void;
   setMode(mode: RenderMode): void;
+}
+
+/** One GasPort driving several (one CombustionVisuals per cylinder; each reads its own cylinder). */
+export class GasFanOut implements GasPort {
+  constructor(readonly ports: readonly GasPort[]) {}
+
+  update(s: EngineSnapshot, dtWall: number, timeScale: number): void {
+    for (let i = 0; i < this.ports.length; i++) this.ports[i].update(s, dtWall, timeScale);
+  }
+
+  setMode(mode: RenderMode): void {
+    for (const p of this.ports) p.setMode(mode);
+  }
 }
 
 /** What the conductor needs from UIController. */
@@ -85,6 +108,8 @@ export class Conductor {
   private waitingFirst = true;
   private _frames = 0;
   private _lastDt = 0;
+  /** The mechanism follows the CR in the data (variable-CR engines only). */
+  private readonly variableCR: boolean;
 
   constructor(
     private readonly spec: EngineSpec,
@@ -97,6 +122,7 @@ export class Conductor {
   ) {
     this._playback = { ...initialPlayback };
     this.clock = new FrameClock(maxFrameSeconds);
+    this.variableCR = hasVariableCompressionRatio(spec);
     sim.onCycle((c) => this.ui?.pushCycle(c));
   }
 
@@ -132,6 +158,7 @@ export class Conductor {
 
   readonly handleOperatingPoint = (patch: Partial<OperatingPoint>): void => {
     this.sim.setOperatingPoint(patch);
+    this.engine.setControls?.(patch);
   };
 
   readonly handlePlayback = (p: PlaybackState): void => {
@@ -174,7 +201,7 @@ export class Conductor {
       this.waitingFirst = false;
       this.hooks.onFirstSnapshot?.(s);
     }
-    this.syncCompressionRatio(s);
+    if (this.variableCR) this.syncCompressionRatio(s);
     this.engine.update(s);
     this.gas.update(s, dt, ts);
     if (this.ui) {

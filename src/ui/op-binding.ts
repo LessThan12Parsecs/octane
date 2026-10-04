@@ -2,7 +2,7 @@
  * Two-way mapping between the SI OperatingPoint and the user-facing control values
  * (°C, kPa, %, ms …). Pure; the lil-gui panel binds to an OpParams object.
  */
-import type { FuelSelection, OperatingPoint } from '../physics/core/operating-point';
+import type { FuelSelection, LoadSpec, OperatingPoint } from '../physics/core/operating-point';
 import {
   celsiusToKelvin,
   fractionToPct,
@@ -16,6 +16,8 @@ import {
 
 export type PureFuel = Extract<FuelSelection, { kind: 'pure' }>['species'];
 export type FuelChoice = 'PRF' | PureFuel;
+export type LoadModel = LoadSpec['kind'];
+export type IgnitionSource = NonNullable<OperatingPoint['ignitionSource']>;
 
 /** Dropdown label → value. */
 export const FUEL_OPTIONS: Readonly<Record<string, FuelChoice>> = {
@@ -45,6 +47,18 @@ export interface OpParams {
   ambientC: number;
   humidityPct: number;
   coolantC: number;
+  /** Load model in 'free' speed mode (OperatingPoint.load.kind; absent = 'constant'). */
+  loadModel: LoadModel;
+  /** 'vehicle' load: gear name (EngineSpec.vehicle.gears key or 'neutral'). */
+  gear: string;
+  /** 'vehicle' load: road grade, % (rise / run × 100). */
+  gradePct: number;
+  /** 'brake' load: reference speed at which the brake absorbs loadTorque, rpm. */
+  brakeRefRpm: number;
+  /** 'brake' load: speed exponent (2 ≈ fan or hydraulic brake). */
+  brakeExponent: number;
+  /** Trembler-magneto ignition supply ('MAG' / 'BAT' switch). */
+  ignitionSource: IgnitionSource;
 }
 
 export type OpParamKey = keyof OpParams;
@@ -58,6 +72,7 @@ const r = (v: number, decimals: number): number => {
 export function paramsFromOp(op: OperatingPoint, prev?: OpParams): OpParams {
   const fuel: FuelChoice = op.fuel.kind === 'PRF' ? 'PRF' : op.fuel.species;
   const octane = op.fuel.kind === 'PRF' ? op.fuel.octaneNumber : (prev?.octaneNumber ?? 90);
+  const load: LoadSpec = op.load ?? { kind: 'constant' };
   return {
     speedMode: op.speedMode,
     rpm: op.rpm,
@@ -75,7 +90,26 @@ export function paramsFromOp(op: OperatingPoint, prev?: OpParams): OpParams {
     ambientC: r(kelvinToCelsius(op.ambientTemperature), 3),
     humidityPct: r(fractionToPct(op.relativeHumidity), 2),
     coolantC: r(kelvinToCelsius(op.coolantTemperature), 3),
+    // Sub-settings of the load models not in use are remembered from `prev`.
+    loadModel: load.kind,
+    gear: load.kind === 'vehicle' ? load.gear : (prev?.gear ?? 'high'),
+    gradePct: load.kind === 'vehicle' ? r(fractionToPct(load.grade), 3) : (prev?.gradePct ?? 0),
+    brakeRefRpm: load.kind === 'brake' ? load.refRpm : (prev?.brakeRefRpm ?? op.rpm),
+    brakeExponent: load.kind === 'brake' ? load.exponent : (prev?.brakeExponent ?? 2),
+    ignitionSource: op.ignitionSource ?? 'magneto',
   };
+}
+
+/** The LoadSpec selected by the load-model controls. */
+export function loadFromParams(p: Pick<OpParams, 'loadModel' | 'gear' | 'gradePct' | 'brakeRefRpm' | 'brakeExponent'>): LoadSpec {
+  switch (p.loadModel) {
+    case 'vehicle':
+      return { kind: 'vehicle', gear: p.gear, grade: pctToFraction(p.gradePct) };
+    case 'brake':
+      return { kind: 'brake', refRpm: Math.max(1, p.brakeRefRpm), exponent: p.brakeExponent };
+    case 'constant':
+      return { kind: 'constant' };
+  }
 }
 
 export function fuelSelectionFromParams(p: Pick<OpParams, 'fuel' | 'octaneNumber'>): FuelSelection {
@@ -117,6 +151,14 @@ export function patchForParam(p: OpParams, key: OpParamKey): Partial<OperatingPo
       return { relativeHumidity: pctToFraction(p.humidityPct) };
     case 'coolantC':
       return { coolantTemperature: celsiusToKelvin(p.coolantC) };
+    case 'loadModel':
+    case 'gear':
+    case 'gradePct':
+    case 'brakeRefRpm':
+    case 'brakeExponent':
+      return { load: loadFromParams(p) };
+    case 'ignitionSource':
+      return { ignitionSource: p.ignitionSource };
   }
 }
 
@@ -138,12 +180,16 @@ export function opFromParams(p: OpParams): OperatingPoint {
     compressionRatio: p.compressionRatio,
     egrFraction: pctToFraction(p.egrPct),
     coolantTemperature: celsiusToKelvin(p.coolantC),
+    load: loadFromParams(p),
+    ignitionSource: p.ignitionSource,
   };
 }
 
-/** Merge a patch into an operating point (fuel replaced as a whole). */
+/** Merge a patch into an operating point (fuel and load replaced as a whole). */
 export function mergeOp(op: OperatingPoint, patch: Partial<OperatingPoint>): OperatingPoint {
-  return { ...op, ...patch, fuel: patch.fuel ? { ...patch.fuel } : op.fuel };
+  const out: OperatingPoint = { ...op, ...patch, fuel: patch.fuel ? { ...patch.fuel } : op.fuel };
+  if (patch.load) out.load = { ...patch.load };
+  return out;
 }
 
 /** Short fuel description, e.g. "PRF 90" or "iso-octane". */

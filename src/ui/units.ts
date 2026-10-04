@@ -34,6 +34,22 @@ export const pctToFraction = (p: number): number => p / 100;
 /** Indicated specific fuel consumption: kg/J → g/kWh. */
 export const isfcToGPerKWh = (kgPerJ: number): number => kgPerJ * 1e3 * J_PER_KWH;
 
+/**
+ * Mechanical horsepower, W: 550 ft·lbf/s = 550 × 0.3048 m × 4.4482216152605 N per s (exact by the
+ * definitions of the international foot and pound-force; NIST SP 811 (2008) App. B.8: 7.456 999 E+02 W).
+ */
+export const W_PER_HP = 550 * 0.3048 * 4.4482216152605;
+/** 1 lbf·ft in N·m: 0.3048 × 4.4482216152605 (NIST SP 811 (2008) App. B.8: 1.355 818 N·m). */
+export const NM_PER_LBFT = 0.3048 * 4.4482216152605;
+/** 1 mile per hour in m/s: 1609.344 m / 3600 s, exact (NIST SP 811 (2008) App. B.8: 4.4704 E−01). */
+export const MPS_PER_MPH = 1609.344 / 3600;
+
+export const wattsToKW = (w: number): number => w * 1e-3;
+export const wattsToHp = (w: number): number => w / W_PER_HP;
+export const nmToLbft = (nm: number): number => nm / NM_PER_LBFT;
+export const mpsToMph = (v: number): number => v / MPS_PER_MPH;
+export const mpsToKmh = (v: number): number => v * 3.6;
+
 /** Crank degrees per second at `rpm` (360°/rev × rpm/60). */
 export const degPerSecond = (rpm: number): number => 6 * rpm;
 
