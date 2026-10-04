@@ -368,7 +368,7 @@ export const ENGINE_CYCLE_OPTION_DEFAULTS: Readonly<Record<string, Readonly<Part
     // (createKnockOscillator) are defined over the whole chamber, pocket included
     knockSensor: virtualKnockSensor(MODEL_T),
     // L_HEAD_MAPO_BAND [2, 18] kHz (UNVERIFIED convention): the CFR's 4–18 kHz ANL band would cut the
-    // L-head's 3.4–4.0 kHz bore-to-pocket fundamental (knock.ts: 3812 Hz at c = 950 m/s)
+    // L-head's 2.8–3.6 kHz bore-to-pocket fundamental (knock.ts: 3277 Hz at c = 950 m/s)
     mapoBand: L_HEAD_MAPO_BAND,
     valveLash: MODEL_T_VALVE_LASH,
     // UNVERIFIED: the crankcase breathes to the atmosphere through the oil-filler breather (no PCV, no pump)

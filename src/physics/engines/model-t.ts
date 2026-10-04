@@ -200,9 +200,11 @@ const VALVE_Z = 0.024;
  *    static pull-in current) by least squares (tools/reference/ignition_trembler_oracle.py --fit, Radau
  *    model of the full circuit: battery + 0.05 Ω, no timer, 10 kV bench gap) to the DC coil-tester data
  *    [ECCT; Cool]: first fire after the make 3.5 ms on 6 V, 2.5 ms on 9 V, 2.0 ms on 12 V, points re-closing
- *    1.8 ms after the 6 V fire. Achieved (oracle): 3.503 / 2.496 / 1.998 ms at 5.34 / 5.96 / 6.52 A
- *    (targets ≈ 5.0–5.4 / 6.2 / 6–7 A — the currents are not fitted, they follow from the RL ramp),
- *    re-close 1.813 ms; emergent: buzz period 5.0 ms on 6 V (≈ 200 Hz; ≈ 190 Hz [Cool]), points open longer
+ *    1.8 ms after the 6 V fire. Refitted with the gap re-ignition model (discharge.ts; `--fit2`: pull-in
+ *    current and damping free, f_n and g₀ kept from the first 4-parameter fit). Achieved (oracle):
+ *    3.502 / 2.497 / 1.999 ms at 5.34 / 5.96 / 6.52 A (targets ≈ 5.0–5.4 / 6.2 / 6–7 A — the currents are not
+ *    fitted, they follow from the RL ramp), re-close 1.8006 ms; emergent: buzz ≈ 196 Hz on 6 V (≈ 190 Hz
+ *    [Cool]), points open longer
  *    at higher current (2.3 ms at 9 V, 2.7 ms at 12 V; "higher firing current throws the vibrator open
  *    wider" [Kossor]), fire at 4.1–4.3 A on slow 120–150 rpm magneto pulses (HCCT fires at 3.0–4.4 A
  *    [Kossor]), ½L₁I² = 47 mJ at the 6 V fire (48–50 mJ at 5.4–5.5 A [ECCT]). The fit is degenerate along
@@ -239,9 +241,9 @@ export const MODEL_T_IGNITION: TremblerMagnetoIgnitionSpec = {
     couplingCoefficient: 0.9,
     condenserCapacitance: 0.43e-6,
     vibrator: {
-      pullCurrent: 3.53, // UNVERIFIED: fitted to the DC firing times (see above)
+      pullCurrent: 3.471, // UNVERIFIED: fitted to the DC firing times (see above)
       naturalFrequency: 133, // UNVERIFIED: fitted
-      dampingRatio: 0.34, // UNVERIFIED: fitted
+      dampingRatio: 0.574, // UNVERIFIED: fitted
       breakTravel: 0.005 * IN,
       maxTravel: 0.005 * IN + (1 / 32) * IN,
       airGap: 1.16e-3, // UNVERIFIED: fitted (effective gap; armature rests ≈ 0.24 mm beyond its travel to the core)

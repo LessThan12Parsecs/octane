@@ -50,15 +50,15 @@ from thermo_common import rnd, write_fixture  # noqa: E402
 IN = 0.0254
 COIL = dict(L1=3.3e-3, R1=0.295, L2=22.0, R2=3300.0, C2=40e-12, k=0.9, C1=0.43e-6)
 # fitted vibrator (see --fit); breakTravel / maxTravel sourced (cushion 0.005 in, point gap 1/32 in)
-VIB = dict(Ip=3.53, fn=133.0, zeta=0.34, g0=1.16e-3, xb=0.005 * IN, xmax=0.005 * IN + IN / 32)
-# The constants above (= engines/model-t.ts MODEL_T_IGNITION) were fitted before the re-ignition model, when
-# every current zero of the spark re-broke the 10 kV bench gap and dumped 1/2 C2 Vbd^2 = 2 mJ: with the
-# re-ignition model the 6 V re-close comes 110 us late. VIB_REFIT is the vibrator refitted WITH the re-ignition
-# model to the same targets (`--fit2`: least squares on Ip and zeta, fn and g0 kept; residuals +2.4 / -2.9 /
-# -1.1 us, re-close +0.6 us), proposed for MODEL_T_IGNITION; the fixture's `refit` block holds what it achieves.
+# The first 4-parameter fit (Ip 3.53 A, fn 133 Hz, zeta 0.34, g0 1.16 mm) was made before the re-ignition model,
+# when every current zero of the spark re-broke the 10 kV bench gap and dumped 1/2 C2 Vbd^2 = 2 mJ; with the
+# re-ignition model its 6 V re-close came 110 us late. VIB (= engines/model-t.ts MODEL_T_IGNITION) is the vibrator
+# refitted WITH the re-ignition model to the same targets (`--fit2`: least squares on Ip and zeta, fn and g0 kept;
+# residuals +2.4 / -2.9 / -1.1 us, re-close +0.6 us); VIB_REFIT (the `refit` block) is the same vibrator.
+VIB = dict(Ip=3.471, fn=133.0, zeta=0.574, g0=1.16e-3, xb=0.005 * IN, xmax=0.005 * IN + IN / 32)
 # UNVERIFIED as individual numbers, like VIB: the fit is degenerate along (fn down, zeta up, g0 up) — the free
 # 4-parameter `--fit` drifts along the valley, e.g. 3.43 A / 143.5 Hz / 0.62 / 0.958 mm with residuals < 1.2 us.
-VIB_REFIT = dict(VIB, Ip=3.471, zeta=0.574)
+VIB_REFIT = dict(VIB)
 VSHEATH = 3 * 365.0 / 14.6 * math.log(1 + 1 / 0.02)
 BENCH_GAP = dict(Vbd=10e3, p=1e5, l=3e-3)
 ENGINE_GAP = dict(Vbd=8e3, p=5e5, l=IN / 32)

@@ -97,11 +97,9 @@ describe('MODEL_T_IGNITION — vibrator fit to the coil-tester data (ECCT; Cool3
     expect(Math.abs(f.achieved.t6 - f.targets.t6)).toBeLessThan(5e-6);
     expect(Math.abs(f.achieved.t9 - f.targets.t9)).toBeLessThan(5e-6);
     expect(Math.abs(f.achieved.t12 - f.targets.t12)).toBeLessThan(5e-6);
-    // The vibrator in use was fitted before the re-ignition model (discharge.ts): each current zero then
-    // re-broke the 10 kV bench gap and dumped ½C₂V_bd² = 2 mJ, which damped the ring; re-igniting at V_r(t)
-    // the spark dissipates less and the points re-close ≈ 110 µs later. The refit vibrator (same targets, with
-    // re-ignition: oracle VIB_REFIT, proposed for MODEL_T_IGNITION) meets all four again.
-    expect(Math.abs(f.achieved.reclose6 - f.targets.reclose6)).toBeLessThan(0.12e-3);
+    // The vibrator in use is the refit made WITH the re-ignition model (discharge.ts; oracle --fit2): the first
+    // fit, made while every current zero re-broke the bench gap, re-closed ≈ 110 µs late once re-ignition existed.
+    expect(Math.abs(f.achieved.reclose6 - f.targets.reclose6)).toBeLessThan(15e-6);
     const rf = oracleFx.refit.achieved;
     expect(Math.abs(rf.t6 - f.targets.t6)).toBeLessThan(5e-6);
     expect(Math.abs(rf.t9 - f.targets.t9)).toBeLessThan(5e-6);
@@ -116,7 +114,7 @@ describe('MODEL_T_IGNITION — vibrator fit to the coil-tester data (ECCT; Cool3
   const r6 = benchRun(6, 20e-3);
   const r9 = benchRun(9, 8e-3);
   const r12 = benchRun(12, 8e-3);
-  /** The coil with the refit vibrator (oracle VIB_REFIT; contract request for MODEL_T_IGNITION). */
+  /** The coil with the oracle's refit vibrator (VIB_REFIT = VIB, the vibrator in use). */
   const rv = oracleFx.refit.vibrator;
   const REFIT_COIL = { ...IG.coil, vibrator: { ...IG.coil.vibrator, pullCurrent: rv.Ip, naturalFrequency: rv.fn, dampingRatio: rv.zeta, airGap: rv.g0 } };
   const q6 = benchRun(6, 20e-3, REFIT_COIL);
@@ -150,10 +148,9 @@ describe('MODEL_T_IGNITION — vibrator fit to the coil-tester data (ECCT; Cool3
       expect(off12).toBeGreaterThan(off9);
       log(`${label}: re-close ${(off6 * 1e3).toFixed(3)} ms after the 6 V fire (target 1.8, residual ${((off6 - 1.8e-3) * 1e6).toFixed(1)} µs); buzz ${(1 / period).toFixed(0)} Hz; open ${(off9 * 1e3).toFixed(2)} ms at 9 V, ${(off12 * 1e3).toFixed(2)} ms at 12 V`);
     };
-    // refit vibrator: the fit targets
+    // the vibrator in use (= the oracle's refit block): the fit targets
+    check(r6, r9, r12, 0.05e-3, [180, 215], 'vibrator in use');
     check(q6, q9, q12, 0.05e-3, [180, 215], 'refit vibrator');
-    // vibrator in use (fitted before the re-ignition model; see the oracle fit test): ≈ 0.14 ms late, buzz ≈ 175 Hz
-    check(r6, r9, r12, 0.16e-3, [165, 215], 'vibrator in use');
   });
 
   it('stored energy at the fire ½L₁I² ≈ 47 mJ on 6 V (48–50 mJ at 5.4–5.5 A, ECCT)', () => {
