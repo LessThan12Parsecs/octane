@@ -140,11 +140,11 @@ export function buildCarburettor(L: ModelTLayout, M: ModelTMaterials): CarbParts
 export interface FanParts {
   /** Rotates about +z at (fan.x, fan.y): rotation.z = −θ·ratio. */
   fan: THREE.Group;
-  /** Static: belt + bracket. */
+  /** Static belt (the bracket is a housing part: buildFanBracket). */
   belt: THREE.Mesh;
 }
 
-export function buildFan(L: ModelTLayout, M: ModelTMaterials, set: FrameSet): FanParts {
+export function buildFan(L: ModelTLayout, M: ModelTMaterials): FanParts {
   const F = L.fan;
   const fan = new THREE.Group();
   fan.name = 'fan';
@@ -175,12 +175,17 @@ export function buildFan(L: ModelTLayout, M: ModelTMaterials, set: FrameSet): Fa
   flatBelt(bm, beltPath([0, 0], L.crank.pulleyRadius + 0.0005, [F.x, F.y], F.pulleyRadius + 0.0005), zb, L.belt.width, L.belt.thickness);
   const belt = new THREE.Mesh(bm.build(), M.x.leather);
   belt.name = 'fan-belt';
-  // bracket from the cylinder front to the fan spindle
+  return { fan, belt };
+}
+
+/** Fan bracket from the cylinder front to the fan spindle (static housing part, not cut). */
+export function buildFanBracket(L: ModelTLayout, set: FrameSet): void {
+  const F = L.fan;
+  const zb = L.belt.z;
   const br = new MeshBuilder();
   cylinderBetween(br, [F.x, F.y, zb - 0.016], [F.x, F.y, zb - 0.032], 0.012, 20);
   box(br, [F.x - 0.009, L.deckY - 0.03, L.block.zF - 0.001], [F.x + 0.009, F.y + 0.006, zb - 0.026]);
   set.add('paint', br.build(), { cut: false, section: false });
-  return { fan, belt };
 }
 
 /** Starter (1919+) on the left of the transmission cover, Bendix pinion at the ring gear. */

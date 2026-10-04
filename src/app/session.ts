@@ -5,7 +5,9 @@
  * whole sessions when the user picks another engine (App.setEngine).
  *
  * Featured cylinder (multi-cylinder engines): only its visuals run the flow tracers and carry the
- * chamber light; setFeaturedCylinder moves both (CylinderVisuals, cylinder-visuals.ts).
+ * chamber light; setFeaturedCylinder moves both (CylinderVisuals, cylinder-visuals.ts). The focus
+ * cylinder (setFocusCylinder) also carries the cutaway section of engines that can move it (the Model T
+ * opens the focus cylinder's chamber), so the featured visuals are never hidden inside closed metal.
  *
  * Construction is all-or-nothing: if any part throws (no render model registered for the engine yet,
  * no WebGL, …) everything already built is released and the stage is left as it was.
@@ -29,7 +31,7 @@ export interface EngineSessionOptions {
   operatingPoint: OperatingPoint;
   simulatorOptions: SimulatorOptions;
   playback: PlaybackState;
-  /** Featured cylinder (0-based): its visuals run the flow tracers; the UI starts focused on it. */
+  /** Focus cylinder (0-based): the cutaway section and the flow tracers start there; so does the UI. */
   focusCylinder: number;
   hooks: ConductorHooks;
   /** The UI's Reset button (after the conductor reset the simulation). */
@@ -64,6 +66,7 @@ export class EngineSession {
       root = engine.root;
       o.stage.scene.add(engine.root);
       engine.setControls?.(op);
+      engine.setSectionCylinder?.(o.focusCylinder); // before the visuals and the conductor read the cut regions
       const visuals = (this.visuals = track(new CylinderVisuals(spec, engine, (r) => o.stage.addEmitters(r), o.focusCylinder)));
       engine.root.updateMatrixWorld(true);
 
@@ -125,6 +128,18 @@ export class EngineSession {
   setFeaturedCylinder(index: number): void {
     if (this.disposed) return;
     if (this.visuals.setFeatured(index, this.conductor.view.mode)) this.engine.root.updateMatrixWorld(true);
+  }
+
+  /**
+   * Focus cylinder `index` in 3D: move the cutaway section there (engines whose section can move; the
+   * conductor re-pushes the cut regions), then feature it (setFeaturedCylinder). Throws if a step fails:
+   * a failed section move changes nothing; a failed feature leaves the section moved and the previous
+   * cylinder featured.
+   */
+  setFocusCylinder(index: number): void {
+    if (this.disposed) return;
+    this.conductor.setSectionCylinder(index);
+    this.setFeaturedCylinder(index);
   }
 
   /** World bounds of the mechanism (for Stage.fitToBounds). */

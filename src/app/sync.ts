@@ -160,6 +160,24 @@ export function searchWithEngine(search: string, id: string, dropOpKnobs = true)
 /** URL keys that set operating-point fields (parseUrlOptions). */
 export const OP_KNOBS: readonly string[] = ['cr', 'on', 'rpm', 'spark', 'phi'];
 
+/** True when `search` carries any operating-point knob (OP_KNOBS), valid or not. */
+export function hasOpKnobs(search: string): boolean {
+  const q = new URLSearchParams(search);
+  return OP_KNOBS.some((k) => q.has(k));
+}
+
+/**
+ * The search string to write after start-up so the address bar names the engine that started: `search`
+ * with ?engine=<id> set and every other parameter kept (knobs, focus, playback). Null when there is
+ * nothing to write: a bare URL (it keeps following the remembered choice) or one that already names `id`.
+ */
+export function searchWithStartEngine(search: string, id: string): string | null {
+  const q = new URLSearchParams(search);
+  if (!q.toString() || q.get('engine') === id) return null;
+  q.set('engine', id);
+  return `?${q.toString()}`;
+}
+
 /** Aspect ratio the recommended camera views are composed for. */
 export const FRAMING_REFERENCE_ASPECT = 1.6;
 

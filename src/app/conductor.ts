@@ -24,7 +24,9 @@
  * housings' cut-away region per cylinder frame (MechanismPort.cutRegion); the
  * conductor hands it to the in-cylinder visuals on every cutaway change, so gas
  * behind cut-away metal is drawn exactly where the metal is gone. Engines without
- * it (the CFR) never set a cut region.
+ * it (the CFR) never set a cut region. Multi-cylinder engines may move their
+ * section to the focus cylinder (setSectionCylinder); the moved regions are handed
+ * on the same way.
  */
 import { hasVariableCompressionRatio, type EngineSpec } from '../physics/core/engine-spec';
 import type { OperatingPoint } from '../physics/core/operating-point';
@@ -68,6 +70,8 @@ export interface MechanismPort {
   setControls?(op: Partial<OperatingPoint>): void;
   /** Cut-away region in cylinder `cylinder`'s frame (null: cutaway off). Optional (EngineRenderModel.cutRegion). */
   cutRegion?(cylinder: number): CutPlanes | null;
+  /** Move the housings' section to cylinder `cylinder` (0-based). Optional (EngineRenderModel.setSectionCylinder). */
+  setSectionCylinder?(cylinder: number): void;
 }
 
 /** What the conductor needs from CombustionVisuals. */
@@ -224,6 +228,17 @@ export class Conductor {
     this.gas.setMode(v.mode);
     this.hooks.onView?.(this._view);
   };
+
+  /**
+   * Move the mechanism's cutaway section to cylinder `index` (engines that can: the Model T opens the
+   * focus cylinder's chamber) and hand the moved cut regions to every in-cylinder visual. No-op for
+   * engines without a movable section. If the mechanism throws, nothing is re-pushed.
+   */
+  setSectionCylinder(index: number): void {
+    if (!this.engine.setSectionCylinder) return;
+    this.engine.setSectionCylinder(index);
+    this.syncCutRegion();
+  }
 
   readonly handleReset = (): void => {
     this.sim.reset();

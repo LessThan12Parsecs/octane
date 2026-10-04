@@ -65,7 +65,7 @@ export interface EngineMetricDef {
 /** Engine rows of the results table (multi-cylinder / free-speed engines report EngineCycleSummary). */
 export const ENGINE_METRICS: readonly EngineMetricDef[] = [
   { key: 'rpm', label: 'Speed', unit: 'rpm', hint: 'Mean crankshaft speed over the engine cycle', decimals: 0, value: (e) => e.rpmMean },
-  { key: 'brakeTorque', label: 'Brake torque', unit: 'N·m', hint: 'Mean brake torque = indicated − friction (− inertia)', decimals: 1, value: (e) => e.brakeTorque },
+  { key: 'brakeTorque', label: 'Brake torque', unit: 'N·m', hint: 'Mean brake torque at the crankshaft = indicated − friction − (engine inertia, ≈ 0 at steady speed): the engine output, excludes the car’s inertia', decimals: 1, value: (e) => e.brakeTorque },
   { key: 'brakeTorqueLbft', label: 'Brake torque', unit: 'lb·ft', hint: 'Mean brake torque in the period unit (Ford rated in lb-ft)', decimals: 1, value: (e) => nmToLbft(e.brakeTorque) },
   { key: 'brakePower', label: 'Brake power', unit: 'kW', hint: 'Brake power = brake torque × ω', decimals: 2, value: (e) => wattsToKW(e.brakePower) },
   { key: 'brakeHp', label: 'Brake power', unit: 'hp', hint: 'Brake power in mechanical horsepower (550 ft·lbf/s)', decimals: 1, value: (e) => wattsToHp(e.brakePower) },

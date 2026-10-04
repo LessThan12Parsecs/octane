@@ -68,6 +68,13 @@ describe('engine metrics', () => {
     expect(new Set(ENGINE_METRICS.map((d) => d.key)).size).toBe(ENGINE_METRICS.length);
   });
 
+  it('brake torque is described as the engine output, without the car’s inertia (EngineCycleSummary.brakeTorque)', () => {
+    const hint = metric('brakeTorque').hint;
+    expect(hint).toMatch(/indicated − friction/);
+    expect(hint).toMatch(/engine output/);
+    expect(hint).toMatch(/excludes the car’s inertia/);
+  });
+
   it('means skip missing values', () => {
     const list = [engine({ brakeTorque: 90 }), engine({ brakeTorque: 110 }), engine({ vehicleSpeed: undefined })];
     expect(engineMetricMean(metric('brakeTorque'), list)).toBeCloseTo(100, 12);

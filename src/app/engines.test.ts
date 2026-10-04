@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { CFR_F1, CFR_RON_CONDITIONS } from '../physics/engines/cfr';
 import { DEFAULT_ENGINE_ID, ENGINE_IDS, ENGINES } from '../physics/engines/index';
 import { MODEL_T, MODEL_T_CRUISE } from '../physics/engines/model-t';
-import { engineChoices, initialOperatingPoint, isEngineId, resolveEngine } from './engines';
-import { clampOperatingPoint, errorSummary, OP_KNOBS, parseUrlOptions, searchWithEngine } from './sync';
+import { engineChoices, initialOperatingPoint, isEngineId, resolveEngine, resolveStartEngine } from './engines';
+import { clampOperatingPoint, errorSummary, hasOpKnobs, OP_KNOBS, parseUrlOptions, searchWithEngine, searchWithStartEngine } from './sync';
 
 describe('URL engine knobs', () => {
   it('reads ?engine, ?cyl and ?sim outside the operating-point overrides', () => {
@@ -58,6 +58,49 @@ describe('resolveEngine', () => {
     expect(resolveEngine(undefined, 'nope', 'ford-model-t').id).toBe('ford-model-t');
     expect(resolveEngine(undefined, null, null).id).toBe(DEFAULT_ENGINE_ID);
     expect(resolveEngine('toString', '__proto__').id).toBe(DEFAULT_ENGINE_ID); // no prototype lookups
+  });
+
+  it('start-up: a legacy CFR share link (op knobs, no ?engine=) opens the CFR even when the Model T is remembered', () => {
+    // review: '/?cr=8&spark=26&rpm=900&on=85' used to open the remembered Model T (CR clamped to 3.98, free/vehicle)
+    const search = '?cr=8&spark=26&rpm=900&on=85';
+    const def = resolveStartEngine(undefined, search, 'ford-model-t');
+    expect(def.id).toBe('cfr-f1');
+    const op = initialOperatingPoint(def, parseUrlOptions(search).op);
+    expect(op.compressionRatio).toBe(8);
+    expect(op.sparkAdvanceDeg).toBe(26);
+    expect(op.rpm).toBe(900);
+    expect(op.fuel).toEqual({ kind: 'PRF', octaneNumber: 85 });
+    expect(op).toEqual(clampOperatingPoint(CFR_F1, { ...CFR_RON_CONDITIONS, ...parseUrlOptions(search).op })); // the pre-picker CFR start
+    // any op knob counts, even one whose value is ignored; an unknown ?engine= cannot claim the knobs either
+    expect(resolveStartEngine(undefined, '?rpm=fast', 'ford-model-t').id).toBe('cfr-f1');
+    expect(resolveStartEngine(undefined, '?engine=nope&spark=10', 'ford-model-t').id).toBe('cfr-f1');
+  });
+
+  it('start-up: ?engine=, the explicit option and the remembered choice otherwise behave as before', () => {
+    expect(resolveStartEngine(undefined, '?engine=ford-model-t&spark=10', 'cfr-f1').id).toBe('ford-model-t');
+    expect(resolveStartEngine(undefined, '?engine=cfr-f1&cr=8', 'ford-model-t').id).toBe('cfr-f1');
+    expect(resolveStartEngine('ford-model-t', '?cr=8', null).id).toBe('ford-model-t'); // explicit option wins
+    // no op knobs: the remembered choice applies (bare URL, playback / view / focus knobs)
+    expect(resolveStartEngine(undefined, '', 'ford-model-t').id).toBe('ford-model-t');
+    expect(resolveStartEngine(undefined, '?ts=0.01&view=engine&cyl=3&paused=1', 'ford-model-t').id).toBe('ford-model-t');
+    expect(resolveStartEngine(undefined, '', null).id).toBe(DEFAULT_ENGINE_ID);
+    expect(resolveStartEngine(undefined, '?cr=8', 'toString').id).toBe(DEFAULT_ENGINE_ID);
+  });
+
+  it('start-up URL: names the started engine when the URL carries parameters, keeps everything else', () => {
+    expect(hasOpKnobs('?cr=8')).toBe(true);
+    expect(hasOpKnobs('?ts=0.01&engine=cfr-f1')).toBe(false);
+    for (const k of OP_KNOBS) expect(hasOpKnobs(`?${k}=`)).toBe(true);
+    expect(searchWithStartEngine('?cr=8&spark=26&rpm=900&on=85', 'cfr-f1')).toBe('?cr=8&spark=26&rpm=900&on=85&engine=cfr-f1');
+    expect(searchWithStartEngine('?cyl=3&ts=0.01', 'ford-model-t')).toBe('?cyl=3&ts=0.01&engine=ford-model-t');
+    expect(searchWithStartEngine('?engine=nope&rpm=900', 'cfr-f1')).toBe('?engine=cfr-f1&rpm=900');
+    expect(searchWithStartEngine('?engine=ford-model-t&cyl=2', 'ford-model-t')).toBeNull(); // already named
+    expect(searchWithStartEngine('', 'cfr-f1')).toBeNull(); // a bare URL keeps following the remembered choice
+    expect(searchWithStartEngine('?', 'cfr-f1')).toBeNull();
+    // the written URL reopens the same engine with the same knobs, whatever is remembered
+    const written = searchWithStartEngine('?cr=8&spark=26', 'cfr-f1')!;
+    expect(resolveStartEngine(undefined, written, 'ford-model-t').id).toBe('cfr-f1');
+    expect(parseUrlOptions(written).op).toEqual(parseUrlOptions('?cr=8&spark=26').op);
   });
 
   it('isEngineId only accepts registry ids', () => {

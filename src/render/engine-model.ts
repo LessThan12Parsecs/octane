@@ -40,6 +40,13 @@ export interface EngineRenderModel {
    * disc) need not provide it, and the app then never sets a cut region.
    */
   cutRegion?(cylinder: number): CutPlanes | null;
+  /**
+   * Multi-cylinder cutaways: move the housings' section to cylinder `cylinder` (0-based, clamped) so its
+   * chamber is open; cutRegion() then reports the moved region for every cylinder, and the 'chamber'
+   * camera view of that cylinder looks through the section. Optional: single-cylinder engines (the CFR)
+   * have one fixed section. The app calls it with the focus cylinder and re-pushes the cut regions.
+   */
+  setSectionCylinder?(cylinder: number): void;
   /** Camera framing: 'engine' = whole machine, 'chamber' = close-up of cylinder `cylinder` (0-based, default 0). */
   cameraView(framing: 'engine' | 'chamber', cylinder?: number): CameraView;
   /** Vertical shift of the chamber when the CR changes from `previous` to `cr`, m (0 for fixed-CR engines). */
