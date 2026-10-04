@@ -129,8 +129,9 @@ const DECK_Y = -(H_TDC + CROWN_ABOVE_DECK);
  */
 const POCKET = { xMin: -0.0915, xMax: -0.03, zMin: -0.0475, zMax: 0.0475, cornerRadius: 0.02 };
 /**
- * Plan area of POCKET minus the bore disc, m² — numerical (4000² grid) integration of the outline above;
- * the chamber model's exact area must agree (engines/model-t.test.ts).
+ * Plan area of POCKET minus the bore disc, m² — exact (Green's theorem, combustion/chamber.ts
+ * lHeadPlanMetrics; independently tools/reference/combustion_geometry_lhead_mc.py); engines/model-t.test.ts
+ * checks the two agree.
  */
 export const MODEL_T_POCKET_PLAN_AREA = 46.03020157589403e-4;
 /** Pocket height above the deck that closes the clearance volume (Vc = A_p·H_TDC + pocket + crevice), m. */
@@ -268,7 +269,8 @@ export const MODEL_T_IGNITION: TremblerMagnetoIgnitionSpec = {
  * offsets [0, 180, 540, 360] for cylinders 1..4; throws 1&4 at 0°, 2&3 at 180°.
  * Main bearings: front, centre (between #2 and #3), rear; crank 25-5/32 in long, mains 2, 2-3/16 and
  * 3-1/8 in long [DB23; Page29 p. 403]. UNVERIFIED: front/rear main centres ≈ 66 mm outboard of cylinders
- * 1/4 (half rod journal 19 mm + web ≈ 22 mm + half main bearing).
+ * 1/4 (half rod journal 19 mm + web ≈ 22 mm + half main bearing); the 3-1/8 in rear main sits ≈ 76 mm behind
+ * cylinder 4 so it clears the crank web (render layout check).
  */
 const Z1 = (4.125 + 5.25 / 2) * IN;
 const Z2 = (5.25 / 2) * IN;
@@ -277,7 +279,7 @@ export const MODEL_T_LAYOUT: CylinderLayoutSpec = {
   firingOffsetDeg: [0, 180, 540, 360],
   axisZ: [Z1, Z2, -Z2, -Z1],
   mirrorZ: [false, true, false, true],
-  mainBearingZ: [Z1 + 0.066, 0, -Z1 - 0.066],
+  mainBearingZ: [Z1 + 0.066, 0, -Z1 - 0.0762],
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -553,7 +555,7 @@ export const MODEL_T_FORD_DYNO: OperatingPoint = {
  * Ford's WOT power/torque table, "representative of the motors in general use" (ratings "as high as
  * 22 1/2 horsepower" were obtained), measured at the transmission output [FSB Fig. 84, via full-text
  * snippets; independently tabulated by Tulsa/Sigworth]. rpm, torque lb-ft, horsepower. The 1400 rpm torque
- * is illegible (≈ 74); Ford's torque and hp columns are rounded independently (≤ 1.5 % disagreement).
+ * is illegible (≈ 74); Ford's torque and hp columns are rounded independently (≤ 1.8 % disagreement).
  */
 export const MODEL_T_FORD_WOT_TABLE: readonly (readonly [number, number, number])[] = [
   [300, 35, 2], [400, 57, 4.5], [500, 69, 6.5], [600, 73, 8.5], [700, 78, 10.4], [800, 81, 12.33],

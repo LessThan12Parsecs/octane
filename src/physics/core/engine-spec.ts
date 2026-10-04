@@ -212,7 +212,7 @@ export interface TremblerMagnetoIgnitionSpec {
    * Optional per-cylinder deviations (index = cylinder − 1) — a mis-adjusted vibrator, a weak
    * condenser; absent entries use `coil`.
    */
-  coilOverrides?: Partial<TremblerCoilSpec & { vibrator: Partial<TremblerVibratorSpec> }>[];
+  coilOverrides?: Partial<Omit<TremblerCoilSpec, 'vibrator'> & { vibrator: Partial<TremblerVibratorSpec> }>[];
   magneto: MagnetoSpec;
   /** Battery for 'battery' operation (OperatingPoint.ignitionSource). */
   battery: { voltage: number; internalResistance: number };

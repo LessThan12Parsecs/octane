@@ -31,7 +31,7 @@ IN = 0.0254
 # plan as MODEL_T; roof 12.92 mm above the deck.
 _VD = math.pi / 4 * (3.75 * IN) ** 2 * 4 * IN
 _VC = _VD / (3.98 - 1)
-_POCKET_H = (_VC - 2.5e-6 - math.pi / 4 * (3.75 * IN) ** 2 * 1.0 * IN) / 46.016e-4
+_POCKET_H = (_VC - 2.5e-6 - math.pi / 4 * (3.75 * IN) ** 2 * 1.0 * IN) / 46.03020157589403e-4
 
 CASES = [
     dict(name="model-t-like", Dv=1.47 * IN, Di=1.3125 * IN, beta=math.radians(45), Ds=0.311 * IN, Dp=1.125 * IN,
