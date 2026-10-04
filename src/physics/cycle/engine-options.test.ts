@@ -2,9 +2,9 @@
  * Engine-keyed option defaults and operating-point sanitising (Model T integration): neutral physics
  * defaults ← per-engine defaults (EngineSpec.id) ← caller options; the CFR set is unchanged; the Model T
  * gets its own friction, valve lash, crankcase pressure, knock pickup/band (the virtual plug transducer and
- * the L-head band) and the (transferred, UNVERIFIED) MODEL_T_CALIBRATION with its physically estimated
- * venturi C_D; sanitizeOperatingPoint falls back to the engine's registry default operating point and keeps
- * the load model and the ignition source.
+ * the L-head band) and MODEL_T_CALIBRATION (calibration phase: fitted to Upton's MBT and suction data and
+ * Ford's WOT table, plus the Model T-only length-scale and friction factors); sanitizeOperatingPoint falls
+ * back to the engine's registry default operating point and keeps the load model and the ignition source.
  */
 import { describe, expect, it } from 'vitest';
 import type { EngineSpec } from '../core/engine-spec';
@@ -17,6 +17,7 @@ import {
   DEFAULT_CYCLE_MODEL_OPTIONS,
   defaultOperatingPointOf,
   ENGINE_CYCLE_OPTION_DEFAULTS,
+  MODEL_T_CALIBRATED_FRICTION,
   NEUTRAL_CYCLE_MODEL_OPTIONS,
   resolveCycleOptions,
   sanitizeOperatingPoint,
@@ -40,9 +41,16 @@ describe('engine-keyed cycle-model option defaults', () => {
     expect(resolveCycleOptions({}, { ...CFR_F1, id: undefined })).toEqual(resolveCycleOptions({}));
   });
 
-  it('the Model T gets its own hardware and the transferred calibration', () => {
+  it('the Model T gets its own hardware and its calibration', () => {
     const o = resolveCycleOptions({}, MODEL_T);
-    expect(o.friction).toBe(MODEL_T_FRICTION);
+    // (calibration phase) the PNH inputs of MODEL_T_FRICTION with the two calibrated friction factors
+    expect(o.friction).toBe(MODEL_T_CALIBRATED_FRICTION);
+    expect(o.friction).toEqual({
+      ...MODEL_T_FRICTION,
+      ringTensionFactor: MODEL_T_CALIBRATION.ringTensionFactor.value,
+      auxiliaryFactor: MODEL_T_CALIBRATION.auxiliaryFactor.value,
+    });
+    expect(o.turbulenceLengthScaleFactor).toBe(MODEL_T_CALIBRATION.turbulenceLengthScaleFactor.value);
     expect(o.friction!.cylinders).toBe(4);
     expect(o.valveLash).toBe(MODEL_T_VALVE_LASH);
     expect(o.crankcaseGaugePressure).toBe(0);
@@ -54,20 +62,30 @@ describe('engine-keyed cycle-model option defaults', () => {
     expect(Math.hypot(o.knockSensor[0], o.knockSensor[1])).toBeGreaterThan(MODEL_T.geometry.bore / 2);
     // caller options still win
     expect(resolveCycleOptions({ burnRateMultiplier: 4, friction: null }, MODEL_T)).toMatchObject({ burnRateMultiplier: 4, friction: null, valveLash: MODEL_T_VALVE_LASH });
-    expect(ENGINE_CYCLE_OPTION_DEFAULTS['ford-model-t'].friction).toBe(MODEL_T_FRICTION);
+    expect(ENGINE_CYCLE_OPTION_DEFAULTS['ford-model-t'].friction).toBe(MODEL_T_CALIBRATED_FRICTION);
+    // the CFR keeps the neutral length scale
+    expect(DEFAULT_CYCLE_MODEL_OPTIONS.turbulenceLengthScaleFactor).toBe(1);
   });
 
-  it('MODEL_T_CALIBRATION = the CFR values (venturi C_D: a physical estimate), each marked UNVERIFIED with the evidence that would set it', () => {
-    for (const k of CAL_KEYS) {
+  it('MODEL_T_CALIBRATION (calibration phase): every entry inside its literature range with source and evidence; the universal closures are the CFR values', () => {
+    const keys = Object.keys(MODEL_T_CALIBRATION) as (keyof typeof MODEL_T_CALIBRATION)[];
+    expect(keys).toEqual(expect.arrayContaining([...CAL_KEYS, 'turbulenceLengthScaleFactor', 'ringTensionFactor', 'auxiliaryFactor']));
+    for (const k of keys) {
       const p = MODEL_T_CALIBRATION[k];
-      // (Model T integration: the CFR venturi fit does not carry over to the 23/32 in venturi)
-      if (k === 'venturiDischargeCoefficient') expect(p.value).not.toBe(CFR_CALIBRATION[k].value);
-      else expect(p.value).toBe(CFR_CALIBRATION[k].value);
-      expect(p.range).toEqual(CFR_CALIBRATION[k].range);
-      expect(p.value).toBeGreaterThanOrEqual(p.range[0]);
-      expect(p.value).toBeLessThanOrEqual(p.range[1]);
-      expect(p.evidence.startsWith('UNVERIFIED')).toBe(true);
-      expect(p.evidence).toMatch(/Would be set by: \S/);
+      expect(p.value, k).toBeGreaterThanOrEqual(p.range[0]);
+      expect(p.value, k).toBeLessThanOrEqual(p.range[1]);
+      expect(p.source.length, k).toBeGreaterThan(20);
+      expect(p.evidence.length, k).toBeGreaterThan(20);
+    }
+    // fitted to the Model T data (Upton MBT and suction, Ford's WOT table): no longer the transferred CFR values
+    for (const k of ['burnRateMultiplier', 'taylorScaleMultiplier', 'venturiDischargeCoefficient'] as const) {
+      expect(MODEL_T_CALIBRATION[k].value, k).not.toBe(CFR_CALIBRATION[k].value);
+      expect(MODEL_T_CALIBRATION[k].evidence.startsWith('UNVERIFIED'), k).toBe(false);
+    }
+    // universal closures (not engine-fitted) stay the CFR values, marked as transferred
+    for (const k of ['kernelHandoffMultiple', 'marksteinMultiplier'] as const) {
+      expect(MODEL_T_CALIBRATION[k].value, k).toBe(CFR_CALIBRATION[k].value);
+      expect(MODEL_T_CALIBRATION[k].evidence).toMatch(/Would be set by: \S/);
     }
   });
 

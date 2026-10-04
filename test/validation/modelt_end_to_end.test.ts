@@ -2,9 +2,9 @@
  * Ford Model T end to end (Model T integration): the real MODEL_T spec — L-head chamber with its block-deck
  * surface, three-arc cams and side-valve flow, venturi + butterfly carburettor, four trembler coils on the
  * flywheel magneto, the rigid four-cylinder crank train with whole-engine friction — run through
- * CycleModel and EngineSimulator. The model is UNCALIBRATED (MODEL_T_CALIBRATION is the transferred CFR set
- * with a physical venturi C_D), so the checks here are integration and physics properties, not Ford's
- * numbers: finite, deterministic output; four identical cylinders giving equal cycles 180° apart in the
+ * CycleModel and EngineSimulator. Written for the uncalibrated model; the checks here are integration and
+ * physics properties, not Ford's numbers (those are test/validation/measured_modelt_data.test.ts, against the
+ * calibrated MODEL_T_CALIBRATION): finite, deterministic output; four identical cylinders giving equal cycles 180° apart in the
  * firing order 1-2-4-3; no misfire; the spark train of each timer contact; conservation of mass, species /
  * elements and energy of the whole four-cylinder network (the tolerances of the CFR and multi-cylinder
  * tests); the snapshot contract (cylinders[] at local angles, trembler spark fields, magneto EMF, firing
@@ -105,17 +105,19 @@ describe("Model T at Ford's dyno condition (fixed 1600 rpm, wide open, lever ful
     }
   });
 
-  it('engine summary: brake = indicated − friction at fixed speed, load = brake, plausible uncalibrated levels', () => {
+  it('engine summary: brake = indicated − friction at fixed speed, load = brake, plausible (calibrated) levels', () => {
     expect(e.rpmMean).toBeCloseTo(1600, 6);
     expect(e.brakeTorque).toBeCloseTo(e.indicatedTorque - e.frictionTorque, 9);
     expect(e.loadTorque).toBe(e.brakeTorque);
     const Vt = 4 * m.kin.displacedVolume;
     expect(rel(e.bmep, (4 * Math.PI * e.brakeTorque) / Vt)).toBeLessThan(1e-12);
-    // uncalibrated plausibility bands (Ford: 65 lb-ft = 88 N m at 1600 rpm; PNH FMEP ≈ 0.66 bar)
+    // plausibility bands (Ford: 65 lb-ft = 88 N m at 1600 rpm). Calibration phase: the friction is PNH with the
+    // calibrated ring-pack and transmission-churning factors (options.ts MODEL_T_CALIBRATED_FRICTION, ≈ 1.13 bar
+    // at 1600 rpm; pure PNH ≈ 0.66 bar) — the band was 0.5–0.8 bar for the uncalibrated model
     expect(e.brakeTorque).toBeGreaterThan(0.5 * 65 * LBFT);
     expect(e.brakeTorque).toBeLessThan(2 * 65 * LBFT);
-    expect(e.fmep / 1e5).toBeGreaterThan(0.5);
-    expect(e.fmep / 1e5).toBeLessThan(0.8);
+    expect(e.fmep / 1e5).toBeGreaterThan(0.9);
+    expect(e.fmep / 1e5).toBeLessThan(1.4);
     expect(e.volumetricEfficiency).toBeGreaterThan(0.4);
     expect(e.volumetricEfficiency).toBeLessThan(0.95);
     expect(e.brakeEfficiency).toBeGreaterThan(0.05);
@@ -127,7 +129,7 @@ describe("Model T at Ford's dyno condition (fixed 1600 rpm, wide open, lever ful
       expect(s.residualFraction).toBeLessThan(0.3);
     }
     console.log(
-      `[Model T] 1600 rpm WOT (uncalibrated): T_b ${e.brakeTorque.toFixed(1)} N m (${(e.brakeTorque / LBFT).toFixed(1)} lb-ft; Ford 65), ` +
+      `[Model T] 1600 rpm WOT: T_b ${e.brakeTorque.toFixed(1)} N m (${(e.brakeTorque / LBFT).toFixed(1)} lb-ft; Ford 65), ` +
         `IMEP ${(e.imepNet / 1e5).toFixed(2)} bar, FMEP ${(e.fmep / 1e5).toFixed(2)} bar, η_v ${e.volumetricEfficiency.toFixed(3)}, ` +
         `CA50 ${last[0].ca50.toFixed(1)}°, first spark ${last[0].sparkDeg!.toFixed(1)}° (${last[0].sparkCount} breakdowns)`,
     );

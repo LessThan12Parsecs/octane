@@ -6,7 +6,7 @@
  * tuned per operating point. DEFAULT_CYCLE_MODEL_OPTIONS (options.ts) takes its defaults from here.
  * Multi-engine (Model T integration): one set PER ENGINE, selected by EngineSpec.id through the
  * engine-keyed option defaults of options.ts — CFR_CALIBRATION ('cfr-f1') and MODEL_T_CALIBRATION
- * ('ford-model-t', transferred CFR values, nothing fitted yet; see below).
+ * ('ford-model-t', calibrated 2026-10 against Ford's WOT table, Upton's MBT and suction data; see below).
  *
  * Validation round 2 (fixer pass, 2026-09-30). The model changed under the calibration: crevice zone,
  * lumped wall temperatures, rate-controlled NO in the burned-zone energy, venturi metering AIR at the
@@ -210,73 +210,190 @@ function transferred(p: CalibratedParameter, wouldBeSetBy: string): CalibratedPa
 }
 
 /**
- * Ford Model T calibration (Model T integration, 2026-10). No measured Model T cylinder-pressure traces
- * exist, so NOTHING here is fitted: every value but one is the CFR F-1 value transferred (DESIGN.md
- * calibration policy, one set per engine; the universal closures marksteinMultiplier and
- * kernelHandoffMultiple are the same physics on both engines) — the exception is the carburettor venturi
- * C_D, whose CFR value (0.6, at the lower bound of its range, fitted to the 9/16 in CFR throat at Re ≈ 1e4
- * with a fuel-nozzle bridge) has no physical reason to apply to the Model T's 23/32 in venturi, so a
- * physical estimate is used instead (see the entry). Each entry names the Model T evidence that would set
- * it. This is the uncalibrated placeholder: a separate calibration phase sets the set. The global
- * targets are Ford's WOT torque/power table (engines/model-t.ts MODEL_T_FORD_WOT_TABLE, ±1.5 % rounding,
- * transmission-output basis) and Upton's MBT spark advance vs speed (modelTUptonMbtDeg). Reasons the CFR
- * values should NOT be expected to carry over: the CFR burn constants were fitted with a shrouded overhead
- * intake valve and a disc chamber, while the Model T has an unshrouded side valve feeding an L-head pocket
- * (weaker, differently structured turbulence, a longer flame path), a much larger surface/volume ratio, a
- * thermosyphon jacket, and a Holley/Kingston carburettor venturi of another size and Reynolds number.
+ * The Model T set: the CFR closures plus the ones only the Model T calibration uses — the turbulence
+ * dissipation-length multiplier (options.turbulenceLengthScaleFactor; neutral 1 for the CFR) and the two
+ * friction factors added to PNH (options.ts MODEL_T_CALIBRATED_FRICTION = MODEL_T_FRICTION with these).
  */
-export const MODEL_T_CALIBRATION: CalibrationSet = Object.freeze({
-  burnRateMultiplier: transferred(
-    CFR_CALIBRATION.burnRateMultiplier,
-    "Upton's MBT spark advance vs speed on a Ford engine at WOT (J. SAE 1923, 0.108R/(1 + 0.001R) deg: MBT puts CA50 " +
-      'near 8–10° ATDC, so the MBT curve measures the burn duration and its growth with rpm) together with the shape of ' +
-      "Ford's WOT torque curve (FSB Fig. 84) at a fixed volumetric efficiency.",
-  ),
-  taylorScaleMultiplier: transferred(
-    CFR_CALIBRATION.taylorScaleMultiplier,
-    'the same MBT-vs-rpm data as C_T (C_λ sets the burn-up tail CA50→CA90, which moves the MBT angle at low speed).',
-  ),
+export type ModelTCalibrationSet = CalibrationSet & {
+  readonly turbulenceLengthScaleFactor: CalibratedParameter;
+  readonly ringTensionFactor: CalibratedParameter;
+  readonly auxiliaryFactor: CalibratedParameter;
+};
+
+/**
+ * Ford Model T calibration (calibration phase, 2026-10). No Model T cylinder-pressure trace exists, so the
+ * set is fitted to GLOBAL period data, ONE set for every operating point of the engine (DESIGN.md policy):
+ *
+ *   1. Upton's WOT MBT spark advance a₀ = 0.108R/(1 + 0.001R) on a Cornell Ford engine (J. SAE Aug. 1923,
+ *      "reduced to zero intake suction"; data to ≈ 1500 rpm) — sets the burn (burnRateMultiplier,
+ *      taylorScaleMultiplier, turbulenceLengthScaleFactor). Simulated as Upton ran it: an ideal timed spark
+ *      (his Atwater Kent battery-distributor ignition — the CFR inductive coil on the Model T spec), intake
+ *      air and discharge water at 140 °F (333 K; mixture 318 K after fuel evaporation), barometer 29.35 inHg,
+ *      wide open (engines/model-t.ts MODEL_T_UPTON_CONDITIONS); the model's MBT is the parabola vertex of its
+ *      brake-torque-vs-spark scan (2.5° steps).
+ *   2. Upton's Table 3 (same paper) intake suction at the lowest-suction (≈ wide-open) point of each speed:
+ *      1.10 / 2.60 / 4.40 / 5.55 inHg at 600 / 800 / 1200 / 1400 rpm — sets the carburettor restriction
+ *      (venturiDischargeCoefficient on the 23/32 in proxy throat). Cross-check: Upton's Fig. 4 peak BMEP
+ *      ≈ 70 psi at 4 inHg (≈ 1100 rpm by Table 3) = Ford's 69 psi at 1000–1100 rpm.
+ *   3. Ford's WOT brake-torque table (FSB Fig. 84, transmission output, "representative of the motors in
+ *      general use") — the model's MAXIMUM brake torque over the spark-lever range (magneto, lever scanned
+ *      in 2.5° steps: the lever→first-spark map is a magneto staircase) at Ford's dyno condition
+ *      (engines/model-t.ts MODEL_T_FORD_DYNO) — sets the friction added to PNH (ringTensionFactor,
+ *      auxiliaryFactor; MODEL_T_CALIBRATED_FRICTION in options.ts) and checks the shape.
+ *   The remaining entries are kept at physically argued values and checked, not fitted.
+ * Scripts: tmp/calib/ of the calibration worktree (sweep-lib.ts runner, gen.py / mk_grid2.py grids, rank.py),
+ * ≈ 5000 fixed-speed runs; grid over C_T 2–6, C_λ 1.6–3, f_L × 0.35–1, venturi C_D 0.6–0.95, friction
+ * variants. Warm-up 2 + 2 cycles; checked against 5 + 4 cycles (brake torque within 0.01 lb-ft).
+ *
+ * Before (transferred CFR set, venturi 0.95, pure PNH friction) → after:
+ *   Upton MBT (model − Upton) 400/600/800/1000/1200 rpm: −16.6/−20.1/−23.7/−26.6/−30.0° → +2.5/+2.0/−0.3/−2.2/−2.7°
+ *     (1400 rpm: flat optimum 63–73°, earlier inductive sparks misfire); Table 3 measured optima at the WOT points
+ *     600/800/1200/1400 rpm: 42/53/55/60° vs model 42.5/47.7/56.2/63–73°. BMEP at the MBT spark, Upton's condition:
+ *     67–68 psi at 600–800 rpm (his Fig. 4: ≈ 70 psi).
+ *   WOT suction 600/800/1200/1400 rpm: 0.85/1.44/2.67/3.25 → 1.61/2.60/4.60/5.50 inHg (Upton 1.10/2.60/4.40/5.55).
+ *   Ford WOT max brake torque, model/Ford − 1, 500/600/…/1900 rpm: before +47/…/+36 (700)/…/+27 (900)/…/+33
+ *     (1200)/…/+37 (1500)/…/+52 (1800) % → +29.4/+25.5/+19.0/+14.2/+9.0/+9.2/+7.6/+5.5/+1.8/−2.3/−5.6/−8.2/
+ *     −4.9/−4.5/−5.9 %: 900–1900 rpm within ±10 %; the 500–800 rpm excess is a documented model-form residual
+ *     (test/fixtures/modelt_validation_README.md); peak 92.8 lb ft at 700 rpm (Ford 83 at 900), 19.3 hp at
+ *     1400 rpm (Ford 20 hp at 1500–1600).
+ *   Top speed (fixed-speed WOT curve, lever 64.5, against the 'vehicle' road load): 49.5 → 43.6 mph at 1784 rpm.
+ *   Motored compression at 150 rpm: 67.9 psig before and after (Ford 60, Motor Age 55): a residual, see
+ *     modelt_validation_README.md (no blow-by in the model; CR 3.78 would give 62.8 psig).
+ *
+ * Physics of the fitted burn: the L-head's turbulence is weak ("the air entering through the inlet valves
+ * had to turn two right angles before it entered the cylinder and … lost much of its initial velocity",
+ * Ricardo, The High-Speed IC Engine, ch. 6, on the pre-1919 side-valve slab chamber with the plug over the
+ * inlet valve — the Model T's) and decays fast in the shallow pocket: with the fitted dissipation length the
+ * K–k u′ at TDC is ≈ 0.25 S̄p (CFR ≈ 0.6) and the entrainment speed C_T u′ is ≈ 1/3 of Keck's (1982) eq. 4.10
+ * correlation evaluated on the Model T's inlet flow, so S_L carries a large share of the burn and the
+ * burn angle grows with speed as Upton measured (a₀ ∝ R/(1 + 0.001R)). Because u′ decays more in the
+ * longer time of a low-speed cycle, u′ rises faster than rpm, which keeps the 1500–1900 rpm burn short
+ * enough for the advance the magneto/trembler ignition can reach (≈ 51–64° first spark).
+ */
+export const MODEL_T_CALIBRATION: ModelTCalibrationSet = Object.freeze({
+  burnRateMultiplier: Object.freeze({
+    value: 4.0,
+    range: [1.2, 16] as const,
+    source:
+      'Both ends evaluated on the Model T model’s own burn (K–k u′ at the calibrated length scale f_L = 0.4 × 0.25, ' +
+      'S_L at CA10–CA50, 400–1800 rpm WOT): lower end Upton 1923 (J. SAE XIII(2) Fig. 10, the Ford engine’s ' +
+      '"turbulence factor" S_T/S_L = 1 + 0.001R, i.e. u_T = 0.001R·S_L) → u_T/u′ ≈ 1.2–1.5; upper end Keck 1982 ' +
+      '(19th Symp. Combust. p. 1451) eq. 4.10, u_T = 0.08 ū_i (ρ_u/ρ_i)^½ with ū_i from the unshrouded inlet valve at ' +
+      'maximum lift → u_T/u′ = 10.7–15.5 (×1.1 for his ±10 %). Qualitatively (Ricardo, High-Speed IC Engine ch. 6) ' +
+      'the pre-turbulent-head side-valve chamber "lacked turbulence".',
+    evidence:
+      'Upton MBT (ideal spark, MODEL_T_UPTON_CONDITIONS) model − Upton: 400/600/800/1000/1200 rpm +2.5/+2.0/−0.3/−2.2/−2.7° ' +
+      '(rms 2.1°; 1400 rpm flat optimum 63–73°). Grid (C_T × C_λ × f_L, rank.py): C_T 3.5/4.5 with f_L 0.45/0.35 ' +
+      'fit equally (rms 1.8/2.3°); C_T 2 with f_L 1 (the CFR length scale) fits the MBT (rms 1.2°) but its early-spark ' +
+      'kernel waits for the hand-off radius (∝ L) to shrink and the WOT torque collapses above 1400 rpm ' +
+      '(1800 rpm −24 % vs Ford). CFR transfer 5.3 (f_L 1): MBT 17–30° too early.',
+  }) as CalibratedParameter,
+  taylorScaleMultiplier: Object.freeze({
+    value: 2.0,
+    range: [1.15, 3.8] as const,
+    source:
+      'Keck 1982 Fig. 15, ℓ_T = 0.8 L_IV (ρ_i/ρ_u)^¾ (±25 %), evaluated on the Model T burn (L_IV = 5.70 mm net lift, ' +
+      'raw Taylor microscale at CA50, 400–1800 rpm WOT, calibrated f_L): ℓ_T/λ = 1.5–3.0 (range × 0.75…1.25).',
+    evidence:
+      'Upton MBT with C_T/f_L (burnRateMultiplier): C_λ 1.6/2.0/2.5 at C_T 4, f_L × 0.4 give MBT rms 3.2/2.1/2.4° ' +
+      '(calibration grid g3, venturi 0.62) and Ford 1500/1800 rpm +8.3/+15.7 %, +6.0/+11.9 %, +2.8/+7.1 % with pure ' +
+      'PNH friction: 2.0 is the MBT optimum; C_λ moves the high-speed tail (burn-up time ∝ λ/S_L) more than the MBT.',
+  }) as CalibratedParameter,
+  turbulenceLengthScaleFactor: Object.freeze({
+    value: 0.4,
+    range: [0.4, 1.5] as const,
+    source:
+      'Multiplier on f_L = 0.25 in L = f_L·min(h, B) (combustion/turbulence.ts): L_int/h ≈ 0.10–0.15 (Aleiferis & ' +
+      'Behringer 2017, Fuel 189:238) divided by C_ε = εL_int/u′³ ≈ 0.4–1.0 (shear flow ≈ 0.5, grid turbulence 0.7–1; ' +
+      'UNVERIFIED, search summaries — turbulence.ts) → f_L = 0.10–0.375, i.e. × 0.4–1.5.',
+    evidence:
+      'At the lower bound (L_int/h ≈ 0.10 with grid-like C_ε ≈ 1: the bore column and the 13 mm deep valve pocket). ' +
+      'With C_T 4, C_λ 2: Upton MBT rms 2.1° and Ford WOT 1500/1800 rpm −5.6/−4.5 %. f_L × 0.5/0.65/1.0, each with C_T ' +
+      'refitted to the MBT, give 1800 rpm −5/−17/−24 % (calibration grids g2/w1, 0.6–1 bar more or less friction ' +
+      'aside): the smaller L shortens the hand-off radius r_ho = 2·0.5·L of the early (50–64° BTDC) magneto sparks — ' +
+      'at f_L 1 the kernel stalls at ≈ 2 mm for ≈ 30° at 1800 rpm — and makes u′ grow faster than rpm. ' +
+      'u′(TDC)/S̄p ≈ 0.25 (Ricardo: weak side-valve turbulence).',
+  }) as CalibratedParameter,
   kernelHandoffMultiple: transferred(
     CFR_CALIBRATION.kernelHandoffMultiple,
-    'universal closure (Forte C_m1 = 2, not engine-fitted); a trembler spark shower (several breakdowns per event) may ' +
-      'need its own hand-off criterion: check the misfire limit at idle (≈ 400 rpm, throttle nearly shut, spark retarded).',
+    'universal closure (Forte C_m1 = 2, not engine-fitted); C = 1 (Fluent) changed the calibrated WOT torque by ≤ 5 % ' +
+      '(1800 rpm) and the MBT by < 1° in the calibration grid (with C_T 2, f_L 1), so it was left universal.',
   ),
   marksteinMultiplier: transferred(
     CFR_CALIBRATION.marksteinMultiplier,
     'universal closure (Bradley 1998 measured/theory ratio, not engine-fitted); unchanged.',
   ),
-  woschniMultiplier: transferred(
-    CFR_CALIBRATION.woschniMultiplier,
-    "the WOT brake efficiency (Ford's dyno table with a fuel-flow measurement, or period road-test fuel economy at a " +
-      'known speed) and the jacket heat rejection of the thermosyphon system; the L-head pocket adds surface that the ' +
-      'per-area Woschni coefficient does not know about.',
-  ),
-  intakePortHeatTransferMultiplier: transferred(
-    CFR_CALIBRATION.intakePortHeatTransferMultiplier,
-    'the WOT torque level at 500–900 rpm (FSB Fig. 84: 69–83 lb ft), which fixes the volumetric efficiency once the burn ' +
-      'is set; the siamesed intake ports run through the water jacket of the block (spec.manifolds.intakePortLength UNVERIFIED).',
-  ),
+  woschniMultiplier: Object.freeze({
+    value: CFR_CALIBRATION.woschniMultiplier.value,
+    range: CFR_CALIBRATION.woschniMultiplier.range,
+    source: CFR_CALIBRATION.woschniMultiplier.source,
+    evidence:
+      'Kept at the CFR value (per-area coefficient; the L-head pocket and block-deck areas are in the chamber geometry). ' +
+      'Check against Ricardo’s heat balance (High-Speed IC Engine ch. 5: a well-designed 5:1 engine loses ≈ 13 % of ' +
+      'the fuel heat to the walls during combustion + expansion): the calibrated Model T loses 20–25/16/14.5 % (closed ' +
+      'cycle, LHV basis, φ 1.15) at 900/1500/1800 rpm WOT — already above it, as a slow-burning L-head should; ×2.0 ' +
+      'would make it 28 % at 900 rpm and lowers the WOT torque ≈ 15 % at every speed (no shape change), so the torque ' +
+      'level was assigned to friction (transmission-output basis) instead.',
+  }) as CalibratedParameter,
+  intakePortHeatTransferMultiplier: Object.freeze({
+    value: CFR_CALIBRATION.intakePortHeatTransferMultiplier.value,
+    range: CFR_CALIBRATION.intakePortHeatTransferMultiplier.range,
+    source: CFR_CALIBRATION.intakePortHeatTransferMultiplier.source,
+    evidence:
+      'Kept at the CFR value (the siamesed ports are cast in the block next to the jacket; spec.manifolds.intakePortLength ' +
+      '0.1 m UNVERIFIED). Sensitivity: 0 (adiabatic) raises the WOT torque by 3.5 % at 500–700 rpm, 2–3 % at 900–1200, ' +
+      '≈ 0 at 1500 — too weak to carry any calibration target, so not refitted.',
+  }) as CalibratedParameter,
   venturiDischargeCoefficient: Object.freeze({
-    // Physical estimate, not fitted: the classical-venturi throat coefficient at the Model T's throat Reynolds
-    // number. ISO 5167-4:2022 gives C = 0.984 for an as-cast convergent at 2e5 ≤ Re ≤ 2e6 (options.ts
-    // VENTURI_DISCHARGE_COEFFICIENT, fetched summary); the 23/32 in (18.3 mm) throat passes ≈ 0.028 kg/s of air
-    // at Ford's 20 hp (η_v ≈ 0.6 at 1600 rpm), Re = ṁ D/(A μ) ≈ 1.1e5 (≈ 0.6e5 at 900 rpm) — below the
-    // standard's range, where venturi coefficients fall a few per cent (UNVERIFIED magnitude: ≈ 0.95–0.97 at
-    // Re ≈ 1e5 from memory of the ASME MFC-3M low-Re curves) and the fuel nozzle in the throat blocks part of
-    // it. The full-loss orifice convention (no diffuser recovery) makes the value conservative for the flow.
-    value: 0.95,
+    value: 0.62,
     range: CFR_CALIBRATION.venturiDischargeCoefficient.range,
     source: CFR_CALIBRATION.venturiDischargeCoefficient.source,
     evidence:
-      'UNVERIFIED for this engine: a physical estimate, nothing fitted (the CFR 0.6 is a fit to another venturi at ' +
-      'Re ≈ 1e4). ISO 5167-4 classical-venturi C = 0.984 (Re ≥ 2e5) reduced to 0.95 for the throat Reynolds number ' +
-      '0.6–1.1e5 at the Model T WOT flows and the fuel-nozzle blockage. Would be set by: the WOT torque fall-off above ' +
-      '1000 rpm (FSB Fig. 84: 82 → 47 lb ft at 1000 → 1900 rpm), mostly carburettor and manifold restriction; a ' +
-      'measured air flow of a Holley NH / Kingston L-4 venturi would set it directly.',
+      'Fitted to Upton 1923 Table 3 (engines/model-t.ts MODEL_T_UPTON_TABLE3: the lowest intake suction at each speed, ' +
+      'Cornell Ford engine with a "regular Holley" carburettor) at MODEL_T_UPTON_CONDITIONS and Upton’s MBT spark: ' +
+      'cycle-mean manifold suction 1.61/2.60/4.60/5.50 inHg at 600/800/1200/1400 rpm vs 1.10/2.60/4.40/5.55 (least ' +
+      'squares over 800–1400 rpm: 0.625; the 600 rpm point is ≥ 0.4 inHg high at any C_D ≤ 0.7). C_D 0.6/0.64/0.66/0.7/0.95: ' +
+      'mean model/Upton ratio 1.057/0.971/0.933/0.863/0.58. Sensitivity to the UNVERIFIED 318 K mixture temperature of ' +
+      'Upton’s condition: a 300 K mixture moves the fit to 0.64. The value multiplies the area of the ' +
+      'UNVERIFIED 23/32 in Holley G proxy throat (manifolds.venturiDiameter), so it is the effective C_D·A of the Holley NH ' +
+      'venturi + fuel-nozzle bridge + swayback passage + 1 in butterfly that the data measure, at Re ≈ 0.6–1.1e5.',
   }) as CalibratedParameter,
   knockStratificationDT: transferred(
     CFR_CALIBRATION.knockStratificationDT,
-    'knock intensity — no measurements exist; the period practice of retarding the spark lever on hills (audible spark ' +
-      'knock at WOT and low speed on ≈ 40–55 ON gasoline) only bounds the knock ONSET (the delay model), not the intensity.',
+    'knock intensity — no Model T measurement exists. Ricardo (High-Speed IC Engine ch. 6): side-valve engines at ' +
+      '≈ 4:1 on the 45–50 ON petrol of 1919–21 "would detonate heavily unless the ignition timing were constantly ' +
+      'adjusted"; the calibrated model knocks at WOT up to 1400 rpm with the lever fully advanced (MAPO 0.01–0.42 bar at ' +
+      'the virtual plug transducer; a light-knock lever, MAPO ≤ 0.05 bar, gives 2–15 % less torque at 500–900 rpm) ' +
+      'and not at the cruise settings — onset is the delay model’s, the MAPO scale unvalidated.',
   ),
+  ringTensionFactor: Object.freeze({
+    value: 2.5,
+    range: [1, 3.2] as const,
+    source:
+      'PNH ring-tension term ∝ ring tension (Patton et al. 1989 / Sandoval 2002 F_t/F_t0). Model T: three cast-iron ' +
+      'rings 1/4 in wide (groove 1/4 × 13/64 in, eccentric 0.180→0.085 in [Dyke 1924 Instr. 70]) = 19.05 mm of ring face ' +
+      'vs ≈ 6–7.5 mm (two ≈ 1.5 mm compression rings + a 3–4 mm oil ring) in the 1980s engines PNH was fitted to ' +
+      '(UNVERIFIED typical widths) → × 2.5–3.2 at equal wall pressure; 1 = PNH as fitted.',
+    evidence:
+      'Physical estimate (face-width ratio 19.05/7.5), not fitted: + 0.20/0.14/0.11 bar FMEP at 500/900/1500 rpm. Its ' +
+      '(1 + 1000/N) boundary-friction form is the only low-speed-heavy loss available; a factor at the bound (3.2) moves ' +
+      'the 500 rpm torque by −1.8 % only (the 500–800 rpm excess is not a friction-sized residual).',
+  }) as CalibratedParameter,
+  auxiliaryFactor: Object.freeze({
+    value: 3.0,
+    range: [0.3, 3.5] as const,
+    source:
+      'Multiplier on PNH’s auxiliary term (oil + water pump + alternator of a 1980s engine: 0.49 kW at 1500 rpm for 2.9 L). ' +
+      'Model T: no pumps — belt fan, generator (1919+) and magneto load ≈ 0.15 kW → 0.3 (MODEL_T_FRICTION, UNVERIFIED); ' +
+      'Ford measured at the transmission output [Tulsa], so the high-gear churning of the magneto flywheel, clutch drum ' +
+      'and planetary in the oil pit belongs here too: UNVERIFIED estimate ≤ 1.5 kW at 1500 rpm (≈ 5–7 % of the 20 hp; ' +
+      'Tulsa assumes 20–25 % for transmission + axle on chassis dynos) → upper end 3.5 (1.7 kW).',
+    evidence:
+      'Fitted to the Ford WOT level at 900–1900 rpm with ringTensionFactor 2.5 (minimax error): max-over-lever torque ' +
+      '+9.0/+9.2/+5.5/−5.6/−8.2/−4.5 % at 900/1000/1200/1500/1600/1800 rpm, every 900–1900 rpm point within ±10 % (aux 2.5: ' +
+      '1000 rpm +10.4 %; aux 3.5: 1600 rpm −10.0 %; offline PNH re-evaluation of the same cycles). Total FMEP ' +
+      '1.00/1.11/1.18 bar at 900/1500/1800 rpm, η_m 0.78 at 1500 rpm — the period ALAM/SAE rating assumption is η_m 0.75 ' +
+      'at 1000 ft/min (90 psi IMEP, D²N/2.5 [Good 1922 pp. 37–38]); pure PNH gave 0.63 bar, η_m 0.88, and +5…+18 % at ' +
+      '900–1900 rpm. Aux 3.0 ≈ 1.5 kW at 1500 rpm.',
+  }) as CalibratedParameter,
 });
