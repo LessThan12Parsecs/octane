@@ -28,10 +28,14 @@
  * al. 2018, SAE 2018-01-0848) — and therefore INCLUDES the top-land/ring
  * crevice, plug and pickup cavities (lumped in `creviceVolume`).
  *   volume(θ)          = V_c + A_p·x(θ)             total cylinder gas volume
- *   clearanceHeight(θ) = h_TDC + x(θ),  h_TDC = (V_c − V_crevice)/A_p
- * so volume(θ) = A_p·clearanceHeight(θ) + V_crevice exactly: the flat-disc
- * ("pancake") chamber of height h plus a constant crevice volume.
- * Piston crown and head face are both taken as flat discs of bore diameter.
+ *   clearanceHeight(θ) = h_TDC + x(θ),  h_TDC = (V_c − V_crevice − V_fixed)/A_p
+ * so volume(θ) = A_p·clearanceHeight(θ) + V_crevice + V_fixed exactly: the bore
+ * column of height h (the flat-disc "pancake" chamber when V_fixed = 0, the
+ * default) plus a constant crevice volume and a constant non-bore chamber volume
+ * V_fixed = `fixedChamberVolume` (the valve pocket of a side-valve 'l-head'
+ * chamber, combustion/chamber.ts chamberFixedVolume; then h is the depth of the
+ * bore column below the head-cavity roof). Piston crown and the head face over
+ * the bore are flat discs of bore diameter.
  *
  * Validation (kinematics.test.ts): numerical loop-closure oracle
  * (tools/reference/mechanics_kinematics.py), Heywood (1988) eqs. 2.4–2.6 for
@@ -45,7 +49,13 @@ import type { EngineGeometrySpec } from '../core/engine-spec';
 export type SliderCrankGeometry = Pick<
   EngineGeometrySpec,
   'bore' | 'stroke' | 'conRodLength' | 'pinOffset' | 'creviceVolume'
->;
+> & {
+  /**
+   * Chamber volume outside the bore column (side-valve pocket), part of the clearance volume, m³.
+   * Absent / 0: the flat-disc convention (h_TDC = (V_c − V_crevice)/A_p). See the file header.
+   */
+  fixedChamberVolume?: number;
+};
 
 /** All kinematic quantities at one crank angle (SI; reused output record, see SliderCrank.evaluate). */
 export interface KinematicState {
@@ -58,7 +68,7 @@ export interface KinematicState {
   x: number;
   dxdTheta: number;
   d2xdTheta2: number;
-  /** Disc clearance height h, m. */
+  /** Clearance height h (flat disc: head-to-crown height; L-head: bore-column depth below the cavity roof), m. */
   clearanceHeight: number;
   /** Cylinder volume V, m³; dV/dθ, m³/rad. */
   volume: number;
@@ -102,6 +112,8 @@ export class SliderCrank {
   readonly pinLineX: number;
   /** Lumped crevice volume, included in the clearance volume, m³. */
   readonly creviceVolume: number;
+  /** Chamber volume outside the bore column (L-head valve pocket), included in the clearance volume, m³ (0: flat disc). */
+  readonly fixedChamberVolume: number;
   /** Bore cross-section πB²/4 (= flat piston-crown area = flat head-face area), m². */
   readonly boreArea: number;
   /** Flat head fire-deck area exposed to the gas (πB²/4, valve faces included), m². */
@@ -137,12 +149,15 @@ export class SliderCrank {
     const xw = pinOffset;
     if (!(l - a > Math.abs(xw))) throw new RangeError('SliderCrank: mechanism cannot pass BDC (l − a ≤ |offset|)');
     if (!(creviceVolume >= 0)) throw new RangeError('SliderCrank: creviceVolume must be ≥ 0');
+    const fixedChamberVolume = geometry.fixedChamberVolume ?? 0;
+    if (!(fixedChamberVolume >= 0)) throw new RangeError('SliderCrank: fixedChamberVolume must be ≥ 0');
     this.bore = bore;
     this.crankRadius = a;
     this.rodLength = l;
     this.pinOffset = pinOffset;
     this.pinLineX = xw;
     this.creviceVolume = creviceVolume;
+    this.fixedChamberVolume = fixedChamberVolume;
     this.boreArea = (Math.PI * bore * bore) / 4;
     this.headArea = this.boreArea;
     this.pistonCrownArea = this.boreArea;
@@ -167,7 +182,7 @@ export class SliderCrank {
     return this.vc;
   }
 
-  /** Head-to-crown disc height at TDC, (V_c − V_crevice)/A_p, m. */
+  /** Clearance height at TDC, (V_c − V_crevice − V_fixed)/A_p, m. */
   get clearanceHeightTDC(): number {
     return this.hTdc;
   }
@@ -180,8 +195,8 @@ export class SliderCrank {
   setCompressionRatio(compressionRatio: number): void {
     if (!(compressionRatio > 1)) throw new RangeError('SliderCrank: compression ratio must be > 1');
     const vc = this.displacedVolume / (compressionRatio - 1);
-    const h = (vc - this.creviceVolume) / this.boreArea;
-    if (!(h > 0)) throw new RangeError('SliderCrank: crevice volume ≥ clearance volume at this compression ratio');
+    const h = (vc - this.creviceVolume - this.fixedChamberVolume) / this.boreArea;
+    if (!(h > 0)) throw new RangeError('SliderCrank: crevice (+ fixed chamber) volume ≥ clearance volume at this compression ratio');
     this.cr = compressionRatio;
     this.vc = vc;
     this.hTdc = h;
@@ -192,9 +207,9 @@ export class SliderCrank {
     return compressionRatio > 1 ? this.displacedVolume / (compressionRatio - 1) : Number.NaN;
   }
 
-  /** Disc clearance height at TDC for compression ratio CR (> 1), m (see volume convention; NaN if CR ≤ 1). */
+  /** Clearance height at TDC for compression ratio CR (> 1), m (see volume convention; NaN if CR ≤ 1). */
   clearanceHeightTDCForCR(compressionRatio: number): number {
-    return (this.clearanceVolumeForCR(compressionRatio) - this.creviceVolume) / this.boreArea;
+    return (this.clearanceVolumeForCR(compressionRatio) - this.creviceVolume - this.fixedChamberVolume) / this.boreArea;
   }
 
   /** Wrist-pin distance from the crank axis along the cylinder axis at crank angle θ (rad), m. */
@@ -209,7 +224,7 @@ export class SliderCrank {
     return this.pinHeightTDC - this.pinHeight(theta);
   }
 
-  /** Instantaneous head-to-crown disc height h(θ) = h_TDC + x(θ), m. */
+  /** Instantaneous clearance height (bore-column depth) h(θ) = h_TDC + x(θ), m. */
   clearanceHeight(theta: number): number {
     return this.hTdc + this.pistonDisplacement(theta);
   }
@@ -306,12 +321,12 @@ export class SliderCrank {
     return (2 * this.pistonTravel * rpm) / 60;
   }
 
-  /** Exposed liner (cylinder-wall) area between head face and crown, πB·h(θ), m². */
+  /** Exposed liner (cylinder-wall) area between head face and crown, πB·h(θ), m² (flat disc only). */
   linerArea(theta: number): number {
     return Math.PI * this.bore * this.clearanceHeight(theta);
   }
 
-  /** Total disc-chamber surface area head + crown + liner (Heywood 1988 eq. 2.8), m². */
+  /** Total disc-chamber surface area head + crown + liner (Heywood 1988 eq. 2.8), m² (flat disc only; see combustion/chamber.ts surfaceAreas). */
   chamberSurfaceArea(theta: number): number {
     return this.headArea + this.pistonCrownArea + this.linerArea(theta);
   }

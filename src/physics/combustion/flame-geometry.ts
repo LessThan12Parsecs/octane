@@ -54,6 +54,17 @@
  *    ≤ 3e-4 in the early flame for the CFR_F1 spec geometry (review, 2026-09).
  *  • Near-axis spark (d ≪ R): all lens formulas are written in P1 = ρ² − c₁² (no ρ² − R² cancellation),
  *    so d down to the central threshold (1e-9 R) is accurate and the table build stays fast.
+ *
+ * ── Spark outside the bore planform (d > R; opt-in `allowSparkOutsideBore`) ──────────────────────
+ * A side-valve ('l-head') chamber has its plug over the valve pocket beside the bore; this class then
+ * describes the BORE COLUMN part of that chamber (combustion/chamber.ts adds the pocket). With
+ * e₁ = d − R = |c₁| the lens range is ρ ∈ [e₁, c₂]: L = 0, Φ = Ψ = 0 for ρ ≤ e₁ (the slice circle has not
+ * reached the bore), the lens formulas above hold unchanged with the SIGNED c₁ = R − d (they only use
+ * c₁ and c₁² = e₁²), and nothing is "inside" (no πρ² regime). The reference becomes Ref = πR²·w with the
+ * same w (w(e₁) = 0, w(c₂) = 1, w′(c₂) = 0), so Dev = w·A_out − (1 − w)·L again vanishes at both ends of
+ * the lens range; the table maps r ∈ [e₁, c₂] (Δ₁ = c₂ − e₁ = 2R) exactly as [c₁, c₂] above, and the
+ * first-contact band uses e₁ as its geometric scale ({@link defaultInnerCellsOutside}). For d < R every
+ * expression evaluates exactly as before (the CFR path is bit-identical).
  */
 
 const PI = Math.PI;
@@ -83,6 +94,18 @@ export const newFlameGeometryResult = (): FlameGeometryResult => ({
 });
 
 export interface FlameGeometryOptions {
+  /**
+   * Accept a spark centre OUTSIDE the bore planform (horizontal offset d > R, e.g. a side-valve chamber's
+   * plug over the valve pocket): the ball then meets the bore column only for r > d − R (see the module
+   * comment). Default false: such a centre throws, as does a centre ON the bore circle (|d − R| < 1e-9 R).
+   */
+  allowSparkOutsideBore?: boolean;
+  /**
+   * Reuse the immutable fast tables of an identical FlameGeometry (same bore, centre and table options)
+   * instead of building them again — e.g. the identical cylinders of a multi-cylinder engine, each with
+   * its own scratch state ({@link FlameGeometry.clone}). Throws if the geometry differs.
+   */
+  shareTablesWith?: FlameGeometry;
   /**
    * Largest clearance height h (m) for which the fast table must be valid (it covers flame radii up to
    * the farthest chamber corner at this height). Larger h still works via the slow exact path.
@@ -124,6 +147,19 @@ export function defaultInnerCells(R: number, d: number): number {
   return n < 64 ? 64 : n > 512 ? 512 : n;
 }
 
+/**
+ * Default number of inner-table cells for a spark OUTSIDE the bore planform (d > R): the table spans
+ * r ∈ [e₁, c₂] (e₁ = d − R, width 2R) and just after first contact the stored integrals vary on the scale
+ * e₁ (two circles touching externally), so the same rule as {@link defaultInnerCells} with d → R, c₁ → e₁:
+ * n = 16·√(2R/e₁), even, 64…512.
+ */
+export function defaultInnerCellsOutside(R: number, d: number): number {
+  const e1 = d - R;
+  if (!(e1 > 0)) return 512;
+  const n = 2 * Math.ceil(8 * Math.sqrt((2 * R) / e1));
+  return n < 64 ? 64 : n > 512 ? 512 : n;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Circle–circle lens (bore disc radius R centred on the axis; slice disc radius ρ at offset d)
 // ---------------------------------------------------------------------------------------------
@@ -140,7 +176,7 @@ function seg(x: number): number {
 
 /**
  * Area (m²) of the intersection of a disc of radius `rho` with a disc of radius `R` whose centres are
- * `d` apart (circle–circle lens). Exact, closed form.
+ * `d` apart (circle–circle lens). Exact, closed form; any d ≥ 0 (d > R: 0 until ρ > d − R).
  */
 export function lensArea(rho: number, R: number, d: number): number {
   if (rho <= 0) return 0;
@@ -148,6 +184,7 @@ export function lensArea(rho: number, R: number, d: number): number {
   const c2 = R + d;
   if (rho <= c1) return PI * rho * rho;
   if (rho >= c2) return PI * R * R;
+  if (rho <= -c1) return 0; // d > R: the discs do not meet yet (never true for d < R)
   // common-chord half-length ℓ = √((ρ² − c1²)(c2² − ρ²)) / (2d); half-angles α (at the slice centre),
   // β (at the axis): ρ cos α = (ρ² − c1c2)/(2d), R cos β = (d² + R² − ρ²)/(2d); L = ρ²α + R²β − dℓ.
   // With P1 = ρ² − c1² these are P1/(2d) − c1 and R − P1/(2d) (no R² − ρ² cancellation for small d).
@@ -165,6 +202,7 @@ export function arcInsideBore(rho: number, R: number, d: number): number {
   const c2 = R + d;
   if (rho <= c1) return TWO_PI;
   if (rho >= c2) return 0;
+  if (rho <= -c1) return 0; // d > R: the circle lies outside the bore disc
   const P1 = (rho - c1) * (rho + c1);
   const l = Math.sqrt(P1 * (c2 - rho) * (c2 + rho)) / (2 * d);
   return 2 * Math.atan2(l, P1 / (2 * d) - c1);
@@ -176,6 +214,7 @@ export function arcOfBoreInside(rho: number, R: number, d: number): number {
   const c2 = R + d;
   if (rho <= c1) return 0;
   if (rho >= c2) return TWO_PI;
+  if (rho <= -c1) return 0; // d > R: the disc has not reached the bore circle
   const P1 = (rho - c1) * (rho + c1);
   const l = Math.sqrt(P1 * (c2 - rho) * (c2 + rho)) / (2 * d);
   return 2 * Math.atan2(l, R - P1 / (2 * d));
@@ -299,6 +338,8 @@ const BAND_TOL = 1e-10;
 const CORNER_BAND = 0.01;
 /** Below this horizontal offset (relative to R) the spark is treated as central (d = 0, closed form). */
 const D_CENTRAL = 1e-9;
+/** A spark centre within this distance (relative to R) of the bore circle is rejected (degenerate lens range). */
+const D_ON_BORE = 1e-9;
 
 /** Maximum bisection depth of the allocation-free band quadrature. */
 const STACK_DEPTH = 48;
@@ -326,9 +367,16 @@ export class FlameGeometry {
   /** Largest flame radius covered by the fast table, m. */
   readonly maxTableRadius: number;
 
+  /** True when the spark centre lies outside the bore planform (d > R; opt-in). */
+  readonly outside: boolean;
+
+  /** Signed R − d (the lens algebra uses c1 and c1² = (d − R)² for either sign). */
   private readonly c1: number;
   private readonly c2: number;
+  /** Lower end of the lens range |R − d| (= c1 bit for bit when d < R; e₁ = d − R when outside). */
+  private readonly lo: number;
   private readonly central: boolean;
+  private readonly options: FlameGeometryOptions;
   /** c2² − c1² = 4Rd (blend normalisation), m². */
   private readonly dc2: number;
   /** Half-width of the band around r = R + d evaluated by exact quadrature, m. */
@@ -362,7 +410,8 @@ export class FlameGeometry {
   /**
    * @param bore cylinder bore, m
    * @param sparkCenter flame (spark-gap) centre in the cylinder frame, m; requires y ≤ 0 and a horizontal
-   *        offset d < bore/2 (accuracy of the fast table degrades only as d → bore/2)
+   *        offset d < bore/2 (accuracy of the fast table degrades only as d → bore/2), or d > bore/2 with
+   *        `allowSparkOutsideBore`
    * @param options table range/resolution
    */
   constructor(bore: number, sparkCenter: readonly [number, number, number], options: FlameGeometryOptions = {}) {
@@ -371,7 +420,14 @@ export class FlameGeometry {
     const [cx, cy, cz] = sparkCenter;
     if (cy > 0) throw new Error('FlameGeometry: spark centre must satisfy y ≤ 0 (below the head plane)');
     let d = Math.hypot(cx, cz);
-    if (!(d < R)) throw new Error('FlameGeometry: spark centre must lie inside the bore (d < R)');
+    let outside = false;
+    if (!(d < R)) {
+      if (!options.allowSparkOutsideBore) throw new Error('FlameGeometry: spark centre must lie inside the bore (d < R)');
+      if (!(d > R * (1 + D_ON_BORE))) throw new Error('FlameGeometry: spark centre on the bore circle (|d − R| < 1e-9 R)');
+      outside = true;
+    }
+    this.outside = outside;
+    this.options = options;
     this.central = d < D_CENTRAL * R;
     if (this.central) d = 0;
     this.bore = bore;
@@ -381,11 +437,12 @@ export class FlameGeometry {
     this.headDistance = -cy;
     this.c1 = R - d;
     this.c2 = R + d;
+    this.lo = outside ? d - R : R - d;
     this.maxHeight = options.maxHeight ?? 2.5 * bore;
     const b = this.headDistance;
     const vmax = Math.max(b, Math.abs(this.maxHeight - b));
     this.maxTableRadius = Math.sqrt(this.c2 * this.c2 + vmax * vmax) * (1 + 1e-9);
-    this.n1 = options.cellsInner ?? defaultInnerCells(R, d);
+    this.n1 = options.cellsInner ?? (outside ? defaultInnerCellsOutside(R, d) : defaultInnerCells(R, d));
     this.n2 = options.cellsOuter ?? 64;
     this.nw = options.cellsTau ?? 64;
     if (this.n1 % 2 !== 0 || this.nw % 2 !== 0 || this.n1 < 2 || this.n2 < 1 || this.nw < 2) {
@@ -393,11 +450,28 @@ export class FlameGeometry {
     }
     this.dc2 = 4 * R * d; // = c2² − c1² exactly (no cancellation for small d)
     this.cornerBand = options.cornerBand ?? CORNER_BAND * R;
-    this.delta1 = 2 * d; // = c2 − c1 exactly
-    // first two p-cells of the inner table: r − c1 < 2·D1·(2/n1)²
-    this.touchBand = this.c1 + 2 * this.delta1 * (2 / this.n1) * (2 / this.n1);
+    this.delta1 = outside ? 2 * R : 2 * d; // = c2 − lo exactly
+    // first two p-cells of the inner table: r − lo < 2·D1·(2/n1)²
+    this.touchBand = this.lo + 2 * this.delta1 * (2 / this.n1) * (2 / this.n1);
     this.delta2 = Math.max(this.maxTableRadius - this.c2, 1e-9 * R);
-    if (this.central) {
+    const src = options.shareTablesWith;
+    if (src) {
+      if (
+        src.bore !== bore ||
+        src.center[0] !== cx ||
+        src.center[1] !== cy ||
+        src.center[2] !== cz ||
+        src.maxHeight !== this.maxHeight ||
+        src.n1 !== this.n1 ||
+        src.n2 !== this.n2 ||
+        src.nw !== this.nw ||
+        src.cornerBand !== this.cornerBand
+      ) {
+        throw new Error('FlameGeometry: shareTablesWith needs an identical geometry and table layout');
+      }
+      this.tab1 = src.tab1;
+      this.tab2 = src.tab2;
+    } else if (this.central) {
       this.tab1 = new Float64Array(0);
       this.tab2 = new Float64Array(0);
     } else {
@@ -406,6 +480,14 @@ export class FlameGeometry {
       this.buildTable(1);
       this.buildTable(2);
     }
+  }
+
+  /**
+   * A FlameGeometry with the same geometry that SHARES this instance's immutable tables (no rebuild) and has
+   * its own scratch / warm-start state — one per cylinder of a multi-cylinder engine.
+   */
+  clone(): FlameGeometry {
+    return new FlameGeometry(this.bore, this.center, { ...this.options, shareTablesWith: this });
   }
 
   /** Distance from the flame centre to the farthest chamber corner at clearance height h, m. */
@@ -439,6 +521,18 @@ export class FlameGeometry {
       out.wettedHead = r > b ? lensArea(Math.sqrt((r - b) * (r + b)), R, this.offset) : 0;
       out.wettedPiston = r > ta ? lensArea(Math.sqrt((r - ta) * (r + ta)), R, this.offset) : 0;
     }
+    return out;
+  }
+
+  /**
+   * Fast volume, front area and liner area only (no planar lenses; wettedHead / wettedPiston of `out` are
+   * left untouched). Same numbers as {@link evaluate}. Allocation-free; returns `out`.
+   */
+  evaluateCore(r: number, h: number, out: FlameGeometryResult): FlameGeometryResult {
+    this.core(r, h);
+    out.volume = this.cV;
+    out.frontArea = this.cA;
+    out.wettedLiner = this.cW;
     return out;
   }
 
@@ -502,12 +596,13 @@ export class FlameGeometry {
     const Vch = PI * R * R * h;
     const rMax = this.maxRadius(h);
     if (V >= Vch) return rMax;
-    // closed form while the ball is strictly inside the chamber
+    // closed form while the ball is strictly inside the chamber (never for a spark outside the bore,
+    // whose ball first meets the column at r = d − R)
     const b = this.headDistance;
-    const rIn = h > b ? Math.min(b, h - b, this.c1) : 0;
+    const rIn = this.outside ? 0 : h > b ? Math.min(b, h - b, this.c1) : 0;
     const rs = Math.cbrt((3 * V) / (4 * PI));
     if (rs <= rIn) return rs;
-    let lo = rIn;
+    let lo = this.outside ? this.lo : rIn;
     let hi = rMax;
     let r = rGuess !== undefined && rGuess > lo && rGuess < hi ? rGuess : this.lastRadius;
     if (!(r > lo && r < hi)) r = Math.min(Math.max(rs, lo), 0.5 * (lo + hi));
@@ -607,6 +702,7 @@ export class FlameGeometry {
     this.sA = 0;
     this.sW = 0;
     if (!(tau > 0) || !(r > 0)) return;
+    if (this.outside && r <= this.lo) return; // the ball has not reached the bore column
     const R = this.radius;
     const c1 = this.c1;
     const c2 = this.c2;
@@ -617,8 +713,8 @@ export class FlameGeometry {
     const aEnd = m < t2 ? m : t2;
     this.sV += PI * R * R * aEnd;
     this.sW += TWO_PI * R * aEnd;
-    // ρ ≤ c1 (t ≥ t1): slice inside the bore — L = πρ², Φ = 2π, Ψ = 0
-    if (m > t1) {
+    // ρ ≤ c1 (t ≥ t1): slice inside the bore — L = πρ², Φ = 2π, Ψ = 0 (outside spark: ρ ≤ e1, L = 0)
+    if (m > t1 && !this.outside) {
       this.sV += PI * (r * r * (m - t1) - (m * m * m - t1 * t1 * t1) / 3);
       this.sA += TWO_PI * r * (m - t1);
     }
@@ -730,6 +826,13 @@ export class FlameGeometry {
       this.sW = 0;
       return;
     }
+    if (this.outside && r <= this.lo) {
+      // spark outside the bore: no slice has reached the bore column yet
+      this.sV = 0;
+      this.sA = 0;
+      this.sW = 0;
+      return;
+    }
     if (this.central) {
       // d = 0: L = π min(ρ, R)², closed form
       const t1c = Math.sqrt((r - R) * (r + R));
@@ -753,7 +856,7 @@ export class FlameGeometry {
     const la = m < t2 ? m : t2;
     V += PI * R * R * la; // ρ ≥ c2: Ref = πR² (independent of r)
     const tb = m < t1 ? m : t1;
-    if (tb > t2) {
+    if (tb > t2 && !this.outside) {
       // Ref = πR² − (π/Δ²)(R² − ρ²)(c2² − ρ²)², a degree-6 polynomial in t: 4-point Gauss is exact
       const R2mr2 = R * R - r * r;
       const c2mr2 = (c2 - r) * (c2 + r);
@@ -771,8 +874,24 @@ export class FlameGeometry {
       const inv = PI / (this.dc2 * this.dc2);
       V += PI * R * R * (tb - t2) - inv * hc * sv;
       A += 2 * r * inv * hc * sa; // ∂/∂r of −(π/Δ²)(R² − ρ²)P2² = (2πr/Δ²) P2 (P2 + 2(R² − ρ²))
+    } else if (tb > t2) {
+      // outside spark: Ref = πR² w = πR² − (πR²/Δ²)(c2² − ρ²)², degree 4 in t: 4-point Gauss is exact
+      const c2mr2 = (c2 - r) * (c2 + r);
+      const hc = 0.5 * (tb - t2);
+      const mid = 0.5 * (tb + t2);
+      let sv = 0;
+      let sa = 0;
+      for (let k = 0; k < 4; k++) {
+        const t = mid + hc * GL4X[k];
+        const P2 = r > c2 ? (t - t2) * (t + t2) : t * t + c2mr2; // c2² − ρ²
+        sv += GL4W[k] * P2 * P2;
+        sa += GL4W[k] * P2;
+      }
+      const inv = (PI * R * R) / (this.dc2 * this.dc2);
+      V += PI * R * R * (tb - t2) - inv * hc * sv;
+      A += 4 * r * inv * hc * sa; // ∂/∂r of −(πR²/Δ²)P2² = (4πR² r/Δ²) P2
     }
-    if (m > t1) {
+    if (m > t1 && !this.outside) {
       // ρ ≤ c1: Ref = πρ² = π(r² − t²)
       V += PI * (r * r * (m - t1) - (m * m * m - t1 * t1 * t1) / 3);
       A += TWO_PI * r * (m - t1);
@@ -800,15 +919,17 @@ export class FlameGeometry {
     let t1: number;
     let t2 = 0;
     if (r < c2) {
+      // (lo = c1 for a spark inside the bore, e1 = d − R outside)
+      const lo = this.lo;
       tab = this.tab1;
       n = this.n1;
-      p = mapBothInv((r - c1) / this.delta1);
+      p = mapBothInv((r - lo) / this.delta1);
       if (p < EPS_LOOK) p = EPS_LOOK;
       else if (p > 1 - EPS_LOOK) p = 1 - EPS_LOOK;
       const dr = this.delta1 * mapBoth(p);
-      re = c1 + dr;
+      re = lo + dr;
       rp = this.delta1 * mapBothD(p);
-      t1 = Math.sqrt(dr * (re + c1));
+      t1 = Math.sqrt(dr * (re + lo));
     } else {
       tab = this.tab2;
       n = this.n2;
@@ -921,10 +1042,19 @@ export class FlameGeometry {
     const ang = this.ang;
     const l = this.lensAngles(P1, P2, ang);
     const rho2 = c1 * c1 + P1;
-    const E = rho2 * seg(ang[1]) - R * R * seg(ang[2]); // πρ² − L
     const Aout = R * R * seg(ang[3]) - rho2 * seg(ang[0]); // πR² − L
     const s = P2 / this.dc2;
     const omw = s * s; // 1 − w
+    if (this.outside) {
+      // Dev = πR² w − L = w·A_out − (1 − w)·L;  Dev′/ρ = πR² w′/ρ − Φ = 4πR² P2/Δ² − Φ
+      const L = rho2 * seg(ang[0]) + R * R * seg(ang[2]);
+      o[0] = (1 - omw) * Aout - omw * L;
+      o[1] = (4 * PI * R * R * P2) / (this.dc2 * this.dc2) - 2 * ang[0];
+      o[2] = 2 * ang[2];
+      o[3] = l;
+      return;
+    }
+    const E = rho2 * seg(ang[1]) - R * R * seg(ang[2]); // πρ² − L
     o[0] = (1 - omw) * Aout + omw * E;
     // Dev′/ρ = w′π(R² − ρ²)/ρ + (1 − w)2π − Φ,  w′ = 4ρP2/Δ²
     // R² − ρ² = d(2R − d) − P1 (no R² − ρ² cancellation for small d)
@@ -945,6 +1075,7 @@ export class FlameGeometry {
     const c1 = this.c1;
     const c2 = this.c2;
     if (r <= c1) return;
+    if (this.outside && r <= this.lo) return;
     const t1 = Math.sqrt((r - c1) * (r + c1));
     const t2 = r > c2 ? Math.sqrt((r - c2) * (r + c2)) : 0;
     const hiT = Math.min(tTo, t1);
@@ -1007,13 +1138,14 @@ export class FlameGeometry {
       let t2 = 0;
       let rpT2r = 0; // (dr/dp)·(∂t2/∂r), regularised
       if (seg === 1) {
-        if (i === 0) continue; // r = c1: F ≡ Y ≡ 0 with all derivatives (F ∝ (r−c1)², Y ∝ (r−c1)); zero-filled
+        if (i === 0) continue; // r = lo: F ≡ Y ≡ 0 with all derivatives (F ∝ (r−lo)², Y ∝ (r−lo)); zero-filled
+        const lo = this.lo; // = c1 (spark inside the bore), e1 = d − R (outside)
         const sig = mapBoth(p);
-        r = c1 + D1 * sig;
+        r = lo + D1 * sig;
         rp = D1 * mapBothD(p);
-        t1 = Math.sqrt(D1 * sig * (r + c1));
+        t1 = Math.sqrt(D1 * sig * (r + lo));
         // for p ≤ ½: σ′/√σ = 4p/(√2 p) = 2√2 exactly
-        rpT1r = p <= 0.5 ? (r * D1 * 2 * Math.SQRT2) / Math.sqrt(D1 * (r + c1)) : (rp * r) / t1;
+        rpT1r = p <= 0.5 ? (r * D1 * 2 * Math.SQRT2) / Math.sqrt(D1 * (r + lo)) : (rp * r) / t1;
       } else {
         const dr = D2 * p * p;
         r = c2 + dr;

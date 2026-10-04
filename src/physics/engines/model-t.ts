@@ -132,7 +132,7 @@ const POCKET = { xMin: -0.0915, xMax: -0.03, zMin: -0.0475, zMax: 0.0475, corner
  * Plan area of POCKET minus the bore disc, m² — numerical (4000² grid) integration of the outline above;
  * the chamber model's exact area must agree (engines/model-t.test.ts).
  */
-export const MODEL_T_POCKET_PLAN_AREA = 46.016e-4;
+export const MODEL_T_POCKET_PLAN_AREA = 46.03020157589403e-4;
 /** Pocket height above the deck that closes the clearance volume (Vc = A_p·H_TDC + pocket + crevice), m. */
 const POCKET_HEIGHT = (VC - CREVICE - A_PISTON * H_TDC) / MODEL_T_POCKET_PLAN_AREA;
 
