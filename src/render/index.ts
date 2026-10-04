@@ -10,6 +10,7 @@ export {
   temperatureLegend,
   VIS_TEMPERATURE_RANGE,
   type CombustionMode,
+  type CombustionVisualsOptions,
   type TemperatureLegendElement,
 } from './combustion/index';
 export {

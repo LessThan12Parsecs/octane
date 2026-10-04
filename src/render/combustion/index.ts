@@ -34,6 +34,12 @@ export { createTemperatureLegendElement, type TemperatureLegendElement } from '.
 export { VISUAL_GAIN, VIS_TEMPERATURE_RANGE } from './constants';
 export type { CombustionMode } from './state';
 
+/** Per-instance options of CombustionVisuals. */
+export interface CombustionVisualsOptions {
+  cylinder?: number;
+  tracers?: boolean;
+}
+
 export class CombustionVisuals {
   readonly root: THREE.Group;
   /** Derived per-frame state (read-only for callers; handy for HUDs/debugging). */
@@ -47,7 +53,14 @@ export class CombustionVisuals {
   private mode: CombustionMode = 'physical';
   private lightEnabled = true;
 
-  constructor(spec: EngineSpec) {
+  /**
+   * @param spec engine spec
+   * @param opts.cylinder 0-based cylinder this instance shows (multi-cylinder engines read
+   *   `s.cylinders[cylinder]`; default 0 = the top-level fields)
+   * @param opts.tracers  run the flow tracers (default true; multi-cylinder apps enable them on one
+   *   featured cylinder only)
+   */
+  constructor(spec: EngineSpec, readonly opts: CombustionVisualsOptions = {}) {
     this.root = new THREE.Group();
     this.root.name = 'combustion-visuals';
     this.state = new CombustionVisualState(spec);
