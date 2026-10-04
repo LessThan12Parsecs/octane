@@ -368,6 +368,21 @@ export class SparkKernel {
     this.blockedSince = NaN;
   }
 
+  /**
+   * Forget a QUENCHED kernel so that the next impulsive deposit creates a new one, keeping the
+   * cumulative energy counters (energyDeposited, energyElectrodeLoss) of the ignition event. Used by
+   * spark trains (trembler coil): a later breakdown of the same timer contact re-seeds the kernel.
+   * No-op unless the kernel is quenched.
+   */
+  reseed(): void {
+    if (this.stage !== 'quenched') return;
+    const e = this.energyDeposited;
+    const l = this.energyElectrodeLoss;
+    this.reset();
+    this.energyDeposited = e;
+    this.energyElectrodeLoss = l;
+  }
+
   /** Update the kernel-gas properties that depend only on the gas state (once per step). */
   private prepare(gas: KernelGasState): void {
     const o = this.opts;

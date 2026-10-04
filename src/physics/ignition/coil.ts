@@ -95,10 +95,14 @@ export const DEFAULT_COIL_OPTIONS: Readonly<CoilOptions> = Object.freeze({
 /**
  * Event sub-steps that advance less than this (s) count as "stalled" for the zero-length
  * event-loop guard (1 ps ≪ every circuit time scale; breakdown itself is instantaneous here).
+ * Shared with the trembler coil (trembler-coil.ts).
  */
-const MIN_EVENT_PROGRESS = 1e-12;
-/** Residual |V₂| amplitude below which the open, ringing circuit is snapped to rest, V (see settleIfQuiescent). */
-const QUIESCENT_V2 = 25;
+export const MIN_EVENT_PROGRESS = 1e-12;
+/**
+ * Residual |V₂| amplitude below which the open, ringing circuit is snapped to rest, V (see
+ * settleIfQuiescent). Shared with the trembler coil (trembler-coil.ts).
+ */
+export const QUIESCENT_V2 = 25;
 
 // primary / secondary modes (numeric for speed)
 const P_CLOSED = 0;
@@ -108,7 +112,7 @@ const S_OPEN = 0;
 const S_COND = 1;
 
 /** Solve the dense n×n system a·x = b in place (partial pivoting). a row-major n*n, result in b. */
-function solveDense(a: Float64Array, b: Float64Array, n: number): void {
+export function solveDense(a: Float64Array, b: Float64Array, n: number): void {
   for (let c = 0; c < n; c++) {
     let piv = c;
     let best = Math.abs(a[c * n + c]);
