@@ -15,6 +15,13 @@ Method (deliberately different from src/physics/mechanics/dynamics.ts):
 Conventions identical to tools/reference/mechanics_kinematics.py
 (x_w = +pinOffset, θ = 0 at the exact TDC found numerically).
 
+Multi-cylinder cases ("multiCases"; MultiCylinderCrankTrain): N identical mechanisms on one rigid
+crank, cylinder i at θ − radians(firingOffsetDeg[i]) (the raw 720° offset: the 2π-periodicity that
+the TypeScript reduces to a throw phase is NOT assumed here). Totals J = Σ J_i, dJ/dθ by finite
+differences of the TOTAL J, gravity −dU_total/dθ, per-cylinder gas torque (p_i − p_cc)·A·dx/dθ with
+dx/dθ = −dy_p/dθ from finite differences of the numerical wrist-pin height, and the free
+acceleration α = (Σ T_gas + T_grav − ½ dJ/dθ ω² + T_ext)/(J_rot + J_load + J).
+
 Writes test/fixtures/mechanics_dynamics.json.
 """
 from __future__ import annotations
@@ -118,6 +125,78 @@ def build(case: dict) -> dict:
     return dict(name=case["name"], geometry=case["geometry"], masses=case["masses"], gravity=G, states=case["states"], rows=rows)
 
 
+MULTI_CASES = [
+    # Ford Model T-like inline four, firing order 1-2-4-3 (offsets 0/180/540/360 -> throws 0/180/180/0),
+    # masses as engines/model-t.ts; one state with a vehicle-like load inertia.
+    dict(
+        name="inline4_1243_modelt_like",
+        geometry=dict(bore=3.75 * IN, stroke=4.0 * IN, conRodLength=7.0 * IN, pinOffset=0.0, creviceVolume=2.5e-6),
+        masses=dict(piston=1.04, conRod=0.6, conRodCgFromBigEnd=7.0 * IN / 3, conRodInertiaCg=0.0042, rotatingInertia=0.65),
+        firingOffsetDeg=[0.0, 180.0, 540.0, 360.0],
+        pCrankcase=1.0e5,
+        states=[
+            dict(omega=2 * math.pi * 1000 / 60, alpha=0.0, externalTorque=-20.0, loadInertia=0.0,
+                 pressures=[25.0e5, 1.1e5, 0.6e5, 4.0e5]),
+            dict(omega=2 * math.pi * 1800 / 60, alpha=-35.0, externalTorque=-60.0, loadInertia=9.8,
+                 pressures=[8.0e5, 0.9e5, 1.3e5, 12.0e5]),
+        ],
+    ),
+    # Generic three-cylinder (offsets 0/240/480 -> throws 0/240/120) with a pin offset and a rod that is
+    # not dynamically equivalent to two masses; reversed rotation in the second state.
+    dict(
+        name="three_cyl_offset_pin",
+        geometry=dict(bore=0.080, stroke=0.090, conRodLength=0.150, pinOffset=0.004, creviceVolume=0.5e-6),
+        masses=dict(piston=0.42, conRod=0.5, conRodCgFromBigEnd=0.045, conRodInertiaCg=0.0016, rotatingInertia=0.12),
+        firingOffsetDeg=[0.0, 240.0, 480.0],
+        pCrankcase=0.98e5,
+        states=[
+            dict(omega=2 * math.pi * 3000 / 60, alpha=400.0, externalTorque=-8.0, loadInertia=0.3,
+                 pressures=[40.0e5, 2.0e5, 0.5e5]),
+            dict(omega=-2 * math.pi * 1200 / 60, alpha=-150.0, externalTorque=5.0, loadInertia=0.0,
+                 pressures=[1.2e5, 15.0e5, 0.8e5]),
+        ],
+    ),
+]
+
+
+def build_multi(case: dict) -> dict:
+    mech = Mechanism(case["geometry"], case["masses"])
+    g = case["geometry"]
+    area = math.pi * g["bore"] ** 2 / 4
+    offs = [math.radians(d) for d in case["firingOffsetDeg"]]
+    m = case["masses"]
+
+    def j_total(th):
+        return sum(mech.J(th - o) for o in offs)
+
+    def u_total(th):
+        return sum(mech.U(th - o) for o in offs)
+
+    def dxdtheta(th):
+        yp = lambda p: mech.positions(p)[1]
+        return -fd1(yp, th + mech.phi_tdc, 1e-3)
+
+    rows = []
+    for tdeg in THETA_DEG:
+        th = math.radians(tdeg)
+        J = j_total(th)
+        dJ = fd1(j_total, th, 2e-3)
+        Tg = -fd1(u_total, th, 1e-3)
+        x1 = [dxdtheta(th - o) for o in offs]
+        row = dict(thetaDeg=tdeg, J=J, dJ=dJ, gravityTorque=Tg, dxdTheta=x1, gasTorque=[], inertiaTorque=[], alpha=[])
+        for st in case["states"]:
+            gas = [(p - case["pCrankcase"]) * area * x for p, x in zip(st["pressures"], x1)]
+            row["gasTorque"].append(gas)
+            row["inertiaTorque"].append(-(J * st["alpha"] + 0.5 * dJ * st["omega"] ** 2))
+            num = sum(gas) + Tg - 0.5 * dJ * st["omega"] ** 2 + st["externalTorque"]
+            row["alpha"].append(num / (m["rotatingInertia"] + st["loadInertia"] + J))
+        rows.append(row)
+    return dict(
+        name=case["name"], geometry=g, masses=m, gravity=G, firingOffsetDeg=case["firingOffsetDeg"],
+        pCrankcase=case["pCrankcase"], states=case["states"], rows=rows,
+    )
+
+
 def round_floats(o):
     if isinstance(o, float):
         return float(f"{o:.15g}")
@@ -137,6 +216,13 @@ def main() -> None:
         ),
         generator="tools/reference/mechanics_dynamics.py",
         cases=[build(c) for c in CASES],
+        multiDescription=(
+            "Multi-cylinder crank train on one rigid crank: cylinder i at theta - firingOffsetDeg[i] (raw 720-deg "
+            "offsets). Totals J, dJ/dtheta, gravity torque; per-cylinder dx/dtheta and gas torque "
+            "(p_i - pCrankcase)*A*dx/dtheta per state; total inertia torque -(J*alpha + 0.5*dJ*omega^2); free "
+            "acceleration (sum gas + gravity - 0.5*dJ*omega^2 + externalTorque)/(rotatingInertia + loadInertia + J)."
+        ),
+        multiCases=[build_multi(c) for c in MULTI_CASES],
     )
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(round_floats(out), separators=(",", ":")) + "\n")
