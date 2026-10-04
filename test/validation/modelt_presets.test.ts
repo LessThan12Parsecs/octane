@@ -4,8 +4,9 @@
  * dyno point, cruise on the battery) runs in EngineSimulator without exceptions, stalls, misfires or
  * non-finite output; the engine keeps running through operating-point changes mid-run (gear, grade, spark
  * lever, hand throttle, MAG/BAT, fuel, speed mode) and a reset; in free speed with the vehicle load the
- * engine summary closes the crank energy balance (brake torque = cycle-mean load torque, with the car's
- * reflected inertia in ΔE_kin); plus the CPU cost per engine cycle of EngineSimulator at 0.5° snapshots
+ * engine summary closes the crank energy balance (brake torque — the engine's output, ΔE_kin of the crank and
+ * mechanisms only — = cycle-mean load torque + the car's kinetic-energy change / 4π, loadInertiaTorque); plus
+ * the CPU cost per engine cycle of EngineSimulator at 0.5° snapshots
  * (logged). The model is uncalibrated: no Ford numbers are asserted here. The ≥ 10-cycle runs of every
  * preset are part of the integration report (scratch runs); here each preset runs one engine cycle after
  * a one-cycle warm-up. Runtime ≈ 60–120 s (vitest).
@@ -120,14 +121,17 @@ describe('Model T: operating-point changes mid-run and reset', () => {
 });
 
 describe('Model T free speed with the vehicle load', () => {
-  it('the engine summary closes the crank energy balance: brake torque = cycle-mean load torque', () => {
+  it('the engine summary closes the crank energy balance: brake torque = cycle-mean load torque + the car\'s ΔE_kin/4π', () => {
     const m = new CycleModel(MODEL_T, MODEL_T_CRUISE, { warmupCycles: 1 });
     const es = m.runCycles(2).filter((s) => s.engine).map((s) => s.engine!);
     expect(es.length).toBe(2);
     for (const e of es) {
-      // brake = indicated − friction − ΔE_kin/4π (crank + mechanisms + the car reflected through high gear);
-      // residual: the friction mean at the cycle-mean speed of a changing speed
-      expect(Math.abs(e.brakeTorque - e.loadTorque)).toBeLessThan(5e-3 * e.frictionTorque);
+      // brake = indicated − friction − ΔE_kin/4π with ΔE_kin of the ENGINE (crank + flywheel + mechanisms): its
+      // output goes into the road load and into the car's kinetic energy (reflected through high gear,
+      // loadInertiaTorque); residual: the friction mean at the cycle-mean speed of a changing speed. (Round 1 put
+      // the car's inertia into ΔE_kin and asserted brake = load: brake torque was the road load, not the engine's.)
+      expect(Math.abs(e.brakeTorque - (e.loadTorque + e.loadInertiaTorque!))).toBeLessThan(5e-3 * e.frictionTorque);
+      expect(e.clutchLoss).toBe(0);
       expect(e.vehicleSpeed! / MPS_PER_MPH).toBeGreaterThan(5);
       expect(e.vehicleSpeed! / MPS_PER_MPH).toBeLessThan(60);
     }

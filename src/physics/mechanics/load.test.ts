@@ -155,9 +155,46 @@ describe('LoadModel: vehicle road load through the gearing', () => {
     }
   });
 
+  it('declutched (neutral): the car coasts on its road load — level road against the analytic solution, grade alone, wheel inertia', () => {
+    // level road, v ≫ ε (sgn_ε ≈ 1): dv/dt = −(a + b v²), a = g C_rr, b = ½ρC_dA/m →
+    // v(t) = √(a/b)·tan(atan(v₀√(b/a)) − √(ab)·t)
+    const n = new LoadModel(V, { airDensity: 1.2 }).configure(op({ kind: 'vehicle', gear: 'neutral', grade: 0 }));
+    expect(n.torque(100)).toBe(0);
+    expect(n.inertia()).toBe(0);
+    expect(n.roadLoadForce(20)).toBe(0); // (no road load on the crank)
+    expect(n.coastMass).toBe(1000);
+    const a = G_STANDARD * 0.015;
+    const b = (0.5 * 1.2 * 2) / 1000;
+    const v0 = 25;
+    let v = v0;
+    const h = 1e-3;
+    for (let i = 0; i < 2000; i++) v = n.coastSpeedAfter(v, h); // 2 s in the cycle model's step sizes
+    const exact = Math.sqrt(a / b) * Math.tan(Math.atan(v0 * Math.sqrt(b / a)) - Math.sqrt(a * b) * 2);
+    expect(Math.abs(v - exact) / exact).toBeLessThan(1e-6); // (sgn_ε: 1 − ε²/2v² ≈ 1 − 2e-6)
+    // one long call (sub-stepped) gives the same answer
+    expect(Math.abs(n.coastSpeedAfter(v0, 2) - exact) / exact).toBeLessThan(1e-6);
+    // a car at rest on a level road stays at rest; on a 10 % grade without rolling or drag it accelerates
+    // down the slope at g·sin(atan 0.1)
+    expect(n.coastSpeedAfter(0, 1)).toBe(0);
+    const slope = new LoadModel({ ...V, rollingResistance: 0, dragArea: 0 }).configure(op({ kind: 'vehicle', gear: 'neutral', grade: 0.1 }));
+    expect(slope.coastSpeedAfter(3, 0.5)).toBeCloseTo(3 - G_STANDARD * Math.sin(Math.atan(0.1)) * 0.5, 12);
+    // the wheels' rotary inertia adds J_w/r² to the coasting mass (and is the same mass the gear reflects)
+    const jw = new LoadModel(V, { wheelInertia: 4.9 }).configure(op({ kind: 'vehicle', gear: 'neutral', grade: 0 }));
+    expect(jw.coastMass).toBeCloseTo(1000 + 4.9 / 0.35 ** 2, 9);
+    const jwHigh = new LoadModel(V, { wheelInertia: 4.9 }).configure(op({ kind: 'vehicle', gear: 'high', grade: 0 }));
+    expect(jwHigh.inertia()).toBeCloseTo(jwHigh.coastMass * jwHigh.roadSpeedPerOmega ** 2, 12);
+    // loads without a coasting car leave the speed unchanged
+    expect(jwHigh.coastSpeedAfter(7, 1)).toBe(7);
+    expect(new LoadModel().configure(op(undefined, 5)).coastSpeedAfter(7, 1)).toBe(7);
+  });
+
   it('validation: vehicle load without a vehicle, unknown gear, invalid data', () => {
     expect(() => new LoadModel().configure(op({ kind: 'vehicle', gear: 'high', grade: 0 }))).toThrow(RangeError);
     expect(() => new LoadModel(V).configure(op({ kind: 'vehicle', gear: 'overdrive', grade: 0 }))).toThrow(RangeError);
+    // own gears only: Object.prototype names are unknown gears, not functions to divide by (code review)
+    for (const gear of ['toString', 'constructor', '__proto__', 'hasOwnProperty']) {
+      expect(() => new LoadModel(V).configure(op({ kind: 'vehicle', gear, grade: 0 }))).toThrow(/unknown gear/);
+    }
     expect(() => new LoadModel({ ...V, drivelineEfficiency: 0 }).configure(op({ kind: 'vehicle', gear: 'high', grade: 0 }))).toThrow(RangeError);
     expect(() => new LoadModel(V).configure(op({ kind: 'vehicle', gear: 'high', grade: Number.NaN }))).toThrow(RangeError);
     expect(() => new LoadModel(V, { rollingSmoothingSpeed: 0 })).toThrow(RangeError);

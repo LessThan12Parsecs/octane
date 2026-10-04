@@ -2785,9 +2785,10 @@ export class Cylinder {
    * Compression-ratio change at the cycle wrap (θ = −360, gas-exchange TDC). The CFR raises the
    * cylinder over seconds while running; here the clearance volume changes at once, so the cylinder
    * gas is compressed/expanded ISENTROPICALLY to the new volume and the work is booked in the ∫p dV
-   * ledger (between cycles: in neither summary). Round 1 kept U at the new volume (no work): p jumped
-   * 1.013 → 1.306 bar for CR 6.43 → 8 while the entropy DROPPED — a second-law violation (validation
-   * round 2). Newton on T: s(T, nRT/V₂) = s₁, (∂s/∂T)_v = c_v/T (molar, frozen composition).
+   * ledger (between cycles: in neither summary, the cylinder's or the engine's). Round 1 kept U at the
+   * new volume (no work): p jumped 1.013 → 1.306 bar for CR 6.43 → 8 while the entropy DROPPED — a
+   * second-law violation (validation round 2). Newton on T: s(T, nRT/V₂) = s₁, (∂s/∂T)_v = c_v/T (molar,
+   * frozen composition).
    */
   private changeCompressionRatio(cr: number): void {
     const y = this.e.y;
@@ -2817,6 +2818,10 @@ export class Cylinder {
     const U2 = n * mixUMolar(X, T);
     y[this.iCU] = U2;
     y[this.iW] -= U2 - U1; // ∫p dV of the isentropic change (−W_on_gas)
+    // ... and the same in the engine-summary baseline: a cylinder i ≥ 1 changes CR at its LOCAL wrap, inside an
+    // engine cycle, whose summary must not book it either (code review; cylinder 0's baseline is reset at the
+    // engine wrap right after its change anyway)
+    this.wEngineStart -= U2 - U1;
     this.cyl.volume = V2;
   }
 

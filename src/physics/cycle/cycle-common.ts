@@ -192,6 +192,12 @@ export const WIEBE_SEED = 1e-5;
 /** Lowest crank speed in 'free' mode, rev/min (numerical stall guard; the model needs ω > 0). */
 export const FREE_MODE_MIN_RPM = 60;
 export const FREE_MODE_MIN_OMEGA = (FREE_MODE_MIN_RPM * 2 * Math.PI) / 60;
+/**
+ * Relative time tolerance of CycleModel.stepUntil (numerical): a time target within
+ * TIME_TARGET_REL_TOL·max(1, |t_target|) of the model time counts as reached (no step). Anything that hands
+ * stepUntil a time target (EngineSimulator's dense sampling) must keep its candidates farther ahead than that.
+ */
+export const TIME_TARGET_REL_TOL = 1e-14;
 /** Initial cylinder / exhaust temperatures of a cold start, K — initial conditions only (the
  * warm-up cycles erase them; not physical constants). */
 export const INITIAL_CYLINDER_T = 900;

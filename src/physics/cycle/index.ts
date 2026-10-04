@@ -38,7 +38,9 @@
  *    frozen at EVO with elements conserved.
  *  - Mechanics: exact slider crank; fixed speed or free crank dynamics of the rigid multi-cylinder
  *    crank train with the whole-engine PNH friction and the load model of op.load (constant, brake,
- *    vehicle road load with the car's reflected inertia, neutral).
+ *    vehicle road load with the car's reflected inertia, neutral). The car has its own road speed (k ω in
+ *    gear, coasting on its road load in neutral); a gear change in free speed is an inelastic clutch
+ *    engagement conserving the angular momentum through the gear train (CycleModel.clutchLoss ledger).
  *  - Operator splits (first order in the step): spark energy / kernel mass, end-gas burn-up,
  *    NO, burn-out merge, LW integral.
  * Energy: dU_tot = −p dV − Q̇_wall + P_spark exactly (U_tot is a state; every mass transfer between
@@ -59,7 +61,8 @@
  *    the cylinder's local cycle number; trembler-magneto: `sparkDeg` / `sparkCount` of the train);
  *    cylinder 0's carries the EngineCycleSummary (`engine`: brake / indicated / friction torque, power,
  *    MEPs over the total displacement, air and fuel flow, η_v, BSFC, brake efficiency, load, vehicle
- *    speed).
+ *    speed; brake = the engine's output at the crankshaft, its inertia term from J_rot + ΣJ_m only — with a
+ *    vehicle, loadInertiaTorque (the car's ΔE_kin / 4π) closes brake ≈ load + loadInertia, and clutchLoss).
  *  - {@link runClosedCycle}: closed-cycle-only run from a prescribed IVC state (validation; one cylinder).
  *  - {@link CycleModelOptions}: heatTransfer, combustionModel, wiebe, knock, ignitionDelayModel,
  *    knockIntegral, turbulentFlameClosure, calibration parameters (burnRateMultiplier,
