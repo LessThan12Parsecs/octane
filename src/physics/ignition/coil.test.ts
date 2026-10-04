@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { IgnitionSystemSpec } from '../core/engine-spec';
+import type { InductiveIgnitionSpec } from '../core/engine-spec';
 import fx from '../../../test/fixtures/ignition_circuit.json';
 import { IgnitionCoil } from './coil';
 import { SparkGap } from './discharge';
@@ -7,7 +7,7 @@ import { SparkGap } from './discharge';
 const P = fx.params;
 
 /** Circuit spec identical to the oracle's parameters. */
-function specFromFixture(over: Partial<IgnitionSystemSpec> = {}): IgnitionSystemSpec {
+function specFromFixture(over: Partial<InductiveIgnitionSpec> = {}): InductiveIgnitionSpec {
   return {
     type: 'inductive',
     supplyVoltage: P.Vs,

@@ -49,7 +49,7 @@
  * after four all events (`forcedSubsteps` counts these; energy stays exact).
  */
 
-import type { IgnitionSystemSpec } from '../core/engine-spec';
+import type { InductiveIgnitionSpec } from '../core/engine-spec';
 import { GapTransition, type SparkGap } from './discharge';
 
 /** Primary-switch state. */
@@ -149,7 +149,7 @@ function solveDense(a: Float64Array, b: Float64Array, n: number): void {
  * All fields SI (A, V, J, s). Allocation-free `step`.
  */
 export class IgnitionCoil {
-  readonly spec: IgnitionSystemSpec;
+  readonly spec: InductiveIgnitionSpec;
   readonly opts: CoilOptions;
   /** Mutual inductance M = k√(L₁L₂), H. */
   readonly mutualInductance: number;
@@ -219,7 +219,7 @@ export class IgnitionCoil {
   /** Sub-step resolving the fast leakage mode, 0.5/ω_f = 0.5√(L₁(1−k²)C₁), s. */
   readonly fastModeSubstep: number;
 
-  constructor(spec: IgnitionSystemSpec, opts?: Partial<CoilOptions>) {
+  constructor(spec: InductiveIgnitionSpec, opts?: Partial<CoilOptions>) {
     this.spec = spec;
     this.opts = { ...DEFAULT_COIL_OPTIONS, ...opts };
     this.mutualInductance = spec.couplingCoefficient * Math.sqrt(spec.primaryInductance * spec.secondaryInductance);

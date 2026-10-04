@@ -26,6 +26,7 @@
  */
 import { DEG } from '../physics/core/constants';
 import type { EngineGeometrySpec, EngineSpec, ValveSpec } from '../physics/core/engine-spec';
+import { requireInductiveIgnition } from '../physics/core/engine-spec';
 import type { FuelSelection, OperatingPoint } from '../physics/core/operating-point';
 import type {
   CycleSummary,
@@ -1408,7 +1409,7 @@ export class MockSimulator implements SimulatorLike {
   }
 
   private fireSpark(): void {
-    const ig = this.spec.ignition;
+    const ig = requireInductiveIgnition(this.spec);
     const op = this.op;
     const L1 = ig.primaryInductance;
     const R1 = Math.max(ig.primaryResistance, 1e-6);
@@ -1642,7 +1643,7 @@ export class MockSimulator implements SimulatorLike {
   }
 
   private sparkState(out: EngineSnapshot['spark'], rho: number): void {
-    const ig = this.spec.ignition;
+    const ig = requireInductiveIgnition(this.spec);
     const t = this.t;
     out.breakdownVoltage = breakdownVoltage(this.spec.sparkPlug.gap, rho);
     out.primaryCurrent = 0;

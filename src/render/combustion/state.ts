@@ -9,6 +9,7 @@
  * and then scaled by the single exposure constant VISUAL_GAIN.
  */
 import type { EngineSpec } from '../../physics/core/engine-spec';
+import { ignitionSecondaryCapacitance } from '../../physics/core/engine-spec';
 import type { EngineSnapshot, SparkPhase } from '../../physics/core/snapshot';
 import { blackbodyXYZFast, xyzToLinearSrgb, clipToGamut, type Vec3 } from './colour/cie';
 import {
@@ -213,7 +214,7 @@ export class CombustionVisualState {
     this.gapAxis = [sp.axis[0] / al, sp.axis[1] / al, sp.axis[2] / al];
     this.gapCenter = [sp.gapCenter[0], sp.gapCenter[1], sp.gapCenter[2]];
     this.gap = sp.gap;
-    this.secC = spec.ignition.secondaryCapacitance;
+    this.secC = ignitionSecondaryCapacitance(spec.ignition);
     const g2 = this.gap / 2;
     this.spark = {
       visible: false, kind: 'none', power: 0, current: 0, radius: 0, drawRadius: VIS_MIN_CHANNEL_RADIUS,

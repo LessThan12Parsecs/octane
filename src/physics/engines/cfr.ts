@@ -47,7 +47,7 @@
  * [D2699 Table A4 footnote]); see cfrCompressionRatioAtCounter.
  */
 import { DEG, P_ATM } from '../core/constants';
-import type { EngineSpec, IgnitionSystemSpec } from '../core/engine-spec';
+import type { EngineSpec, InductiveIgnitionSpec } from '../core/engine-spec';
 import type { OperatingPoint } from '../core/operating-point';
 import type { PnhFrictionInputs } from '../mechanics/friction';
 import { oilViscosityCst, PNH_REFERENCE_VISCOSITY_CST } from '../mechanics/friction';
@@ -82,11 +82,11 @@ export const CFR_VALVE_LIFT_ZERO_LASH = 0.238 * IN;
  * ignition is "electronically triggered condenser discharge through coil to spark plug"
  * [D2699 Table 1] ([KW17], [Pal18], [Choi18]: "Capacitive discharge coil to spark"). The
  * original 1929 engine used "standard battery, interrupter and coil" (Kettering) ignition
- * with a magneto as an option [W850]. The contract (IgnitionSystemSpec) only models an
- * inductive system, so these are generic transistorised-coil values; see
+ * with a magneto as an option [W850]. IgnitionSystemSpec has no capacitive-discharge variant,
+ * so the CFR uses its inductive variant with generic transistorised-coil values; see
  * CFR_CDI_IGNITION for the capacitive-discharge description.
  */
-const INDUCTIVE_IGNITION: IgnitionSystemSpec = {
+const INDUCTIVE_IGNITION: InductiveIgnitionSpec = {
   type: 'inductive',
   // UNVERIFIED: 12 V lead-acid system with charging (typical 13.5–14 V running).
   supplyVoltage: 13.5,
@@ -111,7 +111,7 @@ const INDUCTIVE_IGNITION: IgnitionSystemSpec = {
 /**
  * Capacitive-discharge ignition actually fitted to CFR F1/F2 engines ([D2699] Table 1
  * "electronically triggered condenser discharge through coil to spark plug"; [KW17],
- * [Pal18], [Choi18]). PROPOSED CONTRACT EXTENSION (IgnitionSystemSpec is inductive-only).
+ * [Pal18], [Choi18]). PROPOSED CONTRACT EXTENSION (IgnitionSystemSpec has no CDI variant).
  * All circuit values are UNVERIFIED generic CDI numbers; only the system type is sourced.
  */
 export interface CapacitiveDischargeIgnitionSpec {
@@ -158,7 +158,8 @@ export const CFR_WALL_THERMAL_RESISTANCE = Object.freeze({
   exhaustValve: 0.8570,
 });
 
-export const CFR_F1: EngineSpec = {
+export const CFR_F1: EngineSpec & { ignition: InductiveIgnitionSpec } = {
+  id: 'cfr-f1',
   name: 'Waukesha CFR F-1/F-2 octane-rating engine',
   sources: [
     '[D2699] ASTM D2699-15a, "Standard Test Method for Research Octane Number of Spark-Ignition Engine Fuel" (incorporated by reference; public copy archive.org/details/gov.law.astm.D2699.15A) — Table 1 (cast-iron cylinder with flat combustion surface and integral jacket; CR 4:1–18:1 by worm shaft/worm wheel in the clamping sleeve; 3.250 × 4.50 in, 37.33 in³; stellite-faced intake valve with 180° shroud, plain exhaust valve; cast-iron flat-top piston; 1 chrome/ferrous + 3 ferrous compression rings + 1 oil ring; camshaft overlap 5°; 9/16 in venturi; condenser-discharge ignition; constant 13° btdc), §7.1 (V-belts to a power-absorption motor for constant speed; thermal-syphon jacket), §8.2 (SAE 30 oil, 9.3–12.5 cSt at 100 °C), §10.2–10.3 (600 ± 6 rpm; valve timing IVO 10.0 ± 2.5° atdc, IVC 34° abdc, EVO 40° bbdc, EVC 15.0 ± 2.5° atdc; valve lift 0.238 ± 0.002 in; shroud toward the spark plug, CCW swirl from above; clockwise rotation from the front; hot valve clearance 0.008 ± 0.001 in; oil 172–207 kPa, 57 ± 8 °C; jacket 100 ± 1.5 °C; IAT 52 ± 1 °C at 101.0 kPa; humidity 0.00356–0.00712 kg/kg dry air; crankcase 25–150 mm H2O vacuum; Champion D16 plug, gap 0.51 ± 0.13 mm), Annex A2 (cam lobe 0.248 in, quieting ramps at 0.008–0.010 in; timing check 0.054 in lifter rise at 30 ± 2°; 0.0007 in per counter digit; basic counter 930), Table A4.1 (guide table: RON 90 → counter 726).',

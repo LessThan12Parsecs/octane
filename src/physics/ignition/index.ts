@@ -211,6 +211,7 @@ export class IgnitionSystem {
   constructor(spec: IgnitionSystemSpec, plug: SparkPlugSpec, opts: IgnitionSystemOptions = {}) {
     this.spec = spec;
     this.plug = plug;
+    if (spec.type !== 'inductive') throw new Error(`IgnitionSystem: ignition type '${spec.type}' is not implemented yet`);
     this.coil = new IgnitionCoil(spec, opts.coil);
     this.gap = new SparkGap(plug.gap, opts.gap);
     this.suppressBase = opts.suppressBreakdown ?? false;

@@ -12,6 +12,30 @@ export type SparkPhase = 'off' | 'charging' | 'breakdown' | 'arc' | 'glow' | 'do
 
 export type CylinderPhase = 'gas-exchange' | 'compression' | 'combustion' | 'expansion';
 
+/**
+ * Multi-cylinder engines: the top-level per-cylinder fields of EngineSnapshot (kinematics, in-cylinder
+ * state, flame, spark, gas exchange, knock, composition) describe CYLINDER 1, and `cylinders[i]` holds
+ * every cylinder (including cylinder 1, identical to the top level) at its own local crank angle.
+ * Engine-level fields (t, cycle, thetaDeg = engine angle = cylinder 1's angle, rpm, manifold
+ * pressures, gasTorque, netTorque, frictionTorque, loadTorque, magnetoEmf) exist only at the top level.
+ */
+export type CylinderSnapshot = Pick<
+  EngineSnapshot,
+  | 'pistonDisplacement' | 'clearanceHeight' | 'rodAngle' | 'intakeLift' | 'exhaustLift'
+  | 'phase' | 'volume' | 'pressure' | 'temperatureMean' | 'temperatureUnburned' | 'temperatureBurned'
+  | 'massFractionBurned' | 'mass' | 'heatReleaseRate' | 'heatLossRate'
+  | 'flame' | 'spark' | 'intakeMassFlow' | 'exhaustMassFlow' | 'knock' | 'burnedComposition'
+> & {
+  /** 0-based cylinder index (cylinder number − 1). */
+  index: number;
+  /** Local crank angle of this cylinder, deg, [-360, 360), 0 = its firing TDC. */
+  thetaDeg: number;
+  /** Completed cycles of this cylinder (its local angle wraps at +360°). */
+  cycle: number;
+  /** This cylinder's gas-pressure torque on the crank, N m. */
+  gasTorque: number;
+};
+
 export interface EngineSnapshot {
   /** Simulated time since start, s. */
   t: number;
@@ -84,6 +108,17 @@ export interface EngineSnapshot {
     energyDelivered: number;
     /** Breakdown voltage required at current gas density, V. */
     breakdownVoltage: number;
+    /**
+     * Trembler / multi-spark ignition (optional): gap breakdowns so far in the current ignition event
+     * (one timer contact), cumulative; points open now; timer contact closed now; local crank angle of
+     * the FIRST breakdown of the event (NaN before it).
+     */
+    breakdownCount?: number;
+    pointsOpen?: boolean;
+    timerClosed?: boolean;
+    firstSparkDeg?: number;
+    /** Primary (points) voltage, V (optional). */
+    primaryVoltage?: number;
   };
 
   // ---- gas exchange ----
@@ -111,10 +146,56 @@ export interface EngineSnapshot {
   };
 
   // ---- mechanics ----
-  /** Indicated (gas-pressure) torque on the crank, N m. */
+  /** Indicated (gas-pressure) torque on the crank, N m — the whole engine (sum over cylinders). */
   gasTorque: number;
   /** Net crank torque including inertia and friction, N m. */
   netTorque: number;
+  /** Friction torque on the crank, N m (positive = opposing rotation). Optional. */
+  frictionTorque?: number;
+  /**
+   * Torque absorbed by the load, N m (positive = opposing rotation): the load model in 'free' mode,
+   * the dynamometer holding torque in 'fixed' mode. Optional.
+   */
+  loadTorque?: number;
+  /** Vehicle road speed, m/s ('vehicle' load). Optional. */
+  vehicleSpeed?: number;
+
+  // ---- multi-cylinder / magneto (optional) ----
+  /** Every cylinder at its local angle (multi-cylinder engines; absent for single-cylinder specs). */
+  cylinders?: CylinderSnapshot[];
+  /** Index of the cylinder whose ignition timer contact is closed (-1 = none). Optional. */
+  firingCylinder?: number;
+  /** Magneto open-circuit EMF, V (trembler-magneto ignition). Optional. */
+  magnetoEmf?: number;
+}
+
+/** Engine-level results over one engine cycle (720° of the engine angle). */
+export interface EngineCycleSummary {
+  /** Mean speed, rev/min. */
+  rpmMean: number;
+  /** Mean indicated (gas) torque, N m (net, all cylinders). */
+  indicatedTorque: number;
+  /** Mean friction torque, N m (positive = loss). */
+  frictionTorque: number;
+  /** Mean brake torque = indicated − friction − (inertia, ≈ 0 at steady speed), N m. */
+  brakeTorque: number;
+  /** Brake power, W. */
+  brakePower: number;
+  /** Brake / indicated (net, mean over cylinders) / friction mean effective pressure, Pa. */
+  bmep: number;
+  imepNet: number;
+  fmep: number;
+  /** Air and fuel mass flow through the carburettor, kg/s. */
+  airMassFlow: number;
+  fuelMassFlow: number;
+  /** Volumetric efficiency over the total displacement (ambient-referenced). */
+  volumetricEfficiency: number;
+  /** Brake specific fuel consumption, kg/J, and brake thermal efficiency (LHV). */
+  bsfc: number;
+  brakeEfficiency: number;
+  /** Mean load torque, N m; mean vehicle speed, m/s ('vehicle' load). */
+  loadTorque: number;
+  vehicleSpeed?: number;
 }
 
 export interface CycleSummary {
@@ -161,4 +242,12 @@ export interface CycleSummary {
   /** Wall heat loss over the closed cycle, J; gross indicated work, J. */
   heatLoss: number;
   indicatedWorkGross: number;
+  /** 0-based cylinder this summary belongs to (multi-cylinder engines; absent = 0). */
+  cylinder?: number;
+  /** Local crank angle of the first spark (gap breakdown) of the cycle, deg (NaN: none). Optional. */
+  sparkDeg?: number;
+  /** Gap breakdowns in the cycle's ignition event. Optional. */
+  sparkCount?: number;
+  /** Engine-level results, attached to cylinder 1's summary at the end of each engine cycle. Optional. */
+  engine?: EngineCycleSummary;
 }

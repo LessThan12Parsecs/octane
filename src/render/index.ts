@@ -12,3 +12,9 @@ export {
   type CombustionMode,
   type TemperatureLegendElement,
 } from './combustion/index';
+export {
+  CfrEngineRenderModel,
+  createEngineModel,
+  registerEngineModel,
+  type EngineRenderModel,
+} from './engine-model';
