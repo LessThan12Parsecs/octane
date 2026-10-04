@@ -24,7 +24,7 @@ import type { IgnitionDelayModel } from '../chemistry/ignition-delay';
 import { CFR_CRANKCASE_GAUGE_PRESSURE, CFR_FRICTION, CFR_KNOCK_PICKUP, CFR_RON_CONDITIONS, CFR_VALVE_LASH } from '../engines/cfr';
 import { MODEL_T, MODEL_T_FRICTION, MODEL_T_VALVE_LASH } from '../engines/model-t';
 import { engineOfSpec } from '../engines';
-import { END_GAS_STRATIFICATION_DT, EXCITATION_TIME_PRF, KNOCK_DECAY_TIME } from '../chemistry/knock';
+import { END_GAS_STRATIFICATION_DT, EXCITATION_TIME_PRF, KNOCK_DECAY_TIME, L_HEAD_MAPO_BAND, virtualKnockSensor } from '../chemistry/knock';
 import { CFR_CALIBRATION, CFR_KNOCK_DELAY_MODEL, MODEL_T_CALIBRATION, type CalibrationSet } from './calibration';
 import { moistAirEnhancementFactor, waterSaturationPressure } from '../thermo/fuels';
 
@@ -346,14 +346,14 @@ export const ENGINE_CYCLE_OPTION_DEFAULTS: Readonly<Record<string, Readonly<Part
   'ford-model-t': Object.freeze({
     ...calibrationOptions(MODEL_T_CALIBRATION),
     ignitionDelayModel: CFR_KNOCK_DELAY_MODEL as IgnitionDelayModelId,
-    // UNVERIFIED placeholder (no knock instrumentation exists for the Model T): a head-face point near the
-    // liner on the side opposite the valve pocket, inside the bore disc where the cylindrical-bore acoustic
-    // modes of KnockOscillator are defined (all non-axisymmetric modes have an antinode at the wall). The
-    // L-head chamber's own modes and pickup belong to the chamber model.
-    knockSensor: Object.freeze([0.5 * MODEL_T.geometry.bore - 0.003, 0]) as readonly [number, number],
-    // unfiltered modal sum: the CFR's 4–18 kHz band is a property of the ANL instrumentation, and the L-head's
-    // (1,0)-type mode is expected at 2–4 kHz (chamber area notes) — UNVERIFIED
-    mapoBand: null,
+    // UNVERIFIED (no knock instrumentation exists for the Model T): a virtual plug-mounted transducer at the
+    // spark plug's planform position over the valve pocket (chemistry/knock.ts virtualKnockSensor — the usual
+    // retrofit for in-cylinder pressure on old heads); the L-head's own depth-averaged planform modes
+    // (createKnockOscillator) are defined over the whole chamber, pocket included
+    knockSensor: virtualKnockSensor(MODEL_T),
+    // L_HEAD_MAPO_BAND [2, 18] kHz (UNVERIFIED convention): the CFR's 4–18 kHz ANL band would cut the
+    // L-head's 3.4–4.0 kHz bore-to-pocket fundamental (knock.ts: 3812 Hz at c = 950 m/s)
+    mapoBand: L_HEAD_MAPO_BAND,
     valveLash: MODEL_T_VALVE_LASH,
     // UNVERIFIED: the crankcase breathes to the atmosphere through the oil-filler breather (no PCV, no pump)
     crankcaseGaugePressure: 0,

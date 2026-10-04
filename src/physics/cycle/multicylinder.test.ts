@@ -166,13 +166,17 @@ describe('inline four on the CFR geometry, firing order 1-2-4-3 (offsets 0/180/5
       `P_b ${(e.brakePower / 1e3).toFixed(2)} kW, BMEP ${(e.bmep / 1e5).toFixed(3)} bar, η_b ${(100 * e.brakeEfficiency).toFixed(1)} %`);
   });
 
-  it('cycle-mean friction torque = the cycle average of the instantaneous per-cylinder friction (quadrature)', () => {
+  it('cycle-mean friction torque = the cycle average of the instantaneous whole-engine friction (quadrature)', () => {
+    // (Model T integration: the friction model is the whole engine's — FMEP over N·V_d — summed over the
+    // cylinders' piston terms by torqueCylinders)
     const om = (CFR_RON_CONDITIONS.rpm * 2 * Math.PI) / 60;
     const n = 7200;
+    const dx = new Float64Array(4);
     let s = 0;
     for (let j = 0; j < n; j++) {
       const th = -360 + (720 * (j + 0.5)) / n;
-      for (let i = 0; i < 4; i++) s -= m.friction.torque(m.kin.dxdTheta(cylinderAngleDeg(FOUR, i, th) * (Math.PI / 180)), om);
+      for (let i = 0; i < 4; i++) dx[i] = m.kin.dxdTheta(cylinderAngleDeg(FOUR, i, th) * (Math.PI / 180));
+      s -= m.friction.torqueCylinders(dx, om);
     }
     expect(rel(m.meanFrictionTorque(om), s / n)).toBeLessThan(1e-6);
   });
@@ -278,14 +282,16 @@ describe('four-cylinder EngineSimulator', () => {
 });
 
 describe('four-cylinder speed modes and cost', () => {
-  it("free speed (temporary rigid-crank sum): accelerates under a light constant load; other loads are refused", () => {
+  it('free speed (multi-cylinder crank train): accelerates under a light constant load; a brake load is accepted', () => {
     const m = new CycleModel(FOUR, { ...CFR_RON_CONDITIONS, speedMode: 'free', loadTorque: 10 }, { warmupCycles: 1 });
     const rpm0 = m.rpm;
     const s = m.runCycles(1);
     expect(s.every((x) => Number.isFinite(x.imepNet))).toBe(true);
     expect(m.rpm).toBeGreaterThan(rpm0);
     expect(m.rpm).toBeLessThan(rpm0 * 1.5);
-    expect(() => m.setOperatingPoint({ load: { kind: 'brake', refRpm: 600, exponent: 2 } })).toThrow(/multi-cylinder/);
+    // (Model T integration: the LoadModel replaced the constant-load-only sum)
+    m.setOperatingPoint({ load: { kind: 'brake', refRpm: 600, exponent: 2 } });
+    expect(m.load.kind).toBe('brake');
   });
 
   it('free speed: the engine summary closes the crank energy balance (brake = load torque) for 1 and 4 cylinders', () => {

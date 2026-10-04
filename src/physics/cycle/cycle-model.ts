@@ -18,10 +18,13 @@
  * cylinders; splits run per cylinder; each cylinder's local wrap (θ_i = 360) emits its CycleSummary
  * (summary.cylinder = i for N > 1); the ENGINE wrap (θ = 360, cylinder 0's wrap) applies the pending
  * operating point and attaches the EngineCycleSummary (summary.engine). Speed: 'fixed' for any N;
- * 'free' for N = 1 (CrankTrainDynamics) and, for N > 1, a TEMPORARY rigid-crank sum
- * (multiCylinderAcceleration, constant load only) until the multi-cylinder crank train and the load
- * models are integrated. After a split in a closed cylinder of a fixed-speed multi-cylinder engine only
- * that cylinder is re-evaluated (refreshCylinder).
+ * 'free' through the rigid multi-cylinder crank train (mechanics MultiCylinderCrankTrain: every
+ * cylinder's gas, inertia and gravity torque at its throw phase, Σ J_m), the whole-engine friction
+ * (FrictionTorqueModel normalised by N·V_d, torqueCylinders) and the load model (mechanics LoadModel from
+ * op.load: constant / brake / vehicle road load with the car's reflected inertia / neutral); for one
+ * cylinder and a constant load this is bit for bit the former single-cylinder right-hand side. After a
+ * split in a closed cylinder of a fixed-speed multi-cylinder engine only that cylinder is re-evaluated
+ * (refreshCylinder).
  *
  * ── Continuous state y (Float64Array, layout in cycle-common.ts) ─────────────────────────────
  *   θ (crank deg), ω (rad/s)                                   mechanics (dθ/dt = ω, dω/dt = α or 0)
@@ -38,8 +41,10 @@
  * ── Open phase (EVO → IVC) ───────────────────────────────────────────────────────────────────
  * Fresh charge (humid air + fuel vapour at φ + EGR, thermo/fuels.freshCharge) at the intake
  * mixture temperature and ambient pressure → carburettor venturi (orifice, C_D·A_t scaled by the
- * butterfly throttleArea ratio) → intake plenum → intake valve (ValveFlowModel effective area of
- * the lash-corrected ValveLiftProfile × orificeFlow, bidirectional, direction-dependent C_D) →
+ * butterfly throttleArea ratio; with manifolds.venturiDiameter the venturi and a butterfly throttle as two
+ * compressible restrictions in series, gas-exchange CarburettorFlowModel) → intake plenum → intake valve
+ * (ValveFlowModel effective area of the lash-corrected LiftProfile — polydyne or the cam's own lobe — ×
+ * orificeFlow, bidirectional, direction-dependent C_D; side valves add the pocket → bore transfer) →
  * cylinder → exhaust valve → exhaust plenum → outlet orifice → ambient. Plenums and cylinder are
  * gas-exchange/Plenum volumes (conserved N, U; the stream carries the upstream stagnation
  * enthalpy and composition), so the network conserves mass, species and energy to round-off.
@@ -53,11 +58,12 @@
  * Q̇_u/T_u), m_u, m_b; closure.ts recovers (p, T_u, T_b) by Newton (burned gas in chemical
  * equilibrium at (T_b, p)). After burn-out: burned zone only (UV equilibrium).
  * Combustion (default 'entrainment'): IgnitionSystem (coil circuit, breakdown, arc/glow, Herweg–
- * Maly kernel) → at hand-off the Keck/Tabaczynski entrainment + burn-up ODEs with u′ from the
- * K–k model (u_T = C_T u′; option: Keck 1982 empirical u_T, ℓ_T), λ = Taylor microscale, S_L from
- * the flame-speed tables (at the TRAPPED fuel blend and φ, see trappedMixture) and A_f from the exact
- * sphere ∩ disc FlameGeometry of the entrained volume V_e = V_b + (m_e − m_b)/ρ_u, mapped onto the
- * disc in proportion A_p h/V (the lumped crevice volume holds charge distributed over the chamber).
+ * Maly kernel; trembler-magneto: a spark TRAIN per timer contact) → at hand-off the Keck/Tabaczynski
+ * entrainment + burn-up ODEs with u′ from the K–k model (u_T = C_T u′; option: Keck 1982 empirical u_T,
+ * ℓ_T), λ = Taylor microscale, S_L from the flame-speed tables (at the TRAPPED fuel blend and φ, see
+ * trappedMixture) and A_f from the exact sphere ∩ chamber geometry (combustion CombustionChamber: disc or
+ * L-head) of the entrained volume V_e = V_b + (m_e − m_b)/ρ_u, mapped onto the chamber in proportion
+ * V_chamber/V (the lumped crevice volume holds charge distributed over the chamber).
  * Heat: Woschni (C₂ term with the motored pressure of the unburned-zone isentrope) split over the
  * zones with the burned wetted areas of the flame geometry (wallHeatLossTwoZone).
  *
@@ -103,11 +109,11 @@
  * of engine-simulator.ts do). V8 still boxes doubles passed to / returned from non-inlined calls
  * (≈ 17 MB per 600 rpm cycle, GC ≈ 1 % of the CPU; validation round 1).
  *
- * Extension points (integration): createValveLift / createValveFlow (side-valve cams and flow),
- * createKnockOscillator (chamber acoustics), createIgnitionSystem (+ Cylinder.prepareIgnitionCommand,
- * ignitionSplit, finePhase: trembler-magneto ignition), updateVenturi (series venturi + butterfly when
- * spec.manifolds.venturiDiameter is set), multiCylinderAcceleration and the load torque (multi-cylinder
- * crank train, LoadSpec), and the chamber call sites listed in cylinder.ts.
+ * Sub-model factories: createChamber (combustion createChamber), createValveLift / createValveFlow
+ * (createLiftProfile / createValveFlowModel), createKnockOscillator (chemistry createKnockOscillator),
+ * createIgnitionSystem (inductive or one trembler-magneto system per cylinder); updateVenturi (the CFR
+ * venturi-as-throttle or the series venturi + butterfly carburettor); the crank train, friction and load
+ * model of the free-speed right-hand side.
  */
 import { DEG, RAD2DEG, R_UNIVERSAL } from '../core/constants';
 import type { EngineSpec, WallSpec } from '../core/engine-spec';
@@ -115,27 +121,51 @@ import type { OperatingPoint } from '../core/operating-point';
 import type { CycleSummary, EngineCycleSummary } from '../core/snapshot';
 import { FUEL_SPECIES, NE, NS, SP } from '../core/species';
 import type { EquilibriumSolver } from '../equilibrium';
-import { KnockOscillator, type IgnitionDelayModel, type LivengoodWuIntegrator, type ZeldovichKinetics } from '../chemistry';
-import { DEFAULT_LENGTH_SCALE_FRACTION, DEFAULT_TURBULENCE_PARAMS, type FlameGeometry, type TurbulenceParams } from '../combustion';
+import { createKnockOscillator, type IgnitionDelayModel, type KnockOscillator, type LivengoodWuIntegrator, type ZeldovichKinetics } from '../chemistry';
 import {
+  createChamber,
+  DEFAULT_LENGTH_SCALE_FRACTION,
+  DEFAULT_TURBULENCE_PARAMS,
+  type CombustionChamber,
+  type FlameGeometry,
+  type TurbulenceParams,
+} from '../combustion';
+import {
+  CarburettorFlowModel,
+  createLiftProfile,
+  createValveFlowModel,
   gasStateFromTPX,
+  hasSeparateThrottle,
   newGasState,
   newOrificeFlow,
+  newSeriesOrificeFlow,
   orificeFlow,
   Plenum,
+  resolveValveLash,
   throttleArea,
-  ValveFlowModel,
-  ValveLiftProfile,
   type GasState,
+  type LiftProfile,
+  type OrificeFlow,
+  type SeriesOrificeFlow,
+  type ValveFlowModel,
 } from '../gas-exchange';
 import { IgnitionSystem, type IgnitionCommand } from '../ignition';
-import { FrictionTorqueModel, newCrankTrainState, pnhFmep, type CrankTrainDynamics, type KinematicState, type SliderCrank } from '../mechanics';
+import {
+  FrictionTorqueModel,
+  LoadModel,
+  MultiCylinderCrankTrain,
+  pnhFmep,
+  type CrankTrainDynamics,
+  type KinematicState,
+  type SliderCrank,
+} from '../mechanics';
 import { completeCombustionProducts, freshCharge, fuelFromSelection, humidAir, lowerHeatingValue, type FuelBlend } from '../thermo/fuels';
 import { mixMolarMass, temperatureFromUMolar } from '../thermo';
 import { MOLAR_MASS } from '../thermo/thermo';
 import type { ZoneClosure } from './closure';
 import { Cylinder } from './cylinder';
 import {
+  blockLedgerIndex,
   cloneOp,
   cylinderStateIndex,
   elementMolesOf,
@@ -180,7 +210,7 @@ export {
   I_TH, I_OM, I_CN, I_CU, I_CBG, I_UT, I_SU, I_MU, I_MB, I_ME, I_IN, I_IU, I_IBG, I_EN, I_EU, I_EBG, I_TK, I_TKE, I_SW,
   I_W, I_Q, I_MIVI, I_MIVO, I_MEVO, I_MEVI, I_HV, I_HO, I_LV, I_LO, I_MK, I_GIH, I_GIBG, I_GIN, I_GEH, I_GEBG, I_GEN,
   I_GIK, I_CEG, I_IEG, I_GIV, I_QS, I_CRU, I_CRB, NY,
-  CYLINDER_BLOCK_SIZE, cylinderStateIndex, stateLength,
+  CYLINDER_BLOCK_SIZE, cylinderStateIndex, stateLength, blockLedgerIndex,
   MODE_OPEN, MODE_SINGLE, MODE_TWO, MODE_BURNED,
   OUTLET_DISCHARGE_COEFFICIENT, WIEBE_SEED, FREE_MODE_MIN_RPM, DP_WINDOW_DEG, DP_SUBDIV,
   newCycleTrace, expLinearIntegral, swapNO, resolveDelayModel,
@@ -207,7 +237,14 @@ export class CycleModel {
   readonly c0: Cylinder;
 
   // ---- sub-models (engine) ----
+  /** Whole-engine friction (FMEP over N·V_d; per-cylinder piston terms summed by torqueCylinders). */
   readonly friction: FrictionTorqueModel;
+  /** Rigid crank with every cylinder at its throw phase (free-speed dynamics, inertia). */
+  readonly crank: MultiCylinderCrankTrain;
+  /** Load on the crank in free-speed mode (op.load / loadTorque), configured from the operating point in effect. */
+  readonly load: LoadModel;
+  /** Venturi + butterfly carburettor (spec.manifolds.venturiDiameter), or null (the CFR venturi-as-throttle). */
+  readonly carb: CarburettorFlowModel | null;
   delayModel: IgnitionDelayModel;
   readonly intake: Plenum;
   readonly exhaust: Plenum;
@@ -262,6 +299,8 @@ export class CycleModel {
   private cdaOutlet = 0;
   private throttleFor = NaN;
   private pCrankcase = 101325;
+  /** Per-cylinder thermodynamic pressures for the crank train (last evaluation), Pa. */
+  private readonly pCyl: Float64Array;
 
   // ---- evaluated engine quantities (last RHS evaluation) ----
   mdotV = 0;
@@ -277,6 +316,10 @@ export class CycleModel {
   private tEngineStart = 0;
   private ventEngineStart = 0;
   private omegaEngineStart = 0;
+  /** Load-model inertia at the engine-cycle start (a gear change jumps it), kg m². */
+  private loadInertiaStart = 0;
+  /** ∫ T_load ω dt over the current engine cycle (free speed), J. */
+  private loadWork = 0;
 
   // ---- trace ----
   traceCycle = -1;
@@ -287,9 +330,9 @@ export class CycleModel {
   };
 
   // ---- scratch objects ----
-  private readonly ofV = newOrificeFlow();
+  /** Venturi flow (a SeriesOrificeFlow, carrying the series solve's warm start, with a carburettor). */
+  private readonly ofV: OrificeFlow;
   private readonly ofO = newOrificeFlow();
-  private readonly cts = newCrankTrainState();
   private readonly Nscr = new Float64Array(NS);
   private readonly Xscr = new Float64Array(NS);
 
@@ -301,7 +344,6 @@ export class CycleModel {
     if (closedInit && n > 1) throw new Error('CycleModel: closed-cycle-only runs (runClosedCycle) are single-cylinder');
     this.pendingOp = sanitizeOperatingPoint(spec, op);
     this.op = cloneOp(this.pendingOp);
-    this.checkSupported(this.op, n);
     this.fuel = fuelFromSelection(this.op.fuel);
     this.delayModel = resolveDelayModel(this.opts.ignitionDelayModel);
     const nt = this.opts.burnedNOThermo;
@@ -309,7 +351,9 @@ export class CycleModel {
     this.keck = this.opts.turbulentFlameClosure === 'keck1982';
     this.turbParams = { ...DEFAULT_TURBULENCE_PARAMS, cBeta: this.opts.turbulenceProduction };
     this.lengthFraction = DEFAULT_LENGTH_SCALE_FRACTION * this.opts.turbulenceLengthScaleFactor;
-    const ny = stateLength(n);
+    // (chambers with a block-deck surface — the L-head — append one heat ledger per cylinder)
+    const blockLedgers = spec.geometry.chamber === 'l-head';
+    const ny = stateLength(n) + (blockLedgers ? n : 0);
     this.ny = ny;
     this.y = new Float64Array(ny);
     this.dy = new Float64Array(ny);
@@ -321,13 +365,20 @@ export class CycleModel {
     this.dy0 = new Float64Array(ny);
     this.yComp = new Float64Array(ny);
     this.yComp0 = new Float64Array(ny);
-    const c0 = new Cylinder(this, 0, cylinderStateIndex(0), null);
-    const cyls = [c0];
-    // identical cylinders share the flame-geometry tables (stateless lookups)
-    for (let i = 1; i < n; i++) cyls.push(new Cylinder(this, i, cylinderStateIndex(i), c0.flameGeom));
+    const cyls: Cylinder[] = [];
+    // (identical cylinders share the chamber tables: createChamber caches them, each cylinder gets its own evaluator)
+    for (let i = 0; i < n; i++) cyls.push(new Cylinder(this, i, cylinderStateIndex(i), blockLedgers ? blockLedgerIndex(n, i) : -1));
+    const c0 = cyls[0];
     this.cylinders = cyls;
     this.c0 = c0;
-    this.friction = new FrictionTorqueModel(c0.kin);
+    this.friction = new FrictionTorqueModel(c0.kin, 0.5, n);
+    this.crank = MultiCylinderCrankTrain.fromSpec(spec, c0.kin);
+    this.load = new LoadModel(spec.vehicle);
+    this.pCyl = new Float64Array(n);
+    this.carb = hasSeparateThrottle(spec.manifolds)
+      ? new CarburettorFlowModel(spec.manifolds, { venturiDischargeCoefficient: this.opts.venturiDischargeCoefficient, restrictionArea: this.opts.intakeRestrictionArea })
+      : null;
+    this.ofV = this.carb ? newSeriesOrificeFlow() : newOrificeFlow();
     const X0 = new Float64Array(NS);
     X0[SP.N2] = 1;
     this.intake = new Plenum(spec.manifolds.intakeVolume, 300, 1e5, X0);
@@ -339,32 +390,67 @@ export class CycleModel {
   // Sub-model factories (extension points)
   // ===========================================================================================
 
-  /** Lift profile of a cylinder's valve (lash: ValveSpec.lash, else options.valveLash). */
-  createValveLift(c: Cylinder, kind: 'intake' | 'exhaust'): ValveLiftProfile {
+  /**
+   * Lift profile of a cylinder's valve: the ValveSpec's cam (default polydyne; three-arc flat-follower lobe;
+   * measured table) at the running clearance ValveSpec.lash, else options.valveLash (gas-exchange
+   * createLiftProfile / resolveValveLash). Local crank angles.
+   */
+  createValveLift(c: Cylinder, kind: 'intake' | 'exhaust'): LiftProfile {
     const v = kind === 'intake' ? this.spec.intakeValve : this.spec.exhaustValve;
     void c;
-    return new ValveLiftProfile({ ...v, lash: v.lash ?? this.opts.valveLash });
+    return createLiftProfile(v, resolveValveLash(v, this.opts.valveLash));
   }
 
-  /** Flow model (effective area, discharge coefficients, inflow jet) of a cylinder's valve. */
+  /**
+   * Flow model (effective area, discharge coefficients, inflow jet) of a cylinder's valve (gas-exchange
+   * createValveFlowModel: overhead valves as before; side valves with the pocket-roof masking stage and the
+   * pocket → bore transfer section in series).
+   */
   createValveFlow(c: Cylinder, kind: 'intake' | 'exhaust'): ValveFlowModel {
     const s = this.spec;
     void c;
-    if (kind === 'intake') return new ValveFlowModel(s.intakeValve, 'intake', { portDiameter: Math.max(s.manifolds.intakePortDiameter, s.intakeValve.stemDiameter * 1.01) });
-    return new ValveFlowModel(s.exhaustValve, 'exhaust', { portDiameter: Math.max(s.manifolds.exhaustPortDiameter, s.exhaustValve.stemDiameter * 1.01) });
+    return createValveFlowModel(kind === 'intake' ? s.intakeValve : s.exhaustValve, kind, s);
   }
 
-  /** Acoustic knock modes of a cylinder (cylindrical bore, options.knockSensor / mapoBand). */
+  /**
+   * Chamber geometry of a cylinder (combustion createChamber: flat disc or L-head). The fast tables cover
+   * the tallest bore column: stroke + h_TDC at the lowest compression ratio (+ 2 %); identical cylinders
+   * share the immutable tables (createChamber's cache), each gets its own evaluator.
+   */
+  createChamber(c: Cylinder): CombustionChamber {
+    const hMax = c.kin.pistonTravel + c.kin.clearanceHeightTDCForCR(this.spec.geometry.compressionRatioRange[0]);
+    return createChamber(this.spec, { maxHeight: hMax * 1.02 });
+  }
+
+  /**
+   * Acoustic knock modes of a cylinder (chemistry createKnockOscillator: Bessel modes of the bore for a
+   * flat disc, the depth-averaged planform modes of an L-head — shared by the cylinders — with
+   * options.knockSensor / mapoBand; null band = unfiltered).
+   */
   createKnockOscillator(c: Cylinder): KnockOscillator {
     void c;
-    return new KnockOscillator(this.spec.geometry.bore, { decayTime: this.opts.knockDecayTime, sensor: this.opts.knockSensor, band: this.opts.mapoBand ?? undefined });
+    return createKnockOscillator(this.spec, { decayTime: this.opts.knockDecayTime, sensor: this.opts.knockSensor, band: this.opts.mapoBand });
   }
 
-  /** Ignition system of a cylinder (built at its first cycle start; 'entrainment' combustion only). */
+  /**
+   * Ignition system of a cylinder (built at its first cycle start; 'entrainment' combustion only). A
+   * trembler-magneto ignition gets one system per cylinder — its own coil (coilOverrides[i]), gap and kernel
+   * on its timer segment, the supply data shared (what ignition createIgnitionSystems builds per cylinder) —
+   * fed from the operating point's ignition source.
+   */
   createIgnitionSystem(c: Cylinder): IgnitionSystem {
     const io = this.opts.ignition;
-    void c;
-    return new IgnitionSystem(this.spec.ignition, this.spec.sparkPlug, {
+    const s = this.spec;
+    if (s.ignition.type === 'trembler-magneto') {
+      return new IgnitionSystem(s.ignition, s.sparkPlug, {
+        ...io,
+        kernel: { handoffIntegralScaleMultiple: this.opts.kernelHandoffMultiple, ...(io.kernel ?? {}) },
+        cylinder: c.index,
+        firingOffsetDeg: c.offsetDeg,
+        ignitionSource: this.op.ignitionSource ?? 'magneto',
+      });
+    }
+    return new IgnitionSystem(s.ignition, s.sparkPlug, {
       makeSparkDiode: true,
       ...io,
       kernel: { handoffIntegralScaleMultiple: this.opts.kernelHandoffMultiple, ...(io.kernel ?? {}) },
@@ -385,9 +471,7 @@ export class CycleModel {
       if (v !== undefined) (next as Record<string, unknown>)[k] = v;
     }
     if (patch.fuel) next.fuel = { ...patch.fuel };
-    const pending = sanitizeOperatingPoint(this.spec, next, this.pendingOp);
-    this.checkSupported(pending, this.cylinders.length);
-    this.pendingOp = pending;
+    this.pendingOp = sanitizeOperatingPoint(this.spec, next, this.pendingOp);
     const o = this.op;
     o.rpm = this.pendingOp.rpm;
     o.throttle = this.pendingOp.throttle;
@@ -398,8 +482,18 @@ export class CycleModel {
     if (this.pendingOp.ignitionSource !== undefined) o.ignitionSource = this.pendingOp.ignitionSource;
     else if (o.ignitionSource !== undefined) delete o.ignitionSource;
     if (o.speedMode === 'fixed') this.y[I_OM] = (o.rpm * 2 * Math.PI) / 60;
+    // the load model follows the new load at once (a gear change makes the reflected inertia jump: an ideal
+    // slipping clutch keeps ω continuous); the ignition source switches at each coil's next timer make
+    this.load.configure(o);
+    this.applyIgnitionSource();
     this.updateFriction();
     this.invalidateAll();
+  }
+
+  /** Trembler-magneto: request the operating point's supply (MAG / BAT) on every cylinder's ignition. */
+  private applyIgnitionSource(): void {
+    const kind = this.op.ignitionSource ?? 'magneto';
+    for (const c of this.cylinders) if (c.ign && c.ign.supply) c.ign.ignitionSource = kind;
   }
 
   /** Restart from t = 0 with the latest operating point (runs the warm-up cycles again). */
@@ -716,18 +810,26 @@ export class CycleModel {
     this.updateVenturi();
     this.pCrankcase = op.ambientPressure + this.opts.crankcaseGaugePressure;
     this.delayModel = resolveDelayModel(this.opts.ignitionDelayModel);
+    // load (air density from the ambient state) and ignition supply of the operating point in effect
+    this.load.configure(op);
+    this.applyIgnitionSource();
     this.updateFriction();
   }
 
   /**
-   * Effective flow area C_D·A of the carburettor (cached per throttle opening). Extension point: a spec
-   * with a separate butterfly (manifolds.venturiDiameter + throttle) needs the venturi and the butterfly
-   * in series; today throttleDiameter is treated as the venturi scaled by the butterfly open-area ratio
-   * (the CFR form) for every spec.
+   * Effective flow area C_D·A of the carburettor (cached per throttle opening). A spec with a separate
+   * butterfly (manifolds.venturiDiameter + throttle) sets the plate opening of its series venturi +
+   * butterfly model (CarburettorFlowModel, solved per evaluation); otherwise throttleDiameter is the
+   * venturi scaled by the butterfly open-area ratio (the CFR form).
    */
   private updateVenturi(): void {
     const op = this.op;
     if (op.throttle === this.throttleFor) return;
+    if (this.carb) {
+      this.carb.setOpening(op.throttle);
+      this.throttleFor = op.throttle;
+      return;
+    }
     const D = this.spec.manifolds.throttleDiameter;
     const At = 0.25 * Math.PI * D * D;
     // The CFR has no throttle plate: the venturi throat is the restriction; a partial opening
@@ -749,19 +851,6 @@ export class CycleModel {
     const pI = this.pInt > 0 ? this.pInt : this.op.ambientPressure;
     const b = pnhFmep({ ...fr, compressionRatio: this.op.compressionRatio }, rpm, pI, this.op.ambientPressure);
     this.friction.setFromPnh(b, (rpm * 2 * Math.PI) / 60);
-  }
-
-  /**
-   * Operating points the engine can run: multi-cylinder 'free' speed only with a constant load
-   * (the multi-cylinder crank train with LoadSpec models is integrated separately).
-   */
-  private checkSupported(op: OperatingPoint, n: number): void {
-    if (n > 1 && op.speedMode === 'free' && op.load && op.load.kind !== 'constant') {
-      throw new Error(
-        `CycleModel: '${op.load.kind}' load in free-speed mode is not implemented for multi-cylinder engines yet ` +
-          '(multi-cylinder crank train / LoadModel integration); use speedMode fixed or a constant loadTorque',
-      );
-    }
   }
 
   // ===========================================================================================
@@ -798,17 +887,20 @@ export class CycleModel {
     this.tEngineStart = this.t;
     this.ventEngineStart = this.ventMass();
     this.omegaEngineStart = this.y[I_OM];
+    this.loadInertiaStart = this.load.inertia();
+    this.loadWork = 0;
     for (const c of this.cylinders) c.wEngineStart = this.y[c.ix.W];
   }
 
   /**
    * Engine-level results of the engine cycle just completed (θ −360 → 360): mean speed, indicated torque
    * (∫p dV of all cylinders / 4π), friction torque (cycle mean of the FrictionTorqueModel at the mean
-   * speed), brake torque = indicated − friction − ΔE_kin/4π (free speed: the crank's kinetic-energy
-   * change over the cycle), mean effective pressures over the total displacement, carburettor air and
-   * fuel flow from the venturi ledger, η_v, BSFC (0 when the brake power is not positive) and brake
-   * efficiency (LHV of the selected fuel), and the load: the constant loadTorque in free mode, the
-   * dynamometer's absorbed (= brake) torque in fixed mode.
+   * speed), brake torque = indicated − friction − ΔE_kin/4π (free speed: the kinetic-energy change of the
+   * crank, the mechanisms and the load's reflected inertia, ½(J_rot + ΣJ_m + J_L)ω², over the cycle), mean
+   * effective pressures over the total displacement, carburettor air and fuel flow from the venturi ledger,
+   * η_v, BSFC (0 when the brake power is not positive) and brake efficiency (LHV of the selected fuel), and
+   * the load: in free mode the constant loadTorque, else the cycle mean ∫T_L ω dt/4π of the load model (and
+   * the mean road speed of a vehicle in gear); the dynamometer's absorbed (= brake) torque in fixed mode.
    */
   private makeEngineSummary(): EngineCycleSummary {
     const y = this.y;
@@ -822,10 +914,16 @@ export class CycleModel {
     const indicated = W / (4 * Math.PI);
     const friction = this.meanFrictionTorque(om);
     let dKE = 0;
-    if (this.op.speedMode === 'free') {
+    const free = this.op.speedMode === 'free';
+    if (free) {
       let J = this.c0.dyn.rotatingInertia;
       for (const c of cyls) J += c.dyn.mechanismInertia(c.theta * DEG);
-      dKE = 0.5 * J * (y[I_OM] * y[I_OM] - this.omegaEngineStart * this.omegaEngineStart);
+      // (+ the load's reflected inertia — the car in gear; a gear change during the cycle jumps it)
+      const JL0 = this.loadInertiaStart;
+      const JL1 = this.load.inertia();
+      const w1 = y[I_OM];
+      const w0 = this.omegaEngineStart;
+      dKE = JL0 === JL1 ? 0.5 * (J + JL1) * (w1 * w1 - w0 * w0) : 0.5 * ((J + JL1) * w1 * w1 - (J + JL0) * w0 * w0);
     }
     const brake = indicated - friction - dKE / (4 * Math.PI);
     const mV = this.ventMass() - this.ventEngineStart;
@@ -838,7 +936,9 @@ export class CycleModel {
     const airFlow = dt > 0 ? (mV * (1 - yFuel - this.op.egrFraction)) / dt : 0;
     const power = brake * om;
     const lhv = lowerHeatingValue(this.fuel);
-    return {
+    const ld = this.load;
+    const loadTorque = !free ? brake : ld.kind === 'constant' ? this.op.loadTorque : this.loadWork / (4 * Math.PI);
+    const summary: EngineCycleSummary = {
       rpmMean: (om * 60) / (2 * Math.PI),
       indicatedTorque: indicated,
       frictionTorque: friction,
@@ -853,20 +953,27 @@ export class CycleModel {
       // (undefined without positive brake power: reported as 0 — summaries stay finite)
       bsfc: power > 0 && fuelFlow > 0 ? fuelFlow / power : 0,
       brakeEfficiency: fuelFlow > 0 && lhv > 0 ? power / (fuelFlow * lhv) : 0,
-      loadTorque: this.op.speedMode === 'free' ? this.op.loadTorque : brake,
+      loadTorque,
     };
+    // mean road speed of the car (v = k ω is linear in ω: k × the cycle-mean speed)
+    if (free && (ld.kind === 'vehicle' || ld.kind === 'neutral')) summary.vehicleSpeed = ld.vehicleSpeed(om);
+    return summary;
   }
 
   /**
-   * Cycle-mean friction torque of the engine at constant ω (positive = loss): N cylinders × the mean of
-   * FrictionTorqueModel.torque over a revolution, (T_c + F_c⟨|x′|⟩)·ω/√(ω² + ε²) + c_v⟨x′²⟩ω — exact for the
-   * model's distribution (⟨|x′|⟩ = travel/π, ⟨x′²⟩ tabulated).
+   * Cycle-mean friction torque of the engine at constant ω (positive = loss): the mean of
+   * FrictionTorqueModel.torqueCylinders over a revolution, (T_c + N F_c⟨|x′|⟩)·ω/√(ω² + ε²) + N c_v⟨x′²⟩ω
+   * (T_c the whole engine's constant part, F_c and c_v per cylinder) — exact for the model's distribution
+   * (⟨|x′|⟩ = travel/π, ⟨x′²⟩ tabulated).
    */
   meanFrictionTorque(om: number): number {
     const f = this.friction;
     const e = f.smoothingOmega;
     const s = om / Math.sqrt(om * om + e * e);
-    return this.cylinders.length * ((f.constantTorque + f.coulombForce * f.meanAbsDxdTheta) * s + f.viscousCoefficient * f.meanSqDxdTheta * om);
+    const n = f.cylinders;
+    // (one cylinder: the single-cylinder expression, unchanged)
+    if (n === 1) return (f.constantTorque + f.coulombForce * f.meanAbsDxdTheta) * s + f.viscousCoefficient * f.meanSqDxdTheta * om;
+    return (f.constantTorque + n * f.coulombForce * f.meanAbsDxdTheta) * s + n * f.viscousCoefficient * f.meanSqDxdTheta * om;
   }
 
   // ===========================================================================================
@@ -1004,6 +1111,12 @@ export class CycleModel {
     }
     this.t = tStart + h;
     if (P) this.prof.steps++;
+    // load energy ∫T_L ω dt of a speed-dependent load over the engine cycle (trapezoid; engine summary)
+    if (this.op.speedMode === 'free' && this.load.kind !== 'constant') {
+      const w0 = this.y0[I_OM];
+      const w1 = y[I_OM];
+      this.loadWork += 0.5 * h * (this.load.torque(w0) * w0 + this.load.torque(w1) * w1);
+    }
     // ---- operator splits and bookkeeping ----
     for (let i = 0; i < n; i++) cyls[i].afterStep(h);
     // ---- events at the landing angle ----
@@ -1104,7 +1217,11 @@ export class CycleModel {
     // heater is downstream, so the throat flow is air at T_amb and the fresh-charge stream is
     // ṁ_air/Y_air,fresh (round 1 flowed the heated, vaporised mixture through the throat: 18 % less
     // mass at a given depression in MON — validation round 2). Backflow: plenum gas.
-    let mV = orificeFlow(this.cdaVenturi, this.ambient.p, this.ambient.T, this.ambient.R, this.ambient.gamma, ip.state.p, ip.state.T, ip.state.R, ip.state.gamma, this.ofV);
+    // (with a separate butterfly: venturi and throttle plate as compressible restrictions in series)
+    const amb = this.ambient;
+    let mV = this.carb
+      ? this.carb.flow(amb.p, amb.T, amb.R, amb.gamma, ip.state.p, ip.state.T, ip.state.R, ip.state.gamma, this.ofV as SeriesOrificeFlow)
+      : orificeFlow(this.cdaVenturi, amb.p, amb.T, amb.R, amb.gamma, ip.state.p, ip.state.T, ip.state.R, ip.state.gamma, this.ofV);
     if (mV > 0) {
       const f = this.freshPerAir;
       mV *= f;
@@ -1194,12 +1311,17 @@ export class CycleModel {
     // ---- mechanics ----
     dy[I_TH] = om * RAD2DEG;
     if (this.op.speedMode === 'free') {
-      let a: number;
-      if (n === 1) {
-        const c = this.c0;
-        const ext = -this.op.loadTorque + this.friction.torque(c.ks.dxdTheta, om);
-        a = c.dyn.angularAcceleration(th * DEG, om, c.p, this.pCrankcase, ext);
-      } else a = this.multiCylinderAcceleration(th, om);
+      // rigid crank: Σ_i gas + gravity − ½J′_m ω² torques of the cylinders at their throw phases, the
+      // whole-engine friction and −T_load, over J_rot + J_load + ΣJ_m (mechanics MultiCylinderCrankTrain,
+      // FrictionTorqueModel.torqueCylinders, LoadModel); the THERMODYNAMIC cylinder pressures (the
+      // synthesised knock field exerts no net force on the piston)
+      const thr = th * DEG;
+      const dx = this.crank.update(thr);
+      const pc = this.pCyl;
+      for (let i = 0; i < n; i++) pc[i] = cyls[i].p;
+      const ld = this.load;
+      const ext = -ld.torque(om) + this.friction.torqueCylinders(dx, om);
+      let a = this.crank.angularAcceleration(thr, om, pc, this.pCrankcase, ext, ld.inertia());
       // Stall guard (numerical): a time-stepped cycle cannot represent a stopped crank, so the speed
       // is held at FREE_MODE_MIN_RPM when the torques would decelerate it further.
       if (om <= FREE_MODE_MIN_OMEGA && a < 0) a = 0;
@@ -1214,27 +1336,6 @@ export class CycleModel {
       if (this.c0.mode === MODE_OPEN) this.prof.rhsOpen += dt;
       else this.prof.rhsClosed += dt;
     }
-  }
-
-  /**
-   * TEMPORARY multi-cylinder free-speed crank dynamics (to be replaced by the multi-cylinder crank train
-   * at integration): the cylinders' slider cranks on one rigid crankshaft,
-   *   α = (Σ_i [T_gas,i + T_grav,i − ½ J′_m,i ω²] + Σ_i T_f,i − T_load) / (J_rot + Σ_i J_m,i),
-   * each evaluated at its local angle (CrankTrainDynamics.evaluate at α = 0 gives the inertia torque
-   * −½ J′_m ω²), the friction distributed per cylinder (FrictionTorqueModel normalised per cylinder),
-   * T_load = op.loadTorque (constant load only; see checkSupported).
-   */
-  private multiCylinderAcceleration(th: number, om: number): number {
-    const cyls = this.cylinders;
-    let T = -this.op.loadTorque;
-    let J = this.c0.dyn.rotatingInertia;
-    for (let i = 0; i < cyls.length; i++) {
-      const c = cyls[i];
-      const s = c.dyn.evaluate(c.localAngle(th) * DEG, om, 0, c.p, this.pCrankcase, this.cts);
-      T += s.gasTorque + s.gravityTorque + s.inertiaTorque + this.friction.torque(c.ks.dxdTheta, om);
-      J += s.mechanismInertia;
-    }
-    return T / J;
   }
 
   // ===========================================================================================
@@ -1367,8 +1468,8 @@ export class CycleModel {
   get kin(): SliderCrank { return this.c0.kin; }
   get ks(): KinematicState { return this.c0.ks; }
   get dyn(): CrankTrainDynamics { return this.c0.dyn; }
-  get ivLift(): ValveLiftProfile { return this.c0.ivLift; }
-  get evLift(): ValveLiftProfile { return this.c0.evLift; }
+  get ivLift(): LiftProfile { return this.c0.ivLift; }
+  get evLift(): LiftProfile { return this.c0.evLift; }
   get ivFlow(): ValveFlowModel { return this.c0.ivFlow; }
   get evFlow(): ValveFlowModel { return this.c0.evFlow; }
   get flameGeom(): FlameGeometry { return this.c0.flameGeom; }

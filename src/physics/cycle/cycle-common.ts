@@ -141,9 +141,20 @@ export function cylinderStateIndex(i: number): Readonly<CylinderStateIndex> {
   });
 }
 
-/** Length of the state vector of an engine with n cylinders. */
+/** Length of the state vector of an engine with n cylinders (without the block-surface heat ledgers). */
 export function stateLength(n: number): number {
   return NY + (n - 1) * CYLINDER_BLOCK_SIZE;
+}
+
+/**
+ * Index of cylinder i's 6th per-surface heat ledger (∫ gas-to-BLOCK heat flow dt, J: the block deck /
+ * valve-pocket floor of an 'l-head' chamber, heat-transfer/wall-heat WALL_BLOCK) in an engine of n
+ * cylinders. These ledgers exist only for chambers with a block surface and are APPENDED after every
+ * cylinder block (one per cylinder), so a flat-disc engine keeps its layout (the CFR F-1: NY, five
+ * surface ledgers) and the per-cylinder blocks keep CYLINDER_BLOCK_SIZE.
+ */
+export function blockLedgerIndex(n: number, i: number): number {
+  return stateLength(n) + i;
 }
 
 /** Cylinder modes. */

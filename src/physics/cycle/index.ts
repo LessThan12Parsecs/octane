@@ -14,24 +14,31 @@
  *    stability interval is 2.78 and its amplification stays positive — no chatter),
  *    h ≤ τ_b (burn-up), h ≤ 0.2 m_u/ṁ_b, h ≤ ¼ τ_ab during the end-gas burn-up.
  *  - Open phase: single well-mixed cylinder zone (N, U, burned-gas scalar) between an intake
- *    plenum (fed through the carburettor venturi with the fresh charge) and an exhaust plenum
- *    (outlet orifice to ambient); lash-corrected valve lift × direction-dependent C_D ×
- *    compressible orifice flow; Woschni gas-exchange heat transfer.
+ *    plenum (fed through the carburettor venturi with the fresh charge; a separate butterfly in
+ *    series when manifolds.venturiDiameter is set) and an exhaust plenum (outlet orifice to
+ *    ambient); lash-corrected valve lift of the spec's cam (polydyne / three-arc flat follower /
+ *    table) × direction-dependent C_D (side valves: pocket roof and pocket → bore transfer) ×
+ *    compressible orifice flow; Woschni gas-exchange heat transfer over the chamber's surfaces.
  *  - Closed phase: two zones at common p — frozen unburned (U_tot, S_u, m_u conserved-form
  *    states, isentropic except wall heat loss) and burned gas in chemical equilibrium at
  *    (T_b, p), closed by a 2-D Newton on (p, T_b) with the analytic equilibrium Jacobian.
- *  - Combustion: IgnitionSystem (coil, breakdown, arc/glow, Herweg–Maly kernel) → entrainment +
- *    burn-up (Keck 1982) with the K–k turbulence, Taylor-microscale burn-up, S_L tables and the
- *    exact sphere ∩ disc flame geometry; alternatives 'instantaneous-at-tdc', 'wiebe', 'none'.
+ *  - Combustion: IgnitionSystem (inductive coil, or the trembler-magneto spark train of one timer
+ *    contact; breakdown, arc/glow, Herweg–Maly kernel) → entrainment + burn-up (Keck 1982) with the K–k
+ *    turbulence, Taylor-microscale burn-up, S_L tables and the exact sphere ∩ chamber geometry
+ *    (combustion CombustionChamber: flat disc or L-head); alternatives 'instantaneous-at-tdc', 'wiebe',
+ *    'none'.
  *  - Knock: Livengood–Wu from IVC on the end gas ahead of the front (Douaud–Eyzat τ by default,
  *    CFR_KNOCK_DELAY_MODEL; LLNL detailed-chemistry tables, single- or two-stage, as options) →
  *    end-gas burn-up (τ_ab from the history-integrated ignition-time spread of a ΔT-stratified end
- *    gas) and the KnockOscillator acoustic modes (sub-stepped ≤ 2 µs with the exact exponential
+ *    gas) and the KnockOscillator acoustic modes of the chamber (Bessel modes of the bore; the
+ *    depth-averaged planform modes of an L-head) (sub-stepped ≤ 2 µs with the exact exponential
  *    release; reported pressure only). Fuels the delay model does not cover (CH4, C3H8, C2H5OH with
  *    the PRF models) have knock disabled (CycleModel.knockAvailable, integral 0).
  *  - NO: rate-controlled extended Zeldovich on the burned equilibrium state (exact step);
  *    frozen at EVO with elements conserved.
- *  - Mechanics: exact slider crank; fixed speed or free crank dynamics with PNH friction.
+ *  - Mechanics: exact slider crank; fixed speed or free crank dynamics of the rigid multi-cylinder
+ *    crank train with the whole-engine PNH friction and the load model of op.load (constant, brake,
+ *    vehicle road load with the car's reflected inertia, neutral).
  *  - Operator splits (first order in the step): spark energy / kernel mass, end-gas burn-up,
  *    NO, burn-out merge, LW integral.
  * Energy: dU_tot = −p dV − Q̇_wall + P_spark exactly (U_tot is a state; every mass transfer between
@@ -49,9 +56,10 @@
  *    cylinder's state at its local angle; the legacy single-cylinder fields (p, Tu, closure, knockOsc, …)
  *    are cylinder 0's.
  *  - Summaries: one CycleSummary per cylinder and local cycle (`cylinder` = index for N > 1, `cycle` =
- *    the cylinder's local cycle number); cylinder 0's carries the EngineCycleSummary (`engine`: brake /
- *    indicated / friction torque, power, MEPs over the total displacement, air and fuel flow, η_v,
- *    BSFC, brake efficiency, load).
+ *    the cylinder's local cycle number; trembler-magneto: `sparkDeg` / `sparkCount` of the train);
+ *    cylinder 0's carries the EngineCycleSummary (`engine`: brake / indicated / friction torque, power,
+ *    MEPs over the total displacement, air and fuel flow, η_v, BSFC, brake efficiency, load, vehicle
+ *    speed).
  *  - {@link runClosedCycle}: closed-cycle-only run from a prescribed IVC state (validation; one cylinder).
  *  - {@link CycleModelOptions}: heatTransfer, combustionModel, wiebe, knock, ignitionDelayModel,
  *    knockIntegral, turbulentFlameClosure, calibration parameters (burnRateMultiplier,
@@ -98,6 +106,7 @@ export {
   cylinderCount,
   cylinderStateIndex,
   stateLength,
+  blockLedgerIndex,
   CYLINDER_BLOCK_SIZE,
   newCycleTrace,
   swapNO,

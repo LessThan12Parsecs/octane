@@ -13,17 +13,25 @@
  * for cylinder 0. Every *Deg field of a cylinder (events, ignition command, CA10…, knock onset, peak
  * angle) is local.
  *
- * Extension points (Model T integration):
- *  - chamber: every FlameGeometry / flatChamberAreas / discScale / integralLengthScale call site is a
- *    method of this class — evalOpen and evalClosed (areas, length scale, discScale, flame radius and
- *    front area, two-zone heat split, crevice burned fraction), clampRadiusGuess, endGasCircleRadius,
- *    handoffEntrainedMass, flameRadius, frontAtWalls, createBurnedZone (Lref) — plus
- *    engine-simulator.ts cylinderSnapshot (kernel/flame radius → area);
+ * Sub-model wiring (Model T integration):
+ *  - chamber: every burn / heat geometry call goes through this.chamber (combustion/chamber.ts
+ *    CombustionChamber from createChamber(spec)): the flame volume / front area / radius of the
+ *    entrained and burned spheres, the chamber volume (discScale), the turbulence length-scale height
+ *    (meanDepth), the wall surfaces and their burned fractions (heat-transfer/wall-heat per-surface path:
+ *    head, piston, liner, valve faces and — 'l-head' only — the block deck with its own heat ledger) and
+ *    the crevice-mouth burned fraction. 'flat-disc' (the CFR) is the DiscChamber adapter over
+ *    FlameGeometry + flatChamberAreas, bit-identical to the former direct calls; the slider crank is
+ *    built from sliderCrankGeometry(g) (fixed chamber volume of the L-head pocket);
  *  - ignition: CycleModel.createIgnitionSystem(cylinder) builds this.ign; prepareIgnitionCommand sets
- *    the per-cycle command (inductive: dwell start and switch-off); ignitionSplit is the per-step call;
- *    finePhase decides the fine steps; EngineSimulator.nextDenseTime the dense snapshot sampling;
- *  - valve lift / flow: CycleModel.createValveLift / createValveFlow (factories);
- *  - knock: CycleModel.createKnockOscillator (factory).
+ *    the per-cycle command (inductive: dwell start and switch-off; trembler-magneto: the timer contact
+ *    make/break of the spark lever, tremblerTimerCommand); ignitionSplit is the per-step call (the
+ *    trembler's spark TRAIN: event start at the timer make, sparkFired at the first breakdown, kernel
+ *    window from the make, hand-off at kernelStartTime + handoffTime, re-seeded kernels); finePhase
+ *    decides the fine steps; EngineSimulator's dense snapshot sampling follows the train;
+ *  - valve lift / flow: CycleModel.createValveLift / createValveFlow (createLiftProfile: polydyne or
+ *    three-arc cam; createValveFlowModel: side-valve roof + pocket-transfer stages);
+ *  - knock: CycleModel.createKnockOscillator (chemistry createKnockOscillator: disc or L-head modes) and
+ *    KnockOscillator.setEndGasVolumeFraction at the onset.
  */
 import { DEG, RAD2DEG, R_UNIVERSAL } from '../core/constants';
 import type { WallSpec } from '../core/engine-spec';
@@ -44,42 +52,46 @@ import {
   angularMomentumLengthScale,
   DISSIPATION_COEFFICIENT,
   entrainmentRates,
-  FlameGeometry,
   integralLengthScale,
   intakeJetVelocity,
   keckCharacteristicLength,
   keckCharacteristicSpeed,
   keckMeanInletSpeed,
   laminarFlameSpeed,
-  lensArea,
   lewisNumbers,
   marksteinLengths,
   meanFlowVelocity,
+  newChamberResult,
   newEntrainmentInputs,
   newEntrainmentRates,
-  newFlameGeometryResult,
   newTurbulenceInputs,
   newTurbulenceRates,
+  sliderCrankGeometry,
   taylorMicroscale,
   turbulenceDerivatives,
   turbulenceIntensity,
+  type CombustionChamber,
+  type FlameGeometry,
   type LewisNumbers,
   type MarksteinResult,
   type TurbulenceState,
 } from '../combustion';
-import { newOrificeFlow, orificeFlow, Plenum, ValveFlowModel, ValveLiftProfile, newValveJet } from '../gas-exchange';
+import { newOrificeFlow, orificeFlow, Plenum, ValveFlowModel, newValveJet, type LiftProfile } from '../gas-exchange';
 import {
-  flatChamberAreas,
   hohenbergCoefficient,
-  newChamberAreas,
+  N_WALL_SURFACES,
+  newWallSurfaceArray,
+  newWallSurfaceHeatResult,
+  WALL_BLOCK,
   WOSCHNI_CONSTANTS,
-  newWallHeatResult,
-  wallHeatLoss,
-  wallHeatLossTwoZone,
+  wallHeatLossSurfaces,
+  wallHeatLossTwoZoneSurfaces,
+  wallSurfaceResistances,
+  wallSurfaceTemperatures,
   woschniCoefficient,
   type WoschniInputs,
 } from '../heat-transfer';
-import { IgnitionSystem, type IgnitionCommand, type IgnitionGasState } from '../ignition';
+import { IgnitionSystem, tremblerTimerCommand, type IgnitionCommand, type IgnitionGasState } from '../ignition';
 import { CrankTrainDynamics, newKinematicState, SliderCrank } from '../mechanics';
 import { completeCombustionProducts, freshCharge, lowerHeatingValue, type FuelBlend } from '../thermo/fuels';
 import { mixCpMass, mixCvMass, mixCvMolar, mixHMolar, mixMolarMass, mixSMass, mixSMolar, mixThermalConductivity, mixUMolar, mixViscosity, temperatureFromUMolar } from '../thermo';
@@ -166,16 +178,25 @@ export class Cylinder {
   private readonly iQS: number;
   private readonly iCRU: number;
   private readonly iCRB: number;
+  /** Block-surface heat ledger (−1: the chamber has no block surface; blockLedgerIndex). */
+  private readonly iQB: number;
 
   // ---- sub-models ----
   readonly kin: SliderCrank;
   readonly ks = newKinematicState();
   readonly dyn: CrankTrainDynamics;
-  readonly ivLift: ValveLiftProfile;
-  readonly evLift: ValveLiftProfile;
+  readonly ivLift: LiftProfile;
+  readonly evLift: LiftProfile;
   readonly ivFlow: ValveFlowModel;
   readonly evFlow: ValveFlowModel;
-  readonly flameGeom: FlameGeometry;
+  /** Chamber geometry (flame sphere ∩ chamber, wall surfaces, length-scale height); one evaluator per cylinder. */
+  readonly chamber: CombustionChamber;
+  /** Number of wall surfaces with heat ledgers: 5 (flat disc) or 6 (with the 'l-head' block deck). */
+  readonly nSurfaces: number;
+  /** Side-valve L-head: crown height above the deck at TDC (pocket-transfer area of the valve flow), m; NaN otherwise. */
+  private readonly crownAboveDeckTDC: number;
+  /** Trembler-magneto ignition (spark train per timer contact) instead of an inductive coil. */
+  readonly trembler: boolean;
   readonly closure = new ZoneClosure();
   readonly eqAux = new EquilibriumSolver();
   ign: IgnitionSystem | null = null;
@@ -242,10 +263,12 @@ export class Cylinder {
   Qcr = 0;
   /** Lumped wall model active (spec.walls.thermalResistance and options.wallTemperatureModel 'lumped'). */
   private readonly wallsLumped: boolean;
-  /** Wall excess over the coolant, K: head, piston, liner, intake valve, exhaust valve. */
-  readonly wallExcess = new Float64Array(5);
+  /** Wall excess over the coolant, K: head, piston, liner, intake valve, exhaust valve (, block). */
+  readonly wallExcess = new Float64Array(N_WALL_SURFACES);
   /** Surface heat ledgers and time at the start of the current local cycle. */
-  private readonly qsCycleStart = new Float64Array(5);
+  private readonly qsCycleStart = new Float64Array(N_WALL_SURFACES);
+  /** Surface temperatures of this.walls in WALL_* order (wallSurfaceTemperatures), K. */
+  private readonly Tw6 = newWallSurfaceArray();
   tCycleStart = 0;
   // viscosity table of the frozen unburned mixture (T grid)
   private readonly muTab = new Float64Array(100);
@@ -319,12 +342,18 @@ export class Cylinder {
   electrodeLoss = 0;
   private suLast = 0;
   private TmotGuess = 400;
-  /** True once this cycle's dwell has started (the ignition state then belongs to this cycle). */
+  /** True once this cycle's dwell (trembler: timer contact) has started (the ignition state then belongs to this cycle). */
   dwellSeen = false;
-  /** Time of this cycle's spark command (primary switch-off), s (NaN before). */
+  /** Time of the start of this cycle's ignition event (sparkEventDeg: switch-off; trembler: timer make), s (NaN before). */
   tSparkCmd = NaN;
   /** Livengood–Wu crossing located by the engine's step redo: force the onset at the end of this step. */
   lwForce = false;
+  /** Trembler: ignition-clock creation time of the kernel whose mass is being transferred (re-seed detection). */
+  private kernelStart = NaN;
+  /** Trembler: points openings of the current event already seen (dense-sampling interrupt). */
+  private tripsSeen = 0;
+  /** Trembler: model time of this cycle's timer break (NaN before). */
+  tTimerBreak = NaN;
   /** Delay τ at the end of the current RK step (set by the engine's crossing test), s. */
   tauStepEnd = NaN;
   /** Fraction of the tentative step at which this cylinder's LW integral reaches 1 (−1: none; engine scratch). */
@@ -426,11 +455,13 @@ export class Cylinder {
   private readonly ofIv = newOrificeFlow();
   private readonly ofEv = newOrificeFlow();
   private readonly jet = newValveJet();
-  private readonly areas = newChamberAreas();
-  private readonly heat = newWallHeatResult();
-  private readonly fg = newFlameGeometryResult();
-  private readonly fgB = newFlameGeometryResult();
-  private readonly fgR = newFlameGeometryResult();
+  /** Wall surface areas at the current height (chamber.surfaceAreas), m². */
+  private readonly areas6 = newWallSurfaceArray();
+  private readonly heat6 = newWallSurfaceHeatResult();
+  /** Burned sphere ∩ chamber (two-zone heat split, crevice mouth) and the hand-off kernel sphere. */
+  private readonly chB = newChamberResult();
+  private readonly chR = newChamberResult();
+  private readonly rs6 = newWallSurfaceArray();
   private readonly woschni: WoschniInputs = {
     bore: 0, pressure: 0, temperature: 0, meanPistonSpeed: 0, phase: 'gas-exchange',
     motoredPressure: 0, displacedVolume: 0, refPressure: 0, refTemperature: 0, refVolume: 0, variant: 'woschni1967',
@@ -454,9 +485,9 @@ export class Cylinder {
   /**
    * @param engine the engine (its spec, options and operating point must be set)
    * @param index 0-based cylinder index; @param ix its state indices
-   * @param flameGeom flame geometry (shared by identical cylinders), or null to build one
+   * @param iQB index of its block-surface heat ledger (−1: none — flat-disc chamber)
    */
-  constructor(engine: CycleModel, index: number, ix: Readonly<CylinderStateIndex>, flameGeom: FlameGeometry | null) {
+  constructor(engine: CycleModel, index: number, ix: Readonly<CylinderStateIndex>, iQB: number) {
     const spec = engine.spec;
     const opts = engine.opts;
     this.e = engine;
@@ -485,21 +516,22 @@ export class Cylinder {
     this.iQS = ix.QS;
     this.iCRU = ix.CRU;
     this.iCRB = ix.CRB;
+    this.iQB = iQB;
     this.fuelTrapped = engine.fuel;
     this.phiTrapped = engine.op.equivalenceRatio;
     const g = spec.geometry;
-    this.kin = new SliderCrank(g, engine.op.compressionRatio);
+    // (sliderCrankGeometry: the L-head's fixed pocket volume, so h(θ) is the depth of the bore column;
+    // identical to the bare geometry for a flat disc)
+    this.kin = new SliderCrank(sliderCrankGeometry(g), engine.op.compressionRatio);
     this.dyn = new CrankTrainDynamics(this.kin, spec.masses);
     this.ivLift = engine.createValveLift(this, 'intake');
     this.evLift = engine.createValveLift(this, 'exhaust');
     this.ivFlow = engine.createValveFlow(this, 'intake');
     this.evFlow = engine.createValveFlow(this, 'exhaust');
-    // Flame-geometry table must cover the tallest chamber: stroke + h_TDC at the lowest CR.
-    if (flameGeom) this.flameGeom = flameGeom;
-    else {
-      const hMax = this.kin.pistonTravel + this.kin.clearanceHeightTDCForCR(g.compressionRatioRange[0]);
-      this.flameGeom = new FlameGeometry(g.bore, spec.sparkPlug.gapCenter, { maxHeight: hMax * 1.02 });
-    }
+    this.chamber = engine.createChamber(this);
+    this.nSurfaces = iQB >= 0 ? N_WALL_SURFACES : 5;
+    this.crownAboveDeckTDC = g.chamber === 'l-head' && g.lHead ? g.lHead.crownAboveDeckAtTDC : Number.NaN;
+    this.trembler = spec.ignition.type === 'trembler-magneto';
     this.knockOsc = engine.createKnockOscillator(this);
     const X0 = new Float64Array(NS);
     X0[SP.N2] = 1;
@@ -525,6 +557,20 @@ export class Cylinder {
   /** Current local crank angle, deg. */
   get theta(): number {
     return this.localAngle(this.e.y[I_TH]);
+  }
+
+  /** The bore-column sphere ∩ disc geometry of the chamber (legacy accessor; flat disc: the whole chamber). */
+  get flameGeom(): FlameGeometry {
+    return this.chamber.flame;
+  }
+
+  /**
+   * Local angle at which this cycle's ignition EVENT starts: the spark command (switch-off) of an
+   * inductive coil; the timer MAKE of a trembler-magneto ignition (the first spark follows after the coil's
+   * firing time). Fine steps, the kernel window and the spark-event snapshot start here.
+   */
+  get sparkEventDeg(): number {
+    return this.trembler ? this.ignCmd.dwellStartDeg : this.ignCmd.sparkDeg;
   }
 
   /** Engine angle of a local angle a of the current local cycle, deg. */
@@ -601,6 +647,7 @@ export class Cylinder {
       this.wallExcess[2] = w.linerTemperature - Tc;
       this.wallExcess[3] = w.intakeValveTemperature - Tc;
       this.wallExcess[4] = w.exhaustValveTemperature - Tc;
+      this.wallExcess[WALL_BLOCK] = (w.blockTemperature ?? w.linerTemperature) - Tc;
       this.qsCycleStart.fill(0);
       this.tCycleStart = 0;
     }
@@ -671,6 +718,9 @@ export class Cylinder {
   resetCycleFlags(): void {
     this.dwellSeen = false;
     this.tSparkCmd = NaN;
+    this.kernelStart = NaN;
+    this.tripsSeen = 0;
+    this.tTimerBreak = NaN;
     this.sparkFired = false;
     this.kernelMassPrev = 0;
     this.handedOff = false;
@@ -734,6 +784,7 @@ export class Cylinder {
         intakeValveTemperature: Tc + ex[3],
         exhaustValveTemperature: Tc + ex[4],
       };
+      if (this.nSurfaces > 5) this.walls.blockTemperature = Tc + ex[WALL_BLOCK];
       // intake port (in the water-cooled head): its excess over the coolant scales with the head's
       // (UNVERIFIED assumption; the port gets its heat through the head casting)
       if (Tp !== undefined) Tp = Tc + (Tp - Tref) * (ex[0] / Math.max(1, w.headTemperature - Tref)) - dT;
@@ -745,7 +796,10 @@ export class Cylinder {
         intakeValveTemperature: w.intakeValveTemperature + dT,
         exhaustValveTemperature: w.exhaustValveTemperature + dT,
       };
+      // (the block deck of an L-head; absent in the spec: the liner temperature, wallSurfaceTemperatures)
+      if (this.nSurfaces > 5) this.walls.blockTemperature = (w.blockTemperature ?? w.linerTemperature) + dT;
     }
+    wallSurfaceTemperatures(this.walls, this.Tw6);
     this.wallTavg = (this.walls.headTemperature + this.walls.pistonTemperature + this.walls.linerTemperature) / 3;
     // intake-port heat transfer (Dittus–Boelter over the heated port; see evaluate)
     const Lp = m.intakePortLength ?? 0;
@@ -768,11 +822,17 @@ export class Cylinder {
 
   /**
    * Ignition command of the local cycle starting now (inductive: dwell start = switch-off − dwell time
-   * at the current speed, switch-off at −sparkAdvanceDeg). Extension point for the trembler-magneto timer
-   * (command = the timer contact window of this cylinder).
+   * at the current speed, switch-off at −sparkAdvanceDeg; trembler-magneto: this cylinder's timer contact,
+   * make at the spark lever −sparkAdvanceDeg (clamped to the lever range), break contactArcDeg later —
+   * ignition tremblerTimerCommand). Returns the dwell-start (timer make) angle.
    */
   prepareIgnitionCommand(): number {
     const op = this.e.op;
+    const ig = this.e.spec.ignition;
+    if (ig.type === 'trembler-magneto') {
+      tremblerTimerCommand(ig, op.sparkAdvanceDeg, this.ignCmd);
+      return this.ignCmd.dwellStartDeg;
+    }
     const omegaDeg = this.e.y[I_OM] * RAD2DEG;
     const sparkDeg = -op.sparkAdvanceDeg;
     this.ignCmd.sparkDeg = sparkDeg;
@@ -805,8 +865,9 @@ export class Cylinder {
     this.addEvent(180, EV_BDC_END);
     if (cm === 'instantaneous-at-tdc') this.addEvent(0, EV_TDC);
     if (cm === 'entrainment') {
+      // dwell start (timer make) and switch-off (timer break); = −sparkAdvanceDeg for an inductive coil
       this.addEvent(dwell, EV_IGN);
-      this.addEvent(sparkDeg, EV_IGN);
+      this.addEvent(this.ignCmd.sparkDeg, EV_IGN);
     }
     if (cm === 'wiebe') {
       this.wiebeStart = e.opts.wiebe.startDeg ?? sparkDeg;
@@ -848,12 +909,18 @@ export class Cylinder {
   // Step control
   // ===========================================================================================
 
+  /**
+   * Fine steps (options.fineStepDeg) from the start of the ignition event (inductive: the switch-off;
+   * trembler: the timer make — the train's first spark comes 1–4 ms later) through the kernel until the
+   * hand-off, then until 2 % of the charge has burned.
+   */
   finePhase(): boolean {
     if (!this.ign) return false;
     const th = this.theta;
-    if (th < this.ignCmd.sparkDeg - 1e-9 && !this.sparkFired) return false;
+    const a = this.sparkEventDeg;
+    if (th < a - 1e-9 && !this.sparkFired) return false;
     if (this.misfire || this.kernelQuenched || this.burnDone || this.mode === MODE_OPEN) return false;
-    if (!this.handedOff) return this.sparkFired || th >= this.ignCmd.sparkDeg - 1e-9;
+    if (!this.handedOff) return this.sparkFired || th >= a - 1e-9;
     return this.xb < 0.02;
   }
 
@@ -964,8 +1031,18 @@ export class Cylinder {
     dy[this.iMK] = 0;
     dy[this.iCEG] = 0;
     for (let i = 0; i < 5; i++) dy[this.iQS + i] = 0;
+    if (this.iQB >= 0) dy[this.iQB] = 0;
     dy[this.iCRU] = 0;
     dy[this.iCRB] = 0;
+  }
+
+  /**
+   * Height of the piston crown above the block deck at the current evaluation, m (side-valve L-head:
+   * the pocket-transfer section of the valve flow, valve-flow.ts lHeadPocketTransfer; undefined for
+   * other chambers — the valve flow then has no transfer stage).
+   */
+  private crownAboveDeck(): number | undefined {
+    return Number.isNaN(this.crownAboveDeckTDC) ? undefined : this.crownAboveDeckTDC - this.ks.x;
   }
 
   private evalOpen(y: Float64Array, dy: Float64Array, th: number, acc: boolean): void {
@@ -993,8 +1070,10 @@ export class Cylinder {
     const Li = this.ivLift.lift(th);
     let mIv = 0;
     let cdaI = 0;
+    // (side valves: the pocket → bore transfer section in series, from the crown height; ignored otherwise)
+    const crown = this.crownAboveDeck();
     if (Li > 0) {
-      cdaI = cdm * this.ivFlow.effectiveArea(Li, sc.p > si.p);
+      cdaI = cdm * this.ivFlow.effectiveArea(Li, sc.p > si.p, crown);
       mIv = orificeFlow(cdaI, si.p, si.T, si.R, si.gamma, sc.p, sc.T, sc.R, sc.gamma, this.ofIv);
     } else {
       this.ofIv.dmdotdpa = 0;
@@ -1005,7 +1084,7 @@ export class Cylinder {
     let mEv = 0;
     let cdaE = 0;
     if (Le > 0) {
-      cdaE = cdm * this.evFlow.effectiveArea(Le, se.p > sc.p);
+      cdaE = cdm * this.evFlow.effectiveArea(Le, se.p > sc.p, crown);
       mEv = orificeFlow(cdaE, sc.p, sc.T, sc.R, sc.gamma, se.p, se.T, se.R, se.gamma, this.ofEv);
     } else {
       this.ofEv.dmdotdpa = 0;
@@ -1034,8 +1113,8 @@ export class Cylinder {
       w.variant = opts.woschniVariant;
       const hc = opts.woschniMultiplier * (opts.heatTransferCorrelation === 'hohenberg' ? hohenbergCoefficient(this.V, sc.p, sc.T, w.meanPistonSpeed) : woschniCoefficient(w));
       this.hcoef = hc;
-      flatChamberAreas(e.spec.geometry.bore, this.h, e.spec.intakeValve, e.spec.exhaustValve, this.areas);
-      Q = wallHeatLoss(hc, sc.T, this.areas, this.walls, this.heat);
+      this.chamber.surfaceAreas(this.h, this.areas6);
+      Q = wallHeatLossSurfaces(hc, sc.T, this.areas6, this.Tw6, this.heat6);
       this.surfaceHeatRates(dy, 1);
     }
     if (P) e.prof.heat += now() - tq;
@@ -1104,7 +1183,7 @@ export class Cylinder {
     ti.mDotIn = mIn;
     ti.mDotOut = mOut;
     ti.vIn = mIn > 0 ? Math.sqrt(e2 / mIn) : 0;
-    ti.L = integralLengthScale(this.h, e.spec.geometry.bore, e.lengthFraction);
+    ti.L = integralLengthScale(this.chamber.meanDepth(this.h), e.spec.geometry.bore, e.lengthFraction);
     ti.dlnRhoDt = (mIn - mOut) / m - this.Vdot / this.V;
     ti.swirlTorqueIn = swirlIn;
     ti.rho = sc.rho;
@@ -1187,7 +1266,8 @@ export class Cylinder {
     const Vb = mode === MODE_SINGLE ? 0 : mb * cl.vb;
     // turbulence length scale and intensity (unburned zone)
     const bore = e.spec.geometry.bore;
-    let L = integralLengthScale(this.h, bore, e.lengthFraction);
+    const ch = this.chamber;
+    let L = integralLengthScale(ch.meanDepth(this.h), bore, e.lengthFraction);
     if (mode === MODE_TWO && this.rhoRef > 0 && this.rhoU > 0) {
       const La = angularMomentumLengthScale(this.Lref, this.rhoRef, this.rhoU);
       if (La < L) L = La;
@@ -1202,27 +1282,27 @@ export class Cylinder {
     this.Af = 0;
     this.tauB = Infinity;
     this.burnSpeed = 0;
-    // Zone volumes are mapped onto the disc chamber of the flame geometry in proportion to its share
-    // of the cylinder volume, discScale = A_p h / V = 1 − V_crevice/V: the lumped crevice volume
-    // (part of V, SliderCrank) holds unburned charge that is distributed over the chamber, so the
-    // front reaches the far corner exactly when the whole charge is entrained (round 1 mapped V_e
-    // onto the disc alone: the last V_crevice·ρ_u ≈ 0.8 % of the charge was never entrained and
-    // non-knocking cycles never burned out). Crevice gas thus burns with the charge (no crevice
-    // storage / blow-by model).
-    const discScale = (this.kin.boreArea * this.h) / V;
+    // Zone volumes are mapped onto the flame-reachable chamber in proportion to its share of the
+    // cylinder volume, discScale = V_chamber/V = 1 − V_crevice/V (V_chamber = A_p h for the disc,
+    // A_p h + the L-head pocket): the lumped crevice volume (part of V, SliderCrank) holds unburned charge
+    // that is distributed over the chamber, so the front reaches the far corner exactly when the whole
+    // charge is entrained (round 1 mapped V_e onto the disc alone: the last V_crevice·ρ_u ≈ 0.8 % of the
+    // charge was never entrained and non-knocking cycles never burned out). Crevice gas thus burns with
+    // the charge (no crevice storage / blow-by model).
+    const discScale = ch.chamberVolume(this.h) / V;
     this.discScale = discScale;
     if (mode === MODE_TWO) {
-      // equivalent radius of the burned gas in the chamber (flame-centred sphere ∩ disc)
-      this.rb = this.flameGeom.radiusForVolume(Vb * discScale, this.h, this.clampRadiusGuess(this.rbGuess, this.h));
+      // equivalent radius of the burned gas in the chamber (flame-centred sphere ∩ chamber)
+      this.rb = ch.radiusForVolume(Vb * discScale, this.h, this.clampRadiusGuess(this.rbGuess, this.h));
       this.rbGuess = this.rb;
     }
     if (mode === MODE_TWO && this.flameActive) {
       const me = y[this.iME];
       const Ve = Vb + (me > mb ? (me - mb) * vu : 0);
-      this.rf = this.flameGeom.radiusForVolume(Ve * discScale, this.h, this.clampRadiusGuess(this.rfGuess, this.h));
+      this.rf = ch.radiusForVolume(Ve * discScale, this.h, this.clampRadiusGuess(this.rfGuess, this.h));
       this.rfGuess = this.rf;
-      this.flameGeom.evaluate(this.rf, this.h, this.fg);
-      this.Af = this.fg.frontArea > 0 ? this.fg.frontArea : 0;
+      const af = ch.frontArea(this.rf, this.h);
+      this.Af = af > 0 ? af : 0;
       let uT = opts.burnRateMultiplier * up;
       if (e.keck && this.rhoInlet > 0) {
         // Keck 1982 eq. 4.10 / Fig. 15 empirical closures (entrainment.ts)
@@ -1300,12 +1380,13 @@ export class Cylinder {
       }
       const hc = opts.woschniMultiplier * (opts.heatTransferCorrelation === 'hohenberg' ? hohenbergCoefficient(this.V, p, this.T, w.meanPistonSpeed) : woschniCoefficient(w));
       this.hcoef = hc;
-      flatChamberAreas(bore, this.h, e.spec.intakeValve, e.spec.exhaustValve, this.areas);
+      ch.surfaceAreas(this.h, this.areas6);
       if (mode === MODE_TWO) {
-        this.flameGeom.evaluate(this.rb, this.h, this.fgB);
-        wallHeatLossTwoZone(hc, this.Tu, this.Tb, this.areas, this.fgB, this.walls, this.heat);
-        Qu = this.heat.unburned;
-        Qb = this.heat.burned;
+        // burned zone over the surfaces inside the burned sphere (per-surface burned fractions)
+        ch.evaluate(this.rb, this.h, this.chB);
+        wallHeatLossTwoZoneSurfaces(hc, this.Tu, this.Tb, this.areas6, this.chB.burnedFraction, this.Tw6, this.heat6);
+        Qu = this.heat6.unburned;
+        Qb = this.heat6.burned;
         const q0 = Qu + Qb;
         // numerical guard for vanishing zones (see options.zoneHeatLossMinTime)
         const tg = opts.zoneHeatLossMinTime;
@@ -1315,7 +1396,7 @@ export class Cylinder {
         if (Math.abs(Qb) > qmb) Qb = Math.sign(Qb) * qmb;
         this.surfaceHeatRates(dy, q0 !== 0 ? (Qu + Qb) / q0 : 1);
       } else {
-        const q = wallHeatLoss(hc, this.T, this.areas, this.walls, this.heat);
+        const q = wallHeatLossSurfaces(hc, this.T, this.areas6, this.Tw6, this.heat6);
         if (mode === MODE_SINGLE) Qu = q;
         else Qb = q;
         this.surfaceHeatRates(dy, 1);
@@ -1349,11 +1430,10 @@ export class Cylinder {
       const mcu = y[this.iCRU];
       const mcb = y[this.iCRB];
       const mcr = mcu + mcb;
+      // (burned fraction at the crevice mouth: the burned-wetted share of the liner for the disc, of the
+      // bore circle at the crown for the L-head — chamber evaluate().creviceBurnedFraction)
       let fb = mode === MODE_BURNED ? 1 : 0;
-      if (mode === MODE_TWO && this.areas.liner > 0) {
-        fb = this.fgB.wettedLiner / this.areas.liner;
-        fb = fb > 0 ? (fb < 1 ? fb : 1) : 0;
-      }
+      if (mode === MODE_TWO) fb = this.chB.creviceBurnedFraction;
       const dp0 = this.closedDp(mode, dU, dSnet, dmu, dmb, this.Vdot, mu, V, p);
       const hu = cl.hu;
       const hb = cl.hb;
@@ -1472,13 +1552,15 @@ export class Cylinder {
 
   /** Per-surface heat-flow ledgers (lumped wall model), scaled by the zone guard factor f. */
   private surfaceHeatRates(dy: Float64Array, f: number): void {
-    const q = this.heat;
+    const q = this.heat6.surface;
     const i = this.iQS;
-    dy[i] = f * q.head;
-    dy[i + 1] = f * q.piston;
-    dy[i + 2] = f * q.liner;
-    dy[i + 3] = f * q.intakeValves;
-    dy[i + 4] = f * q.exhaustValves;
+    // (WALL_* order = the ledger order: head, piston, liner, intake valves, exhaust valves; block apart)
+    dy[i] = f * q[0];
+    dy[i + 1] = f * q[1];
+    dy[i + 2] = f * q[2];
+    dy[i + 3] = f * q[3];
+    dy[i + 4] = f * q[4];
+    if (this.iQB >= 0) dy[this.iQB] = f * q[WALL_BLOCK];
   }
 
   /**
@@ -1494,17 +1576,23 @@ export class Cylinder {
   private updateWalls(dtCycle: number, instant: boolean): void {
     const R = this.e.spec.walls.thermalResistance;
     if (!R || !this.wallsLumped || !(dtCycle > 0)) return;
-    const y = this.e.y;
     const tau = this.e.opts.wallTimeConstant;
     const a = instant || !(tau > 0) ? 1 : -Math.expm1(-dtCycle / tau);
-    const rs = [R.head, R.piston, R.liner, R.intakeValve, R.exhaustValve];
-    for (let i = 0; i < 5; i++) {
-      const qBar = (y[this.iQS + i] - this.qsCycleStart[i]) / dtCycle;
+    // (resistances in WALL_* order; the L-head block deck falls back to the liner's)
+    const rs = wallSurfaceResistances(R, this.rs6);
+    for (let i = 0; i < this.nSurfaces; i++) {
+      const qBar = (this.surfaceLedger(i) - this.qsCycleStart[i]) / dtCycle;
       let target = rs[i] * qBar;
       if (target < -50) target = -50;
       if (target > 600) target = 600;
       if (Number.isFinite(target)) this.wallExcess[i] += a * (target - this.wallExcess[i]);
     }
+  }
+
+  /** Per-surface heat ledger i (WALL_* order; the block deck's is appended, iQB), J. */
+  private surfaceLedger(i: number): number {
+    const y = this.e.y;
+    return i < 5 ? y[this.iQS + i] : y[this.iQB];
   }
 
   /** Mean piston speed at the current ω (accepted state), m/s. */
@@ -1534,12 +1622,11 @@ export class Cylinder {
     return (m * cl.Ru * T) / V;
   }
 
-  /** Radius guess kept strictly inside the bracket of FlameGeometry.radiusForVolume (deterministic warm start). */
+  /** Radius guess kept strictly inside the bracket of the chamber's radiusForVolume (deterministic warm start). */
   private clampRadiusGuess(r: number, h: number): number {
-    const fg = this.flameGeom;
-    const b = fg.headDistance;
-    const lo = h > b ? Math.min(b, h - b, fg.radius - fg.offset) : 0;
-    const hi = fg.maxRadius(h);
+    const ch = this.chamber;
+    const lo = ch.inscribedRadius(h);
+    const hi = ch.maxRadius(h);
     const span = hi - lo;
     const a = lo + 1e-6 * span;
     const z = hi - 1e-6 * span;
@@ -1854,9 +1941,11 @@ export class Cylinder {
    *    (= τ|∂lnτ/∂T|ΔT of knock.ts autoignitionBurnTime for a constant state). Unlike the local
    *    derivative at the onset state, J does not vanish when the onset sits at the NTC turning
    *    point of τ(T) (validation round 1: τ_ab collapsed to τ_e ≈ 1 µs and MAPO jumped to 60–130 bar).
-   *  - Acoustic source region: the planform outside a circle about the plug whose area fraction
-   *    equals the autoigniting VOLUME fraction (the head-plane section of the flame sphere covers the
-   *    whole head late in the burn although end gas remains near the piston: zero source, MAPO 0),
+   *  - Acoustic source region: the end gas is the autoigniting VOLUME fraction of the source domain
+   *    farthest from the plug (KnockOscillator.setEndGasVolumeFraction) — flat disc: the planform
+   *    outside a circle about the plug with that area fraction (the head-plane section of the flame
+   *    sphere covers the whole head late in the burn although end gas remains near the piston: zero
+   *    source, MAPO 0); L-head: the gas outside a flame ball about the plug with that volume fraction —
    *    released sequentially from the periphery inward (options.knockSourceShells).
    */
   private onAutoignition(): void {
@@ -1883,10 +1972,8 @@ export class Cylinder {
     // end-gas planform region with the end-gas volume fraction
     const Vg = this.creviceOn ? this.V - this.Vcr : this.V;
     const vEg = this.mode === MODE_SINGLE ? Vg : eg * this.closure.vu;
-    const c = e.spec.sparkPlug.gapCenter;
-    const rIn = this.endGasCircleRadius(Math.min(1, vEg / Vg));
-    if (e.opts.knockSourceShells > 0) this.knockOsc.setSequentialEndGasRegion(c[0], c[2], rIn, e.opts.knockSourceShells);
-    else this.knockOsc.setEndGasRegion(c[0], c[2], rIn);
+    // (the gap centre is passed explicitly: the source is centred on the plug for any oscillator)
+    this.knockOsc.setEndGasVolumeFraction(Math.min(1, vEg / Vg), e.opts.knockSourceShells, e.spec.sparkPlug.gapCenter);
     this.knockEgOnset = eg;
     this.knockMkOnset = y[this.iMK];
     // autoignition before any burned gas (e.g. before the spark): seed the burned zone
@@ -1897,25 +1984,6 @@ export class Cylinder {
     this.knockG0 = this.knockGamma;
     this.knockV0 = this.V;
     this.knockOsc.setBandReference(this.knockC0);
-  }
-
-  /**
-   * Radius of the planform circle centred at the spark plug whose complement in the bore has the
-   * area fraction f (0..1): πR² − lens(r) = f πR² (closed-form circle–circle lens, bisection).
-   */
-  private endGasCircleRadius(f: number): number {
-    const R = 0.5 * this.e.spec.geometry.bore;
-    const g = this.e.spec.sparkPlug.gapCenter;
-    const d = Math.max(Math.hypot(g[0], g[2]), 1e-9);
-    const target = (1 - f) * Math.PI * R * R; // lens area inside the circle
-    let lo = 0;
-    let hi = R + d;
-    for (let i = 0; i < 60; i++) {
-      const mid = 0.5 * (lo + hi);
-      if (lensArea(mid, R, d) < target) lo = mid;
-      else hi = mid;
-    }
-    return 0.5 * (lo + hi);
   }
 
   /** Ignition-system split; returns true if the thermodynamic state changed. */
@@ -1940,7 +2008,14 @@ export class Cylinder {
     gas.dissipationLength = this.L;
     gas.flowVelocity = meanFlowVelocity(y[this.iTK], this.mode === MODE_TWO ? y[this.iMU] : this.mCyl);
     const kst = ign.state.kernel.stage;
-    const kernelWindow = closed && this.mode !== MODE_BURNED && (th >= this.ignCmd.sparkDeg - 1e-9 || this.sparkFired) && (kst === 'none' || kst === 'kernel');
+    // kernel window: the gas properties a kernel needs (S_L, Markstein length, expansion ratio, Le) from the
+    // start of the ignition event — the switch-off, or the trembler's timer make (its breakdowns come at
+    // unknown instants of the train, and a quenched kernel is re-seeded by the next one while it lasts)
+    const kernelWindow =
+      closed &&
+      this.mode !== MODE_BURNED &&
+      (th >= this.sparkEventDeg - 1e-9 || this.sparkFired) &&
+      (kst === 'none' || kst === 'kernel' || (this.trembler && kst === 'quenched' && ign.state.trainActive));
     if (kernelWindow) {
       const phi = this.phiTrapped;
       const fuel = this.fuelTrapped;
@@ -1964,12 +2039,29 @@ export class Cylinder {
       gas.flameThickness = 0;
       gas.kinematicViscosity = this.nuU;
     }
-    const st = ign.step(h, th, this.ignCmd, gas);
-    // The IgnitionSystem starts a new event (kernel, ledgers) at the dwell start; until then its
-    // state still describes the previous cycle's spark.
-    if (st.switchState === 'closed') this.dwellSeen = true;
+    // (trembler-magneto: the magneto is driven by the crank speed and the ENGINE angle at the step end)
+    const st = this.trembler ? ign.step(h, th, this.ignCmd, gas, y[I_OM], y[I_TH]) : ign.step(h, th, this.ignCmd, gas);
+    // The IgnitionSystem starts a new event (kernel, ledgers) at the dwell start (trembler: the timer
+    // make — its switchState is the vibrator points); until then its state still describes the previous
+    // cycle's spark.
+    if (this.trembler ? st.timerClosed : st.switchState === 'closed') this.dwellSeen = true;
     if (!this.dwellSeen) return false;
-    if (!this.sparkFired && st.switchState !== 'closed' && th >= this.ignCmd.sparkDeg - 1e-9 && th < this.ignCmd.sparkDeg + 180) this.sparkFired = true;
+    if (this.trembler) {
+      // the spark train: fired at the first breakdown of the event; a re-seeded kernel (a later breakdown
+      // after a quench) starts its mass transfer afresh (its burned mass restarts small)
+      if (!this.sparkFired && st.breakdownCount > 0) this.sparkFired = true;
+      const ks = st.kernelStartTime;
+      if (!Number.isNaN(ks) && ks !== this.kernelStart) {
+        if (!Number.isNaN(this.kernelStart)) this.kernelMassPrev = 0;
+        this.kernelStart = ks;
+      }
+      // each vibrator trip (points opening) starts a breakdown sequence: an output-worthy instant (dense
+      // snapshot sampling, EngineSimulator)
+      if (st.pointsBreakCount !== this.tripsSeen) {
+        this.tripsSeen = st.pointsBreakCount;
+        e.interrupt = true;
+      }
+    } else if (!this.sparkFired && st.switchState !== 'closed' && th >= this.ignCmd.sparkDeg - 1e-9 && th < this.ignCmd.sparkDeg + 180) this.sparkFired = true;
     let changed = false;
     // electrical energy to the gas minus the kernel's electrode conduction loss over the step
     const dE = st.energyToGas - this.sparkEnergyPrev;
@@ -2030,7 +2122,8 @@ export class Cylinder {
       // integrator locates it exactly; its growth stopped there): catch up the entrainment and
       // burn-up over the remaining part of the step with the rates at the hand-off state (error
       // O(Δt²) instead of the round-1 O(Δt) stairs of CA50 / knock onset vs spark advance).
-      const tHo = ign.gap.firstBreakdownTime + st.kernel.handoffTime;
+      // (trembler: the CURRENT kernel's creation — a re-seeded kernel starts later than the first breakdown)
+      const tHo = (this.trembler ? st.kernelStartTime : ign.gap.firstBreakdownTime) + st.kernel.handoffTime;
       let late = ign.time - tHo;
       if (!(late > 0)) late = 0;
       if (late > h) late = h;
@@ -2080,15 +2173,15 @@ export class Cylinder {
     const cl = this.closure;
     const mb = y[this.iMB];
     const Vb = mb * cl.vb;
-    const fg = this.fgR;
-    this.flameGeom.evaluate(rk, this.h, fg);
+    const fg = this.chR;
+    this.chamber.evaluate(rk, this.h, fg);
     const sc = this.discScale > 0 ? this.discScale : 1;
     const Vk = fg.volume / sc; // cylinder volume represented by the clipped kernel sphere
     let me = Vk > Vb ? mb + (Vk - Vb) / cl.vu : mb;
     const tauB = this.SL > 0 && this.lambda > 0 && this.lambda < Infinity ? this.lambda / this.SL : Infinity;
     if (STk > this.SL && tauB < Infinity) {
-      const rfb = this.flameGeom.radiusForVolume((Vb + (me - mb) * cl.vu) * sc, this.h, this.clampRadiusGuess(rk, this.h));
-      this.flameGeom.evaluate(rfb, this.h, fg);
+      const rfb = this.chamber.radiusForVolume((Vb + (me - mb) * cl.vu) * sc, this.h, this.clampRadiusGuess(rk, this.h));
+      this.chamber.evaluate(rfb, this.h, fg);
       const mu0 = (fg.frontArea / cl.vu) * (STk - this.SL) * tauB;
       if (mb + mu0 > me) me = mb + mu0;
     }
@@ -2132,7 +2225,7 @@ export class Cylinder {
     this.dpEval = 0;
     this.dTbEval = 0;
     this.tEval = e.t;
-    this.Lref = integralLengthScale(this.h, e.spec.geometry.bore, e.lengthFraction);
+    this.Lref = integralLengthScale(this.chamber.meanDepth(this.h), e.spec.geometry.bore, e.lengthFraction);
     this.rhoRef = p / (cl.Ru * T);
     this.rbGuess = 0;
     e.invalidate(this);
@@ -2165,7 +2258,7 @@ export class Cylinder {
 
   /** Current flame radius for output (kernel / entrained front / burned sphere / chamber). */
   flameRadius(): number {
-    if (this.burnDone) return this.flameGeom.maxRadius(this.h);
+    if (this.burnDone) return this.chamber.maxRadius(this.h);
     if (this.flameActive) return this.rf;
     // kernel stage: the front radius the entrainment model would start from if the kernel were
     // handed off now (the chamber-clipped kernel sphere plus the brush that makes the burning speed
@@ -2179,7 +2272,7 @@ export class Cylinder {
         const sc = this.discScale > 0 ? this.discScale : 1;
         const y = this.e.y;
         const Ve = y[this.iMB] * cl.vb + (me - y[this.iMB]) * cl.vu;
-        return this.flameGeom.radiusForVolume(Ve * sc, this.h, this.clampRadiusGuess(k.radius, this.h));
+        return this.chamber.radiusForVolume(Ve * sc, this.h, this.clampRadiusGuess(k.radius, this.h));
       }
       return this.rb;
     }
@@ -2192,7 +2285,7 @@ export class Cylinder {
     if (!this.flameActive) return false;
     const y = this.e.y;
     const m = y[this.iMU] + y[this.iMB];
-    return y[this.iME] >= m * (1 - 1e-6) || this.rf >= this.flameGeom.maxRadius(this.h) * (1 - 1e-6) || this.Af <= 1e-10;
+    return y[this.iME] >= m * (1 - 1e-6) || this.rf >= this.chamber.maxRadius(this.h) * (1 - 1e-6) || this.Af <= 1e-10;
   }
 
   /**
@@ -2394,12 +2487,20 @@ export class Cylinder {
             this.markBurnJump(x0, this.xb, th);
           }
           break;
-        case EV_IGN:
-          if (Math.abs(this.evAngle[this.evNext - 1] - this.ignCmd.sparkDeg) < 1e-9 && Number.isNaN(this.tSparkCmd)) {
+        case EV_IGN: {
+          // start of the ignition event (inductive: the switch-off; trembler: the timer make) → snapshot
+          const a = this.evAngle[this.evNext - 1];
+          if (Math.abs(a - this.sparkEventDeg) < 1e-9 && Number.isNaN(this.tSparkCmd)) {
             this.tSparkCmd = e.t;
             e.interrupt = true;
           }
+          // trembler: the timer break (it can fire a last "timer spark")
+          if (this.trembler && Math.abs(a - this.ignCmd.sparkDeg) < 1e-9 && Number.isNaN(this.tTimerBreak)) {
+            this.tTimerBreak = e.t;
+            e.interrupt = true;
+          }
           break;
+        }
         case EV_WIEBE:
           if (this.mode === MODE_SINGLE) {
             // Seed of the burned zone: WIEBE_SEED of the charge (numerical; x_b starts at it). The
@@ -2646,11 +2747,10 @@ export class Cylinder {
   /** End of this cylinder's local cycle (θ_i = 360): summary, lumped walls, surface ledgers. */
   endCycle(): CycleSummary | null {
     const e = this.e;
-    const y = e.y;
     const s = this.partialCycle ? null : this.makeSummary();
     if (s) e.summaries.push(s);
     this.updateWalls(e.t - this.tCycleStart, e.warmingUp);
-    for (let i = 0; i < 5; i++) this.qsCycleStart[i] = y[this.iQS + i];
+    for (let i = 0; i < this.nSurfaces; i++) this.qsCycleStart[i] = this.surfaceLedger(i);
     this.tCycleStart = e.t;
     this.partialCycle = false;
     return s;
@@ -2774,6 +2874,12 @@ export class Cylinder {
       indicatedWorkGross: wGross,
     };
     if (e.cylinders.length > 1) s.cylinder = this.index;
+    if (this.trembler) {
+      // the spark train of this cycle's timer contact: local angle of its first breakdown, breakdowns
+      const st = this.ign && this.dwellSeen ? this.ign.state : null;
+      s.sparkDeg = st ? st.firstSparkDeg : Number.NaN;
+      s.sparkCount = st ? st.breakdownCount : 0;
+    }
     return s;
   }
 
@@ -2837,6 +2943,7 @@ export class Cylinder {
     this.tCycleStart += dt;
     this.tEval += dt;
     if (!Number.isNaN(this.tSparkCmd)) this.tSparkCmd += dt;
+    if (!Number.isNaN(this.tTimerBreak)) this.tTimerBreak += dt;
     if (!Number.isNaN(this.tKnockOnset)) this.tKnockOnset += dt;
   }
 }

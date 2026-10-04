@@ -1,14 +1,16 @@
 /**
  * Engine-keyed option defaults and operating-point sanitising (Model T integration): neutral physics
  * defaults ← per-engine defaults (EngineSpec.id) ← caller options; the CFR set is unchanged; the Model T
- * gets its own friction, valve lash, crankcase pressure, knock pickup/band and the (transferred, UNVERIFIED)
- * MODEL_T_CALIBRATION; sanitizeOperatingPoint falls back to the engine's registry default operating point
- * and keeps the load model and the ignition source.
+ * gets its own friction, valve lash, crankcase pressure, knock pickup/band (the virtual plug transducer and
+ * the L-head band) and the (transferred, UNVERIFIED) MODEL_T_CALIBRATION with its physically estimated
+ * venturi C_D; sanitizeOperatingPoint falls back to the engine's registry default operating point and keeps
+ * the load model and the ignition source.
  */
 import { describe, expect, it } from 'vitest';
 import type { EngineSpec } from '../core/engine-spec';
 import { CFR_CRANKCASE_GAUGE_PRESSURE, CFR_F1, CFR_FRICTION, CFR_KNOCK_PICKUP, CFR_RON_CONDITIONS, CFR_VALVE_LASH } from '../engines/cfr';
 import { MODEL_T, MODEL_T_CRUISE, MODEL_T_FRICTION, MODEL_T_VALVE_LASH } from '../engines/model-t';
+import { L_HEAD_MAPO_BAND, virtualKnockSensor } from '../chemistry/knock';
 import { CFR_CALIBRATION, MODEL_T_CALIBRATION } from './calibration';
 import { CycleModel } from './cycle-model';
 import {
@@ -44,19 +46,23 @@ describe('engine-keyed cycle-model option defaults', () => {
     expect(o.friction!.cylinders).toBe(4);
     expect(o.valveLash).toBe(MODEL_T_VALVE_LASH);
     expect(o.crankcaseGaugePressure).toBe(0);
-    expect(o.mapoBand).toBeNull();
+    // (Model T integration) the L-head acoustics: the virtual plug-mounted pickup over the valve pocket and
+    // the 2–18 kHz band that keeps the bore-to-pocket fundamental
+    expect(o.mapoBand).toEqual(L_HEAD_MAPO_BAND);
     for (const k of CAL_KEYS) expect(o[k], k).toBe(MODEL_T_CALIBRATION[k].value);
-    // the pickup lies inside the bore disc (where the cylindrical-bore modes are defined)
-    expect(Math.hypot(o.knockSensor[0], o.knockSensor[1])).toBeLessThan(MODEL_T.geometry.bore / 2);
+    expect(o.knockSensor).toEqual(virtualKnockSensor(MODEL_T));
+    expect(Math.hypot(o.knockSensor[0], o.knockSensor[1])).toBeGreaterThan(MODEL_T.geometry.bore / 2);
     // caller options still win
     expect(resolveCycleOptions({ burnRateMultiplier: 4, friction: null }, MODEL_T)).toMatchObject({ burnRateMultiplier: 4, friction: null, valveLash: MODEL_T_VALVE_LASH });
     expect(ENGINE_CYCLE_OPTION_DEFAULTS['ford-model-t'].friction).toBe(MODEL_T_FRICTION);
   });
 
-  it('MODEL_T_CALIBRATION = the CFR values, each marked UNVERIFIED with the evidence that would set it', () => {
+  it('MODEL_T_CALIBRATION = the CFR values (venturi C_D: a physical estimate), each marked UNVERIFIED with the evidence that would set it', () => {
     for (const k of CAL_KEYS) {
       const p = MODEL_T_CALIBRATION[k];
-      expect(p.value).toBe(CFR_CALIBRATION[k].value);
+      // (Model T integration: the CFR venturi fit does not carry over to the 23/32 in venturi)
+      if (k === 'venturiDischargeCoefficient') expect(p.value).not.toBe(CFR_CALIBRATION[k].value);
+      else expect(p.value).toBe(CFR_CALIBRATION[k].value);
       expect(p.range).toEqual(CFR_CALIBRATION[k].range);
       expect(p.value).toBeGreaterThanOrEqual(p.range[0]);
       expect(p.value).toBeLessThanOrEqual(p.range[1]);

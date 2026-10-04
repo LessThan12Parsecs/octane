@@ -211,9 +211,13 @@ function transferred(p: CalibratedParameter, wouldBeSetBy: string): CalibratedPa
 
 /**
  * Ford Model T calibration (Model T integration, 2026-10). No measured Model T cylinder-pressure traces
- * exist, so NOTHING here is fitted: every value is the CFR F-1 value transferred (DESIGN.md calibration
- * policy, one set per engine; the universal closures marksteinMultiplier and kernelHandoffMultiple are the
- * same physics on both engines). Each entry names the Model T evidence that would set it. The global
+ * exist, so NOTHING here is fitted: every value but one is the CFR F-1 value transferred (DESIGN.md
+ * calibration policy, one set per engine; the universal closures marksteinMultiplier and
+ * kernelHandoffMultiple are the same physics on both engines) — the exception is the carburettor venturi
+ * C_D, whose CFR value (0.6, at the lower bound of its range, fitted to the 9/16 in CFR throat at Re ≈ 1e4
+ * with a fuel-nozzle bridge) has no physical reason to apply to the Model T's 23/32 in venturi, so a
+ * physical estimate is used instead (see the entry). Each entry names the Model T evidence that would set
+ * it. This is the uncalibrated placeholder: a separate calibration phase sets the set. The global
  * targets are Ford's WOT torque/power table (engines/model-t.ts MODEL_T_FORD_WOT_TABLE, ±1.5 % rounding,
  * transmission-output basis) and Upton's MBT spark advance vs speed (modelTUptonMbtDeg). Reasons the CFR
  * values should NOT be expected to carry over: the CFR burn constants were fitted with a shrouded overhead
@@ -252,11 +256,24 @@ export const MODEL_T_CALIBRATION: CalibrationSet = Object.freeze({
     'the WOT torque level at 500–900 rpm (FSB Fig. 84: 69–83 lb ft), which fixes the volumetric efficiency once the burn ' +
       'is set; the siamesed intake ports run through the water jacket of the block (spec.manifolds.intakePortLength UNVERIFIED).',
   ),
-  venturiDischargeCoefficient: transferred(
-    CFR_CALIBRATION.venturiDischargeCoefficient,
-    'the WOT torque fall-off above 1000 rpm (FSB Fig. 84: 82 → 47 lb ft at 1000 → 1900 rpm), mostly carburettor and ' +
-      'manifold restriction; a measured air flow of a Holley NH / Kingston L-4 venturi would set it directly.',
-  ),
+  venturiDischargeCoefficient: Object.freeze({
+    // Physical estimate, not fitted: the classical-venturi throat coefficient at the Model T's throat Reynolds
+    // number. ISO 5167-4:2022 gives C = 0.984 for an as-cast convergent at 2e5 ≤ Re ≤ 2e6 (options.ts
+    // VENTURI_DISCHARGE_COEFFICIENT, fetched summary); the 23/32 in (18.3 mm) throat passes ≈ 0.028 kg/s of air
+    // at Ford's 20 hp (η_v ≈ 0.6 at 1600 rpm), Re = ṁ D/(A μ) ≈ 1.1e5 (≈ 0.6e5 at 900 rpm) — below the
+    // standard's range, where venturi coefficients fall a few per cent (UNVERIFIED magnitude: ≈ 0.95–0.97 at
+    // Re ≈ 1e5 from memory of the ASME MFC-3M low-Re curves) and the fuel nozzle in the throat blocks part of
+    // it. The full-loss orifice convention (no diffuser recovery) makes the value conservative for the flow.
+    value: 0.95,
+    range: CFR_CALIBRATION.venturiDischargeCoefficient.range,
+    source: CFR_CALIBRATION.venturiDischargeCoefficient.source,
+    evidence:
+      'UNVERIFIED for this engine: a physical estimate, nothing fitted (the CFR 0.6 is a fit to another venturi at ' +
+      'Re ≈ 1e4). ISO 5167-4 classical-venturi C = 0.984 (Re ≥ 2e5) reduced to 0.95 for the throat Reynolds number ' +
+      '0.6–1.1e5 at the Model T WOT flows and the fuel-nozzle blockage. Would be set by: the WOT torque fall-off above ' +
+      '1000 rpm (FSB Fig. 84: 82 → 47 lb ft at 1000 → 1900 rpm), mostly carburettor and manifold restriction; a ' +
+      'measured air flow of a Holley NH / Kingston L-4 venturi would set it directly.',
+  }) as CalibratedParameter,
   knockStratificationDT: transferred(
     CFR_CALIBRATION.knockStratificationDT,
     'knock intensity — no measurements exist; the period practice of retarding the spark lever on hills (audible spark ' +

@@ -5,14 +5,20 @@
  *
  * Snapshot cadence:
  *  - every options.snapshotEveryDeg crank degrees (engine angle) on a grid anchored at θ = −360;
- *  - an event snapshot at every cylinder's spark command (primary switch-off) and knock onset;
- *  - dense time-based samples (every cylinder's): 5 µs from switch-off until 100 µs after the first
- *    breakdown (or 0.5 ms without breakdown), then 50 µs until the discharge has ended (≤ 5 ms), and
- *    10 µs for the first 3 ms of knock ringing.
+ *  - an event snapshot at every cylinder's spark command (primary switch-off; trembler-magneto: the
+ *    timer make, each vibrator trip and the timer break) and knock onset;
+ *  - dense time-based samples (every cylinder's): inductive — 5 µs from switch-off until 100 µs after
+ *    the first breakdown (or 0.5 ms without breakdown), then 50 µs until the discharge has ended (≤ 5 ms);
+ *    trembler-magneto spark train — 5 µs for DENSE_TRIP_WINDOW (150 µs) after each points opening and
+ *    after the timer break (ring-up, breakdown, early discharge), DENSE_TRAIN_DT (100 µs) otherwise while
+ *    the train is active (timer contact closed or the gap conducting); knock ringing: 10 µs for the
+ *    first 3 ms (multi-cylinder engines: 20 µs for 2 ms, DENSE_KNOCK_DT_MULTI).
  * Multi-cylinder engines (spec.cylinders > 1): EngineSnapshot.cylinders holds every cylinder at its
  * local angle (CylinderSnapshot); the top-level per-cylinder fields are cylinder 0's; gasTorque is the
- * engine's (sum), and frictionTorque / loadTorque are added. A single-cylinder spec (the CFR) gets
- * exactly the former snapshot (no cylinders array, no extra fields).
+ * engine's (sum), and frictionTorque / loadTorque / vehicleSpeed are added (plus magnetoEmf and
+ * firingCylinder for a trembler-magneto ignition, whose spark fields carry the train: breakdownCount,
+ * pointsOpen, timerClosed, firstSparkDeg, primaryVoltage). A single-cylinder spec (the CFR) gets exactly
+ * the former snapshot (no cylinders array, no extra fields).
  * Conventions kept from the mock simulator (the front-end relies on them):
  * temperatureUnburned = temperatureMean and temperatureBurned = 0 without a burned zone;
  * flame.radius at 'done' covers the chamber; laminar/turbulent speeds 0 after burn-out;
@@ -27,7 +33,8 @@ import type { CycleSummary, CylinderPhase, CylinderSnapshot, EngineSnapshot } fr
 import { DEG } from '../core/constants';
 import { NS, SP } from '../core/species';
 import { newCrankTrainState } from '../mechanics';
-import { newFlameGeometryResult } from '../combustion';
+import { newChamberResult } from '../combustion';
+import { magnetoEmf } from '../ignition';
 import { CycleModel, I_OM, MODE_BURNED, MODE_OPEN, MODE_TWO, swapNO, type CycleTrace } from './cycle-model';
 import type { Cylinder } from './cylinder';
 import type { CycleModelOptions } from './options';
@@ -47,6 +54,17 @@ export const DENSE_DISCHARGE_DT = 50e-6;
 export const DENSE_DISCHARGE_MAX = 5e-3;
 export const DENSE_KNOCK_DT = 10e-6;
 export const DENSE_KNOCK_DURATION = 3e-3;
+/**
+ * Knock ringing of a MULTI-cylinder engine: 20 µs for 2 ms (every cylinder may knock in every cycle — four
+ * 10 µs × 3 ms windows doubled the snapshot stream of the Model T at WOT; 20 µs still gives ≈ 13 samples per
+ * period of the L-head's ≈ 3.8 kHz fundamental). MAPO itself is sampling-independent (cycle model).
+ */
+export const DENSE_KNOCK_DT_MULTI = 20e-6;
+export const DENSE_KNOCK_DURATION_MULTI = 2e-3;
+/** Trembler spark train: 5 µs (DENSE_SPARK_DT) samples this long after each points opening / the timer break, s. */
+export const DENSE_TRIP_WINDOW = 150e-6;
+/** Trembler spark train: sample interval otherwise while the train is active, s. */
+export const DENSE_TRAIN_DT = 100e-6;
 
 type FlameStage = EngineSnapshot['flame']['stage'];
 
@@ -59,7 +77,7 @@ export class EngineSimulator {
   private initialPending = true;
   private lastTime = 0;
   private readonly cts = newCrankTrainState();
-  private readonly fg = newFlameGeometryResult();
+  private readonly fg = newChamberResult();
   private readonly Nb = new Float64Array(NS);
 
   /**
@@ -118,10 +136,10 @@ export class EngineSimulator {
       const d = this.snapshotEveryDeg;
       let thTarget = -360 + (Math.floor((th + 360) / d + 1e-7) + 1) * d;
       if (thTarget > 360) thTarget = 360;
-      // snapshot exactly at every cylinder's spark command (engine angle of its local spark angle)
+      // snapshot exactly at every cylinder's spark command (trembler: timer make; engine angle of its local angle)
       for (const c of m.cylinders) {
         if (!c.ign || !Number.isNaN(c.tSparkCmd)) continue;
-        const sp = c.engineAngle(c.ignCmd.sparkDeg);
+        const sp = c.engineAngle(c.sparkEventDeg);
         if (sp > th + 1e-9 && sp < thTarget) thTarget = sp;
       }
       m.stepUntil(this.nextDenseTime(), thTarget);
@@ -135,7 +153,7 @@ export class EngineSimulator {
     const m = this.model;
     const t = m.t;
     let next = Infinity;
-    for (const c of m.cylinders) next = Math.min(next, denseTimeOf(c, t));
+    for (const c of m.cylinders) next = Math.min(next, c.trembler ? denseTimeTrembler(c, t) : denseTimeOf(c, t));
     return next;
   }
 
@@ -149,25 +167,28 @@ export class EngineSimulator {
     const list: CylinderSnapshot[] = [];
     let gas = 0;
     let other = 0;
-    let fric = 0;
+    let firing = -1;
     for (const c of cyls) {
       const part = this.cylinderSnapshot(c);
       const th = c.theta;
       // (gas torque from the THERMODYNAMIC pressure, see singleCylinderSnapshot)
       const cts = c.dyn.evaluate(th * DEG, om, alpha, c.p, pcc, this.cts);
-      const f = m.friction.torque(c.ks.dxdTheta, om);
       part.gasTorque = cts.gasTorque;
       gas += cts.gasTorque;
       other += cts.inertiaTorque + cts.gravityTorque;
-      fric += f;
+      if (firing < 0 && c.trembler && c.ign && c.ign.state.timerClosed) firing = c.index;
       list.push({ ...part, index: c.index, thetaDeg: th >= 360 ? th - 720 : th, cycle: c.cycle });
     }
+    // whole-engine friction (negative = opposing) with every cylinder at its throw phase
+    const fric = m.friction.torqueCylinders(m.crank.update(m.theta * DEG), om);
     let net = gas + other + fric;
     const free = m.op.speedMode === 'free';
-    if (free) net -= m.op.loadTorque;
+    const ld = m.load;
+    const tLoad = free ? ld.torque(om) : 0;
+    if (free) net -= tLoad;
     const c0 = list[0];
     const th = m.theta;
-    return {
+    const snap: EngineSnapshot = {
       t: m.t,
       cycle: m.cycle,
       thetaDeg: th >= 360 ? th - 720 : th,
@@ -198,11 +219,18 @@ export class EngineSimulator {
       gasTorque: gas,
       netTorque: net,
       frictionTorque: -fric,
-      // load: the constant load in free mode; in fixed mode the dynamometer absorbs the net crank torque
+      // load: the load model in free mode; in fixed mode the dynamometer absorbs the net crank torque
       // (it holds α = 0)
-      loadTorque: free ? m.op.loadTorque : net,
+      loadTorque: free ? tLoad : net,
       cylinders: list,
     };
+    if (free && (ld.kind === 'vehicle' || ld.kind === 'neutral')) snap.vehicleSpeed = ld.vehicleSpeed(om);
+    const ig = m.spec.ignition;
+    if (ig.type === 'trembler-magneto') {
+      snap.magnetoEmf = magnetoEmf(ig.magneto, th, om);
+      snap.firingCylinder = firing;
+    }
+    return snap;
   }
 
   /** The single-cylinder snapshot (the CFR contract, unchanged). */
@@ -221,7 +249,7 @@ export class EngineSimulator {
     // the pickup pressure made the reported torque ring by up to ±9 N m (validation round 2)
     const cts = c.dyn.evaluate(th * DEG, om, alpha, c.p, pcc, this.cts);
     let net = cts.gasTorque + cts.inertiaTorque + cts.gravityTorque + m.friction.torque(c.ks.dxdTheta, om);
-    if (m.op.speedMode === 'free') net -= m.op.loadTorque;
+    if (m.op.speedMode === 'free') net -= m.load.torque(om);
     return {
       t: m.t,
       cycle: m.cycle,
@@ -287,7 +315,7 @@ export class EngineSimulator {
     const kst = c.ign && c.dwellSeen ? c.ign.state.kernel : null;
     if (stage === 'kernel' && kst) {
       radius = c.flameRadius();
-      c.flameGeom.evaluate(radius, c.h, this.fg);
+      c.chamber.evaluate(radius, c.h, this.fg);
       area = Math.max(0, this.fg.frontArea);
       SL = c.SL;
       ST = kst.turbulentSpeed;
@@ -295,13 +323,13 @@ export class EngineSimulator {
       radius = c.flameActive ? c.rf : c.rb;
       area = c.flameActive ? c.Af : 0;
       if (!c.flameActive && radius > 0) {
-        c.flameGeom.evaluate(radius, c.h, this.fg);
+        c.chamber.evaluate(radius, c.h, this.fg);
         area = Math.max(0, this.fg.frontArea);
       }
       SL = c.SL;
       ST = c.flameActive ? c.burnSpeed : area > 0 && c.rhoU > 0 ? c.burnRateStep / (c.rhoU * area) : 0;
     } else if (stage === 'done') {
-      radius = c.flameGeom.maxRadius(c.h);
+      radius = c.chamber.maxRadius(c.h);
     }
     // phase
     let phase: CylinderPhase;
@@ -358,6 +386,14 @@ export class EngineSimulator {
         spark.secondaryCurrent = s.secondaryCurrent;
         spark.energyDelivered = s.energyDelivered;
       }
+      if (c.trembler) {
+        // the spark train of this cycle's timer contact (counters 0 / NaN until the make)
+        spark.breakdownCount = c.dwellSeen ? s.breakdownCount : 0;
+        spark.pointsOpen = s.pointsOpen;
+        spark.timerClosed = s.timerClosed;
+        spark.firstSparkDeg = c.dwellSeen ? s.firstSparkDeg : Number.NaN;
+        spark.primaryVoltage = s.primaryVoltage;
+      }
     }
     return {
       pistonDisplacement: ks.x,
@@ -402,8 +438,8 @@ export class EngineSimulator {
 /**
  * Next dense-sampling time of one cylinder after t (Infinity if none): 5 µs from its spark command
  * (switch-off) until 100 µs after the first breakdown (0.5 ms without one), then 50 µs while the
- * discharge lasts (≤ 5 ms after switch-off); 10 µs for the first 3 ms after its knock onset.
- * Extension point: a trembler spark train extends the window over the whole timer contact.
+ * discharge lasts (≤ 5 ms after switch-off); knock ringing after its onset (denseKnockTime). A trembler
+ * spark train is sampled by denseTimeTrembler instead.
  */
 function denseTimeOf(c: Cylinder, t: number): number {
   let next = Infinity;
@@ -424,9 +460,44 @@ function denseTimeOf(c: Cylinder, t: number): number {
       }
     }
   }
-  if (c.knockOnset && c.mode !== MODE_OPEN) {
-    const tk = c.tKnockOnset;
-    if (t < tk + DENSE_KNOCK_DURATION) next = Math.min(next, tk + (Math.floor((t - tk) / DENSE_KNOCK_DT + 1e-6) + 1) * DENSE_KNOCK_DT);
+  return Math.min(next, denseKnockTime(c, t));
+}
+
+/** Next knock-ringing sample of a cylinder after t (10 µs for 3 ms after its onset; multi-cylinder 20 µs for 2 ms). */
+function denseKnockTime(c: Cylinder, t: number): number {
+  if (!c.knockOnset || c.mode === MODE_OPEN) return Infinity;
+  const tk = c.tKnockOnset;
+  const multi = c.e.cylinders.length > 1;
+  const dt = multi ? DENSE_KNOCK_DT_MULTI : DENSE_KNOCK_DT;
+  if (t < tk + (multi ? DENSE_KNOCK_DURATION_MULTI : DENSE_KNOCK_DURATION)) return tk + (Math.floor((t - tk) / dt + 1e-6) + 1) * dt;
+  return Infinity;
+}
+
+/**
+ * Next dense-sampling time of a trembler-magneto cylinder after t (Infinity if none): 5 µs for
+ * DENSE_TRIP_WINDOW after each vibrator trip (points opening: ring-up, breakdown and the early discharge)
+ * and after the timer break, DENSE_TRAIN_DT otherwise while the spark train is active (timer contact closed
+ * or the gap conducting), anchored at the timer make; knock ringing after its onset (denseKnockTime). The
+ * trip instants come from the ignition clock (TremblerCoil.lastTripTime), converted to model time with the
+ * clock offset at the last step (the cylinder splits advance the ignition with every step).
+ */
+function denseTimeTrembler(c: Cylinder, t: number): number {
+  let next = Infinity;
+  const ign = c.ign;
+  const tr = ign ? ign.trembler : null;
+  if (ign && tr && c.dwellSeen && !Number.isNaN(c.tSparkCmd)) {
+    const off = c.e.t - ign.time; // model time − ignition-clock time
+    // 5 µs windows after the latest trip of this event and after the timer break
+    for (let k = 0; k < 2; k++) {
+      const t0 = k === 0 ? (tr.tripCount > 0 ? tr.lastTripTime + off : Number.NaN) : c.tTimerBreak;
+      if (Number.isNaN(t0)) continue;
+      const tEnd = t0 + DENSE_TRIP_WINDOW;
+      if (t >= t0 - 1e-12 && t < tEnd - 1e-12) next = Math.min(next, t0 + (Math.floor((t - t0) / DENSE_SPARK_DT + 1e-6) + 1) * DENSE_SPARK_DT, tEnd);
+    }
+    if (ign.state.trainActive) {
+      const ts = c.tSparkCmd;
+      next = Math.min(next, ts + (Math.floor((t - ts) / DENSE_TRAIN_DT + 1e-6) + 1) * DENSE_TRAIN_DT);
+    }
   }
-  return next;
+  return Math.min(next, denseKnockTime(c, t));
 }
