@@ -2,19 +2,23 @@
  * The "Traces" tab: live crank-angle charts, the p–V diagram and the spark trace.
  * Only cards that are expanded, scrolled into view and on the active tab redraw,
  * and only when their inputs changed.
+ *
+ * Multi-cylinder engines: the θ, p–V and spark cards show the FOCUS cylinder at its
+ * local crank angle (toolbar selector; axis 'θ, cyl n'), and an extra card overlays
+ * the pressure of all cylinders against the engine angle.
  */
 import type { EngineSpec } from '../../physics/core/engine-spec';
 import type { CycleSummary, EngineSnapshot } from '../../physics/core/snapshot';
 import { cylinderVolumes, STROKE_LABEL, STROKES } from '../engine-cycle';
 import { sparkPhaseDurations, columnMax, type SparkEvent } from '../spark-capture';
-import { CH, polytropicIndex, type TraceSelection } from '../trace-store';
+import { CH, overlayPressureChannel, polytropicIndex, type TraceSelection } from '../trace-store';
 import { fmt, fmtMicros, fractionToPct, jToMJ, kgPerSToGPerS, m3ToCm3, mToMm, paToBar } from '../units';
 import { Card } from './card';
 import { ZoomGroup } from './plot-kit';
 import { PvPlot } from './pv-plot';
-import { SparkPlots } from './spark-plots';
+import { SPARK_DEFAULT_WINDOW_US, SPARK_SHOWER_WINDOW_US, SparkPlots } from './spark-plots';
 import { SERIES, STATUS, STROKE_COLOR, withAlpha } from './theme';
-import { ThetaPlot, type ThetaFrame } from './theta-plot';
+import { cylinderThetaLabel, ENGINE_THETA_LABEL, ThetaPlot, X_AXIS_LABEL, type ThetaFrame } from './theta-plot';
 
 export interface TraceFrame {
   sel: TraceSelection;
@@ -26,7 +30,27 @@ export interface TraceFrame {
   spark: SparkEvent | null;
   sparkVersion: number;
   lastCycle: CycleSummary | null;
+  /** All-cylinder pressure overlay (multi-cylinder engines; engine angle), or null. */
+  overlay?: TraceSelection | null;
+  /** Version of the overlay store. */
+  overlayVersion?: number;
+  /** Engine crank angle at the playback cursor (cylinder 1's), deg. */
+  engineTheta?: number;
 }
+
+export interface TracePanelOptions {
+  /** Cylinders of the engine (> 1 adds the focus selector and the all-cylinders card). */
+  cylinders?: number;
+  /** Initial focus cylinder, 0-based. */
+  focus?: number;
+  /** The user picked a focus cylinder in the toolbar. */
+  onFocus?: (index: number) => void;
+  /** Trembler ignition: the spark chart opens on a whole shower instead of one discharge. */
+  shower?: boolean;
+}
+
+/** Overlay colours of cylinders 1…n (yellow is reserved for the spark marker). */
+const CYLINDER_COLORS: readonly string[] = [SERIES.blue, SERIES.orange, SERIES.aqua, SERIES.violet, SERIES.magenta];
 
 const THETA_VIEWS: { label: string; title: string; range: [number, number] }[] = [
   { label: '720°', title: 'Whole cycle (−360° … 360°)', range: [-360, 360] },
@@ -50,6 +74,13 @@ export class TracePanel {
   private readonly cGas: Card;
   private readonly thetaCards: Card[];
   private readonly thetaFrame: ThetaFrame;
+  private readonly cylinders: number;
+  private focus = 0;
+  private readonly focusButtons: HTMLButtonElement[] = [];
+  private readonly cAll: Card | null = null;
+  private readonly allPlot: ThetaPlot | null = null;
+  private readonly allFrame: ThetaFrame = { sel: { current: null, currentCount: 0, ghosts: [] }, playheadTheta: 0, sparkDeg: NaN };
+  private lastOverlayVersion = -1;
   private readonly io: IntersectionObserver | null = null;
   private readonly ro: ResizeObserver | null = null;
   private readonly viewButtons: HTMLButtonElement[] = [];
@@ -67,7 +98,10 @@ export class TracePanel {
     host: HTMLElement,
     private readonly spec: EngineSpec,
     scrollRoot: HTMLElement,
+    private readonly opts: TracePanelOptions = {},
   ) {
+    this.cylinders = Math.max(1, Math.floor(opts.cylinders ?? 1));
+    this.focus = Math.min(this.cylinders - 1, Math.max(0, opts.focus ?? 0));
     this.el = document.createElement('div');
     this.el.className = 'oct-traces';
     host.appendChild(this.el);
@@ -93,6 +127,31 @@ export class TracePanel {
       this.viewButtons.push(b);
     }
     bar.appendChild(seg);
+    if (this.cylinders > 1) {
+      const clbl = document.createElement('span');
+      clbl.className = 'oct-toolbar-label';
+      clbl.textContent = 'Cylinder';
+      const cseg = document.createElement('div');
+      cseg.className = 'oct-seg oct-seg-cyl';
+      cseg.setAttribute('role', 'group');
+      cseg.setAttribute('aria-label', 'Focus cylinder');
+      for (let i = 0; i < this.cylinders; i++) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = String(i + 1);
+        b.title = `Show cylinder ${i + 1} in the crank-angle, p–V and ignition charts`;
+        b.addEventListener('click', () => {
+          this.setFocus(i);
+          this.opts.onFocus?.(i);
+        });
+        cseg.appendChild(b);
+        this.focusButtons.push(b);
+      }
+      const group = document.createElement('span');
+      group.className = 'oct-toolbar-group';
+      group.append(clbl, cseg);
+      bar.append(group);
+    }
     const hint = document.createElement('span');
     hint.className = 'oct-toolbar-hint';
     hint.textContent = 'drag to zoom · double-click resets';
@@ -123,6 +182,36 @@ export class TracePanel {
       range: { includeMin: 0, minSpan: 2 },
       series: [{ label: 'p', ch: CH.p, color: SERIES.blue, unit: 'bar', decimals: 2 }],
     });
+
+    // --- all cylinders (engine angle) ---
+    if (this.cylinders > 1) {
+      this.cAll = this.addCard(
+        'cylinders',
+        'Pressure, all cylinders',
+        'Every cylinder against the ENGINE crank angle (cylinder 1 = 0 at its firing TDC): the firing sequence and the cylinder-to-cylinder spread.',
+      );
+      this.allPlot = new ThetaPlot(
+        this.cAll.plotHost(),
+        {
+          yLabel: 'p [bar]',
+          height: 170,
+          ghosts: 0,
+          xLabels: true,
+          range: { includeMin: 0, minSpan: 2 },
+          series: Array.from({ length: this.cylinders }, (_, i) => ({
+            label: `cyl ${i + 1}`,
+            ch: overlayPressureChannel(i),
+            color: CYLINDER_COLORS[i % CYLINDER_COLORS.length],
+            unit: 'bar',
+            decimals: 2,
+          })),
+        },
+        this.thetaZoom,
+        this.width,
+        'theta-engine',
+      );
+      this.allPlot.setXLabel(ENGINE_THETA_LABEL);
+    }
 
     // --- p–V ---
     this.pvCard = this.addCard('pv', 'log p – log V', 'Indicator diagram on log–log axes; the current cycle is coloured by stroke.');
@@ -177,9 +266,14 @@ export class TracePanel {
 
     // --- spark ---
     this.sparkCard = this.addCard('spark', 'Ignition', 'Coil secondary voltage vs the breakdown voltage the gap requires, gap current and primary current, around the spark event.');
+    const sparkWindow = opts.shower ? SPARK_SHOWER_WINDOW_US : SPARK_DEFAULT_WINDOW_US;
     this.sparkCard.addAction('Fit', 'Show the whole captured event', () => this.spark.fit());
-    this.sparkCard.addAction('Reset', 'Default window (−200 µs … 2.5 ms)', () => this.spark.zoom.reset());
-    this.spark = new SparkPlots(this.sparkCard.body, this.width);
+    this.sparkCard.addAction(
+      'Reset',
+      opts.shower ? 'Default window (−4 ms … 12 ms: the coil build-up and the trembler shower)' : 'Default window (−200 µs … 2.5 ms)',
+      () => this.spark.zoom.reset(),
+    );
+    this.spark = new SparkPlots(this.sparkCard.body, this.width, sparkWindow);
     this.spark.zoom.onChange(() => (this.sparkCard.stale = true));
 
     // --- gas exchange ---
@@ -209,6 +303,7 @@ export class TracePanel {
     });
 
     this.thetaCards = [this.cPressure, this.cBurn, this.cTemp, this.cGas];
+    if (this.cylinders > 1) this.setFocus(this.focus);
 
     if (typeof IntersectionObserver !== 'undefined') {
       this.io = new IntersectionObserver(
@@ -256,10 +351,32 @@ export class TracePanel {
     return w > 0 ? Math.max(200, Math.floor(w)) : 0;
   }
 
+  /** Focus cylinder of the θ, p–V and spark cards (0-based; multi-cylinder engines). */
+  setFocus(index: number): void {
+    const i = Math.min(this.cylinders - 1, Math.max(0, Math.floor(index)));
+    this.focus = i;
+    this.focusButtons.forEach((b, k) => {
+      b.classList.toggle('is-on', k === i);
+      b.setAttribute('aria-pressed', String(k === i));
+    });
+    const label = this.cylinders > 1 ? cylinderThetaLabel(i) : X_AXIS_LABEL;
+    for (const { plot } of this.thetaPlots) plot.setXLabel(label);
+    this.pvStats.version = -2;
+    this.lastVersion = -1;
+    this.lastSparkVersion = -1;
+    this.lastSparkReadout = -1;
+    for (const c of this.cards) c.stale = true;
+  }
+
+  get focusCylinder(): number {
+    return this.focus;
+  }
+
   resize(): void {
     const w = this.measureWidth();
     if (w === 0 || w === this.width) return;
     this.width = w;
+    this.allPlot?.resize(w);
     for (const { plot } of this.thetaPlots) plot.resize(w);
     this.pv.resize(w);
     this.spark.resize(w);
@@ -286,6 +403,19 @@ export class TracePanel {
     for (const c of this.thetaCards) c.redraw = c.active && (anyChange || c.stale);
     for (const { card, plot } of this.thetaPlots) if (card.redraw) plot.update(tf);
     for (const c of this.thetaCards) if (c.redraw) c.stale = false;
+
+    const all = this.cAll;
+    if (all && this.allPlot && f.overlay) {
+      const ov = f.overlayVersion ?? -1;
+      if (all.active && (ov !== this.lastOverlayVersion || dataChanged || zoomChanged || all.stale)) {
+        this.lastOverlayVersion = ov;
+        const af = this.allFrame;
+        af.sel = f.overlay;
+        af.playheadTheta = f.engineTheta ?? f.playhead.thetaDeg;
+        this.allPlot.update(af);
+        all.stale = false;
+      }
+    }
 
     if (this.pvCard.active && (dataChanged || this.pvCard.stale || f.compressionRatio !== this.lastCR)) {
       if (f.compressionRatio !== this.lastCR) {
@@ -350,6 +480,10 @@ export class TracePanel {
       broke ? `V_peak ${fmt(vPeak, 1)} kV` : `no breakdown (V_peak ${fmt(vPeak, 1)} kV)`,
       `E ${fmt(jToMJ(ev.energy), 1)} mJ`,
     ];
+    if (ev.shower || ev.sparkCount > 1) {
+      // Trembler shower: how many sparks the timer contact produced and where the first one fired.
+      parts.unshift(`${ev.sparkCount} spark${ev.sparkCount === 1 ? '' : 's'}${broke ? ` · first @ ${fmt(ev.firstSparkDeg, 1)}°` : ''}`);
+    }
     if (d.arc > 0) parts.push(`arc ${fmtMicros(d.arc * 1e6)}`);
     if (d.glow > 0) parts.push(`glow ${fmtMicros(d.glow * 1e6)}`);
     if (!ev.complete) parts.push('live');
@@ -367,6 +501,7 @@ export class TracePanel {
     this.io?.disconnect();
     this.ro?.disconnect();
     for (const { plot } of this.thetaPlots) plot.dispose();
+    this.allPlot?.dispose();
     this.pv.dispose();
     this.spark.dispose();
     this.el.remove();

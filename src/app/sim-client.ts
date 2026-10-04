@@ -14,16 +14,97 @@
  */
 import type { EngineSpec } from '../physics/core/engine-spec';
 import type { OperatingPoint } from '../physics/core/operating-point';
-import type { CycleSummary, EngineSnapshot } from '../physics/core/snapshot';
+import type { CycleSummary, CylinderSnapshot, EngineSnapshot } from '../physics/core/snapshot';
 import type { FromWorker, SimulatorOptions, ToWorker } from '../worker/protocol';
 
 // ---------------------------------------------------------------------------
 // Snapshot helpers
 // ---------------------------------------------------------------------------
 
-/** A zero-filled snapshot (used as a reusable interpolation target). */
-export function createEmptySnapshot(): EngineSnapshot {
+/** Per-cylinder fields shared by the top level of EngineSnapshot (cylinder 1) and CylinderSnapshot. */
+export type CylinderFields = Omit<CylinderSnapshot, 'index' | 'thetaDeg' | 'cycle' | 'gasTorque'>;
+
+function emptyFlame(): EngineSnapshot['flame'] {
   return {
+    stage: 'none',
+    radius: 0,
+    center: [0, 0, 0],
+    area: 0,
+    laminarSpeed: 0,
+    turbulentSpeed: 0,
+    turbulenceIntensity: 0,
+  };
+}
+
+function emptySpark(): EngineSnapshot['spark'] {
+  return {
+    phase: 'off',
+    primaryCurrent: 0,
+    secondaryVoltage: 0,
+    secondaryCurrent: 0,
+    energyDelivered: 0,
+    breakdownVoltage: 0,
+    // Optional trembler fields, declared up front so the scratch objects keep one shape.
+    breakdownCount: undefined,
+    pointsOpen: undefined,
+    timerClosed: undefined,
+    firstSparkDeg: undefined,
+    primaryVoltage: undefined,
+  };
+}
+
+const emptyKnock = (): EngineSnapshot['knock'] => ({ integral: 0, autoignited: false, oscillation: 0 });
+
+const emptyComposition = (): EngineSnapshot['burnedComposition'] => ({
+  CO2: 0,
+  H2O: 0,
+  CO: 0,
+  O2: 0,
+  H2: 0,
+  OH: 0,
+  H: 0,
+  O: 0,
+  NO: 0,
+  N2: 0,
+});
+
+/** A zero-filled per-cylinder snapshot (reusable interpolation target for `cylinders[index]`). */
+export function createEmptyCylinderSnapshot(index: number): CylinderSnapshot {
+  return {
+    index,
+    thetaDeg: -360,
+    cycle: 0,
+    gasTorque: 0,
+    pistonDisplacement: 0,
+    clearanceHeight: 0,
+    rodAngle: 0,
+    intakeLift: 0,
+    exhaustLift: 0,
+    phase: 'gas-exchange',
+    volume: 0,
+    pressure: 0,
+    temperatureMean: 0,
+    temperatureUnburned: 0,
+    temperatureBurned: 0,
+    massFractionBurned: 0,
+    mass: 0,
+    heatReleaseRate: 0,
+    heatLossRate: 0,
+    flame: emptyFlame(),
+    spark: emptySpark(),
+    intakeMassFlow: 0,
+    exhaustMassFlow: 0,
+    knock: emptyKnock(),
+    burnedComposition: emptyComposition(),
+  };
+}
+
+/**
+ * A zero-filled snapshot (used as a reusable interpolation target). `cylinders` > 0 preallocates
+ * `cylinders[]` for a multi-cylinder stream (0: none, as single-cylinder specs emit).
+ */
+export function createEmptySnapshot(cylinders = 0): EngineSnapshot {
+  const s: EngineSnapshot = {
     t: 0,
     cycle: 0,
     thetaDeg: -360,
@@ -43,32 +124,26 @@ export function createEmptySnapshot(): EngineSnapshot {
     mass: 0,
     heatReleaseRate: 0,
     heatLossRate: 0,
-    flame: {
-      stage: 'none',
-      radius: 0,
-      center: [0, 0, 0],
-      area: 0,
-      laminarSpeed: 0,
-      turbulentSpeed: 0,
-      turbulenceIntensity: 0,
-    },
-    spark: {
-      phase: 'off',
-      primaryCurrent: 0,
-      secondaryVoltage: 0,
-      secondaryCurrent: 0,
-      energyDelivered: 0,
-      breakdownVoltage: 0,
-    },
+    flame: emptyFlame(),
+    spark: emptySpark(),
     intakeMassFlow: 0,
     exhaustMassFlow: 0,
     intakeManifoldPressure: 0,
     exhaustManifoldPressure: 0,
-    knock: { integral: 0, autoignited: false, oscillation: 0 },
-    burnedComposition: { CO2: 0, H2O: 0, CO: 0, O2: 0, H2: 0, OH: 0, H: 0, O: 0, NO: 0, N2: 0 },
+    knock: emptyKnock(),
+    burnedComposition: emptyComposition(),
     gasTorque: 0,
     netTorque: 0,
+    // Optional engine-level fields (undefined = not reported by the simulator).
+    frictionTorque: undefined,
+    loadTorque: undefined,
+    vehicleSpeed: undefined,
+    cylinders: undefined,
+    firingCylinder: undefined,
+    magnetoEmf: undefined,
   };
+  if (cylinders > 0) s.cylinders = Array.from({ length: cylinders }, (_, i) => createEmptyCylinderSnapshot(i));
+  return s;
 }
 
 /** Monotonic crank angle, deg: cycle·720 + θ + 360 (0 at t = 0 for a run starting at θ = −360). */
@@ -92,27 +167,19 @@ export function lerpCrankAngleDeg(a: number, b: number, alpha: number): number {
 
 const lerp = (x: number, y: number, u: number): number => x + (y - x) * u;
 
+/** Optional scalar: linear when both ends carry it, else whichever end has it (undefined if neither). */
+function lerpOpt(x: number | undefined, y: number | undefined, u: number): number | undefined {
+  if (x === undefined) return y;
+  if (y === undefined) return x;
+  return x + (y - x) * u;
+}
+
 /**
- * Interpolate between two snapshots (a earlier, b later) into `out`:
- * linear for scalars, wrap-aware for thetaDeg; discrete fields (phase, flame
- * stage, spark phase, autoignited) and `cycle` come from the earlier sample —
- * or from the later one when the interpolated angle has crossed the cycle wrap,
- * so the result is always consistent with its own (cycle, thetaDeg).
+ * Per-cylinder fields of a → b into `out`: scalars linear, discrete fields (phase, flame stage, spark
+ * phase and the trembler flags/counters, autoignited) from `d`, the sample on the same side of this
+ * cylinder's cycle wrap as the interpolated angle.
  */
-export function interpolateSnapshot(
-  a: EngineSnapshot,
-  b: EngineSnapshot,
-  alpha: number,
-  out: EngineSnapshot,
-): EngineSnapshot {
-  const u = alpha < 0 ? 0 : alpha > 1 ? 1 : alpha;
-  const th = lerpCrankAngleDeg(a.thetaDeg, b.thetaDeg, u);
-  const wrapped = b.cycle !== a.cycle && th < a.thetaDeg;
-  const d = wrapped ? b : a;
-  out.t = lerp(a.t, b.t, u);
-  out.cycle = d.cycle;
-  out.thetaDeg = th;
-  out.rpm = lerp(a.rpm, b.rpm, u);
+function lerpCylinderFields(a: CylinderFields, b: CylinderFields, d: CylinderFields, u: number, out: CylinderFields): void {
   out.pistonDisplacement = lerp(a.pistonDisplacement, b.pistonDisplacement, u);
   out.clearanceHeight = lerp(a.clearanceHeight, b.clearanceHeight, u);
   out.rodAngle = lerp(a.rodAngle, b.rodAngle, u);
@@ -144,18 +211,22 @@ export function interpolateSnapshot(
 
   const sa = a.spark;
   const sb = b.spark;
+  const sd = d.spark;
   const so = out.spark;
-  so.phase = d.spark.phase;
+  so.phase = sd.phase;
   so.primaryCurrent = lerp(sa.primaryCurrent, sb.primaryCurrent, u);
   so.secondaryVoltage = lerp(sa.secondaryVoltage, sb.secondaryVoltage, u);
   so.secondaryCurrent = lerp(sa.secondaryCurrent, sb.secondaryCurrent, u);
   so.energyDelivered = lerp(sa.energyDelivered, sb.energyDelivered, u);
   so.breakdownVoltage = lerp(sa.breakdownVoltage, sb.breakdownVoltage, u);
+  so.breakdownCount = sd.breakdownCount;
+  so.pointsOpen = sd.pointsOpen;
+  so.timerClosed = sd.timerClosed;
+  so.firstSparkDeg = sd.firstSparkDeg;
+  so.primaryVoltage = lerpOpt(sa.primaryVoltage, sb.primaryVoltage, u);
 
   out.intakeMassFlow = lerp(a.intakeMassFlow, b.intakeMassFlow, u);
   out.exhaustMassFlow = lerp(a.exhaustMassFlow, b.exhaustMassFlow, u);
-  out.intakeManifoldPressure = lerp(a.intakeManifoldPressure, b.intakeManifoldPressure, u);
-  out.exhaustManifoldPressure = lerp(a.exhaustManifoldPressure, b.exhaustManifoldPressure, u);
 
   out.knock.integral = lerp(a.knock.integral, b.knock.integral, u);
   out.knock.autoignited = d.knock.autoignited;
@@ -174,9 +245,73 @@ export function interpolateSnapshot(
   co.O = lerp(ca.O, cb.O, u);
   co.NO = lerp(ca.NO, cb.NO, u);
   co.N2 = lerp(ca.N2, cb.N2, u);
+}
 
+/**
+ * Interpolate one cylinder (a earlier, b later) into `out`, with this cylinder's OWN cycle wrap
+ * choosing the discrete fields (its local angle wraps at a different engine angle than cylinder 1's).
+ */
+export function interpolateCylinder(a: CylinderSnapshot, b: CylinderSnapshot, alpha: number, out: CylinderSnapshot): CylinderSnapshot {
+  const u = alpha < 0 ? 0 : alpha > 1 ? 1 : alpha;
+  const th = lerpCrankAngleDeg(a.thetaDeg, b.thetaDeg, u);
+  const d = b.cycle !== a.cycle && th < a.thetaDeg ? b : a;
+  out.index = a.index;
+  out.thetaDeg = th;
+  out.cycle = d.cycle;
+  out.gasTorque = lerp(a.gasTorque, b.gasTorque, u);
+  lerpCylinderFields(a, b, d, u, out);
+  return out;
+}
+
+/**
+ * Interpolate between two snapshots (a earlier, b later) into `out`:
+ * linear for scalars, wrap-aware for thetaDeg; discrete fields (phase, flame
+ * stage, spark phase, autoignited) and `cycle` come from the earlier sample —
+ * or from the later one when the interpolated angle has crossed the cycle wrap,
+ * so the result is always consistent with its own (cycle, thetaDeg).
+ *
+ * Multi-cylinder streams: `cylinders[i]` is interpolated the same way, each with its own cycle wrap
+ * (into `out.cylinders`, preallocated by createEmptySnapshot(n); allocated once here otherwise).
+ * Optional fields are carried when the samples have them and left undefined when they do not.
+ */
+export function interpolateSnapshot(
+  a: EngineSnapshot,
+  b: EngineSnapshot,
+  alpha: number,
+  out: EngineSnapshot,
+): EngineSnapshot {
+  const u = alpha < 0 ? 0 : alpha > 1 ? 1 : alpha;
+  const th = lerpCrankAngleDeg(a.thetaDeg, b.thetaDeg, u);
+  const wrapped = b.cycle !== a.cycle && th < a.thetaDeg;
+  const d = wrapped ? b : a;
+  out.t = lerp(a.t, b.t, u);
+  out.cycle = d.cycle;
+  out.thetaDeg = th;
+  out.rpm = lerp(a.rpm, b.rpm, u);
+  lerpCylinderFields(a, b, d, u, out);
+  out.intakeManifoldPressure = lerp(a.intakeManifoldPressure, b.intakeManifoldPressure, u);
+  out.exhaustManifoldPressure = lerp(a.exhaustManifoldPressure, b.exhaustManifoldPressure, u);
   out.gasTorque = lerp(a.gasTorque, b.gasTorque, u);
   out.netTorque = lerp(a.netTorque, b.netTorque, u);
+
+  out.frictionTorque = lerpOpt(a.frictionTorque, b.frictionTorque, u);
+  out.loadTorque = lerpOpt(a.loadTorque, b.loadTorque, u);
+  out.vehicleSpeed = lerpOpt(a.vehicleSpeed, b.vehicleSpeed, u);
+  out.magnetoEmf = lerpOpt(a.magnetoEmf, b.magnetoEmf, u);
+  out.firingCylinder = d.firingCylinder;
+
+  const ca = a.cylinders;
+  if (ca) {
+    const cb = b.cylinders && b.cylinders.length === ca.length ? b.cylinders : ca;
+    let co = out.cylinders;
+    if (!co || co.length !== ca.length) {
+      co = out.cylinders = [];
+      for (let i = 0; i < ca.length; i++) co.push(createEmptyCylinderSnapshot(i));
+    }
+    for (let i = 0; i < ca.length; i++) interpolateCylinder(ca[i], cb[i], cb === ca ? 0 : u, co[i]);
+  } else {
+    out.cylinders = undefined;
+  }
   return out;
 }
 
@@ -385,27 +520,35 @@ export class SimClient {
   private readonly minAhead: number;
   private readonly buffer = new SnapshotBuffer();
   private readonly cycleListeners: ((c: CycleSummary) => void)[] = [];
+  private readonly errorListeners: ((message: string) => void)[] = [];
   private pendingCycles: CycleSummary[] = [];
-  private lastEmittedCycle = -1;
+  /** Newest delivered summary per cylinder (index = CycleSummary.cylinder ?? 0). */
+  private lastEmitted: number[] = [];
   private playback = NaN;
   /** Data is ignored until the worker's next 'ready' (after init / reset). */
   private awaitingReady = true;
   private lastDemand = NaN;
   private timeScale = 0.1;
-  private readonly outs: [EngineSnapshot, EngineSnapshot] = [createEmptySnapshot(), createEmptySnapshot()];
+  private readonly outs: [EngineSnapshot, EngineSnapshot];
   private outIndex = 0;
-  private readonly scratch: EngineSnapshot = createEmptySnapshot();
+  private readonly scratch: EngineSnapshot;
   private readonly recent: EngineSnapshot[] = [];
   private resolveReady!: () => void;
   private rejectReady!: (e: unknown) => void;
   private isReady = false;
   private disposed = false;
+  private _starved = false;
+  private _error: string | null = null;
 
   constructor(spec: EngineSpec, op: OperatingPoint, options: SimulatorOptions, config: SimClientConfig = {}) {
     this.options = { ...options };
     this.historyCycles = Math.max(1, config.historyCycles ?? 4);
     this.aheadWall = Math.max(0, config.aheadWallSeconds ?? 0.5);
     this.minAhead = Math.max(0, config.minAheadSeconds ?? 0.02);
+    // Multi-cylinder streams carry cylinders[]: preallocate the interpolation targets for them.
+    const nCyl = spec.cylinders > 1 ? spec.cylinders : 0;
+    this.outs = [createEmptySnapshot(nCyl), createEmptySnapshot(nCyl)];
+    this.scratch = createEmptySnapshot(nCyl);
     this.ready = new Promise<void>((resolve, reject) => {
       this.resolveReady = resolve;
       this.rejectReady = reject;
@@ -416,7 +559,7 @@ export class SimClient {
     this.worker.onmessage = (ev) => this.handleMessage(ev.data);
     this.worker.onerror = (ev) => {
       console.error('[sim worker] error', ev.message ?? ev);
-      if (!this.isReady) this.rejectReady(new Error(`simulation worker failed: ${ev.message}`));
+      this.reportError(`simulation worker failed: ${ev.message}`);
     };
     this.post({ type: 'init', spec, operatingPoint: op, options: this.options });
     this.maybeDemand(true);
@@ -434,9 +577,29 @@ export class SimClient {
   get bufferedCount(): number {
     return this.buffer.length;
   }
+  /**
+   * True when the latest advance() wanted to move past the newest buffered sample: playback is
+   * waiting for the simulator (simulation-limited, e.g. a multi-cylinder engine at a high time scale).
+   */
+  get starved(): boolean {
+    return this._starved;
+  }
+  /** The first error the worker reported (simulator construction or run failure), or null. */
+  get error(): string | null {
+    return this._error;
+  }
 
   onCycle(cb: (c: CycleSummary) => void): void {
     this.cycleListeners.push(cb);
+  }
+
+  /**
+   * Called when the worker reports an error: a failed init (e.g. a simulator that does not support the
+   * spec), a simulator exception, or the worker script itself failing. `ready` rejects if it is still
+   * pending.
+   */
+  onError(cb: (message: string) => void): void {
+    this.errorListeners.push(cb);
   }
 
   setOperatingPoint(patch: Partial<OperatingPoint>): void {
@@ -448,8 +611,9 @@ export class SimClient {
     this.post({ type: 'reset' });
     this.buffer.clear();
     this.pendingCycles = [];
-    this.lastEmittedCycle = -1;
+    this.lastEmitted = [];
     this.playback = NaN;
+    this._starved = false;
     this.awaitingReady = true;
     this.lastDemand = NaN;
     this.maybeDemand(true);
@@ -471,7 +635,9 @@ export class SimClient {
     }
     if (Number.isNaN(this.playback)) this.playback = this.buffer.earliestTime;
     const dt = Math.max(0, dtWall) * this.timeScale;
-    this.playback = Math.min(this.playback + dt, this.buffer.latestTime);
+    const want = this.playback + dt;
+    this._starved = dt > 0 && want > this.buffer.latestTime;
+    this.playback = Math.min(want, this.buffer.latestTime);
     return this.finishMove();
   }
 
@@ -511,6 +677,7 @@ export class SimClient {
     this.buffer.clear();
     this.pendingCycles = [];
     this.cycleListeners.length = 0;
+    this.errorListeners.length = 0;
   }
 
   /** Handle one message from the worker (public for tests / custom transports). */
@@ -528,7 +695,7 @@ export class SimClient {
         if (!this.awaitingReady) this.buffer.pushBatch(msg.batch);
         break;
       case 'cycle':
-        if (!this.awaitingReady && msg.summary.cycle > this.lastEmittedCycle) {
+        if (!this.awaitingReady && msg.summary.cycle > (this.lastEmitted[msg.summary.cylinder ?? 0] ?? -1)) {
           this.pendingCycles.push(msg.summary);
           if (this.pendingCycles.length > MAX_PENDING_CYCLES) this.pendingCycles.shift();
         }
@@ -536,6 +703,7 @@ export class SimClient {
       case 'log': {
         const fn = msg.level === 'error' ? console.error : msg.level === 'warn' ? console.warn : console.info;
         fn(`[sim worker] ${msg.message}`);
+        if (msg.level === 'error') this.reportError(msg.message);
         break;
       }
     }
@@ -554,7 +722,7 @@ export class SimClient {
 
   private finishMove(): EngineSnapshot {
     const out = this.buffer.sample(this.playback, this.nextOut())!;
-    this.flushCycles(out.cycle);
+    this.flushCycles(out);
     const rpm = out.rpm > 1 ? out.rpm : 600;
     const keep = (this.historyCycles * 120) / rpm;
     this.buffer.trimBefore(this.playback - keep);
@@ -562,11 +730,28 @@ export class SimClient {
     return out;
   }
 
-  /** Deliver summaries of cycles that playback has completed. */
-  private flushCycles(currentCycle: number): void {
-    while (this.pendingCycles.length > 0 && this.pendingCycles[0].cycle < currentCycle) {
-      const c = this.pendingCycles.shift()!;
-      this.lastEmittedCycle = c.cycle;
+  private reportError(message: string): void {
+    if (this._error === null) this._error = message;
+    if (!this.isReady) this.rejectReady(new Error(message));
+    for (const cb of this.errorListeners) cb(message);
+  }
+
+  /**
+   * Deliver summaries of cycles that playback has completed: a summary of cylinder k is due once
+   * playback is in a later cycle of THAT cylinder (cylinders[k].cycle; the engine cycle for a
+   * single-cylinder stream). Summaries arrive in completion order, so the queue is FIFO; one that would
+   * otherwise wait more than an engine cycle (a simulator numbering cylinder cycles differently) is
+   * released anyway.
+   */
+  private flushCycles(s: EngineSnapshot): void {
+    const cyl = s.cylinders;
+    while (this.pendingCycles.length > 0) {
+      const c = this.pendingCycles[0];
+      const k = c.cylinder ?? 0;
+      const current = cyl && k < cyl.length ? cyl[k].cycle : s.cycle;
+      if (!(c.cycle < current || c.cycle < s.cycle - 1)) break;
+      this.pendingCycles.shift();
+      this.lastEmitted[k] = c.cycle;
       for (const cb of this.cycleListeners) cb(c);
     }
   }

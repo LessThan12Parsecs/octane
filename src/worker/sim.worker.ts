@@ -28,8 +28,8 @@ import type { SimulatorFactory, SimulatorLike } from './simulator-like';
  *  - `simulator`: 'physics' (default, src/physics/cycle EngineSimulator) or 'mock'
  *    (MockSimulator — the lightweight stand-in, e.g. for UI work or slow machines);
  *  - any CycleModelOptions / MockSimulatorOptions overrides for the chosen simulator.
- * (Extra fields survive structured cloning, so the main thread can pass them through
- * SimClient unchanged; wiring a `?sim=mock` URL flag in the app is a one-line addition there.)
+ * (Extra fields survive structured cloning, so the main thread passes them through SimClient
+ * unchanged; the app sets `simulator: 'mock'` for the `?sim=mock` URL flag.)
  */
 export type WorkerSimulatorOptions = SimulatorOptions &
   Partial<CycleModelOptions> &
@@ -37,11 +37,26 @@ export type WorkerSimulatorOptions = SimulatorOptions &
     simulator?: 'physics' | 'mock';
   };
 
-/** THE simulator used by the worker: the physics EngineSimulator unless `simulator: 'mock'`. */
+/**
+ * THE simulator used by the worker: the physics EngineSimulator unless `simulator: 'mock'`. The spec
+ * travels in the init message, and spec.id selects the physics model's per-engine option defaults
+ * (cycle/options.ts); EngineSimulator handles multi-cylinder specs itself. The mock models a single
+ * cylinder only: asking it for a multi-cylinder engine is an error (reported to the app as a worker log
+ * error, which the app shows).
+ */
 export const createSimulator: SimulatorFactory = (spec, op, options) => {
   const o = options as WorkerSimulatorOptions;
-  return o.simulator === 'mock' ? new MockSimulator(spec, op, o) : new EngineSimulator(spec, op, o);
+  if (o.simulator === 'mock') {
+    if (spec.cylinders > 1) throw new Error(mockUnsupportedMessage(spec));
+    return new MockSimulator(spec, op, o);
+  }
+  return new EngineSimulator(spec, op, o);
 };
+
+/** Why the mock simulator cannot run a spec (multi-cylinder engines). */
+export function mockUnsupportedMessage(spec: { name: string; cylinders: number }): string {
+  return `The mock simulator models a single cylinder; ${spec.name} has ${spec.cylinders}. Use the physics simulator (drop ?sim=mock).`;
+}
 
 /** Environment the host runs in (the worker global scope, or a test harness). */
 export interface HostPort {

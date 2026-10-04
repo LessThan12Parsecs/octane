@@ -60,6 +60,80 @@
   color: var(--oct-text-2, #a3acb9);
 }
 
+.oct-stage-status .oct-stage-status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+  pointer-events: auto;
+}
+
+.oct-stage-status .oct-stage-status-actions[hidden] {
+  display: none;
+}
+
+.oct-stage-status-actions button {
+  padding: 4px 10px;
+  border: 1px solid var(--oct-border-strong, rgba(255, 255, 255, 0.14));
+  border-radius: 5px;
+  background: var(--oct-surface-3, #1c222b);
+  color: var(--oct-text, #e6e9ee);
+  font: inherit;
+  cursor: pointer;
+}
+
+.oct-stage-status-actions button:hover {
+  background: var(--oct-accent-soft, rgba(57, 135, 229, 0.18));
+}
+
+.oct-stage-status-actions button:focus-visible {
+  outline: 2px solid var(--oct-accent, #3987e5);
+  outline-offset: 1px;
+}
+
+/* Playback is waiting for the simulator. */
+.oct-stage-limited {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  max-width: calc(100% - 32px);
+  padding: 4px 10px;
+  overflow: hidden;
+  transform: translateX(-50%);
+  border: 1px solid rgba(250, 178, 25, 0.35);
+  border-radius: 999px;
+  background: rgba(18, 22, 28, 0.88);
+  color: var(--oct-warning, #fab219);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.oct-stage-limited[hidden] {
+  display: none;
+}
+
+.oct-engine-pick select {
+  max-width: 180px;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 5px;
+  background: var(--oct-surface-3, #1c222b);
+  color: var(--oct-text, #e6e9ee);
+  font: inherit;
+  cursor: pointer;
+}
+
+.oct-engine-pick select:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+.oct-engine-pick select:focus-visible {
+  outline: 2px solid var(--oct-accent, #3987e5);
+  outline-offset: 1px;
+}
+
 .oct-stage-dock {
   position: absolute;
   right: 12px;

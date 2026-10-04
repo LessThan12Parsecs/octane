@@ -3,26 +3,35 @@
  * mechanism + in-cylinder combustion visuals) and the UI together and runs the
  * animation loop.
  *
- *   SimClient (worker) ──snapshots──▶ Conductor ──▶ EngineModel.update
- *                                               ├─▶ CombustionVisuals.update
+ *   SimClient (worker) ──snapshots──▶ Conductor ──▶ EngineRenderModel.update
+ *                                               ├─▶ CombustionVisuals.update (one per cylinder)
  *                                               └─▶ UIController.update (+ pushCycle)
  *   UIController callbacks ──▶ Conductor (operating point, playback, step, view, reset)
  *
- * Starts on the CFR Research-method (RON) conditions in slow motion, framed on
- * the combustion chamber.
+ * The App is a SHELL that lives as long as the page — Stage (one WebGL context),
+ * viewport overlay (engine picker, framing, status), rAF loop, keyboard and
+ * camera framing — around a disposable EngineSession (session.ts) holding
+ * everything engine-specific. setEngine(id) builds the new session first and
+ * swaps it in atomically, so a failure (e.g. an engine whose 3D model is not
+ * available) leaves the running engine untouched.
+ *
+ * Starts on the engine from ?engine=, the remembered choice or the default (the
+ * CFR at its Research-method conditions) in slow motion, framed on the chamber.
  */
-import * as THREE from 'three';
 import type { EngineSpec } from '../physics/core/engine-spec';
 import type { OperatingPoint } from '../physics/core/operating-point';
 import type { EngineSnapshot } from '../physics/core/snapshot';
-import { CFR_F1, CFR_RON_CONDITIONS } from '../physics/engines/cfr';
-import { CombustionVisuals, createTemperatureLegendElement, EngineModel, recommendedCameraView, Stage } from '../render/index';
-import { UIController } from '../ui/index';
+import { DEFAULT_ENGINE_ID, ENGINES, type EngineDefinition } from '../physics/engines/index';
+import { createTemperatureLegendElement, Stage, type CameraView } from '../render/index';
+import { definitionForSpec, engineTitle } from '../ui/index';
+import { loadPref, savePref } from '../ui/prefs';
 import type { SimulatorOptions } from '../worker/protocol';
-import { Conductor, type ViewState } from './conductor';
-import { ViewportOverlay } from './overlay';
-import { SimClient } from './sim-client';
-import { clampOperatingPoint, framingDistanceScale, parseUrlOptions, type Framing } from './sync';
+import type { PlaybackState, ViewState } from './conductor';
+import { engineChoices, initialOperatingPoint, isEngineId, resolveEngine } from './engines';
+import { ViewportOverlay, type StatusAction } from './overlay';
+import './register-engines';
+import { EngineSession } from './session';
+import { clampOperatingPoint, errorSummary, framingDistanceScale, parseUrlOptions, searchWithEngine, type Framing } from './sync';
 
 /** Default playback speed: 1/50 of real time (a 600 rpm burn of ~5 ms takes ~¼ s). */
 export const DEFAULT_TIME_SCALE = 1 / 50;
@@ -39,121 +48,132 @@ export const DEFAULT_SIMULATOR_OPTIONS: SimulatorOptions = { snapshotEveryDeg: 0
 
 /** Seconds without a first snapshot before the status card reports a stall. */
 const STALL_WARNING_SECONDS = 10;
+/** Consecutive starved / fed frames before the simulation-limited hint appears / goes. */
+const LIMITED_FRAMES = 45;
+/** localStorage key (prefs.ts) of the remembered engine. */
+const ENGINE_PREF = 'engine';
 
 export interface AppOptions {
   /** Element with class `oct-viewport` that receives the canvas. */
   viewport: HTMLElement;
   /** Container for the UI overlay (controls, charts, HUD). */
   uiContainer: HTMLElement;
+  /** Engine registry id to start with (default: ?engine=, the remembered choice, else the CFR). */
+  engineId?: string;
+  /** Ad-hoc spec to run instead of a registry engine (tests, experiments). */
   spec?: EngineSpec;
-  /** Initial operating point (default: CFR RON conditions). */
+  /** Initial operating point (default: the engine's default operating point). */
   operatingPoint?: OperatingPoint;
   simulatorOptions?: SimulatorOptions;
-  /** `location.search` for the URL knobs (?cr=&on=&rpm=&spark=&phi=&ts=&paused=&view=). */
+  /** `location.search` for the URL knobs (?engine=&cr=&on=&rpm=&spark=&phi=&ts=&paused=&view=&cyl=&sim=). */
   search?: string;
+  /** Write the engine choice back to the address bar (history.replaceState) on a switch (default true). */
+  syncUrl?: boolean;
 }
 
 export class App {
-  readonly spec: EngineSpec;
   readonly stage: Stage;
-  readonly engine: EngineModel;
-  readonly combustion: CombustionVisuals;
-  readonly sim: SimClient;
-  readonly conductor: Conductor;
-  readonly ui: UIController;
+  private session: EngineSession;
   private readonly overlay: ViewportOverlay;
+  private readonly uiContainer: HTMLElement;
+  private readonly simulatorOptions: SimulatorOptions;
+  private readonly syncUrl: boolean;
   private framing: Framing;
+  private focus = 0;
   private raf = 0;
   private startedAt = NaN;
   private hasData = false;
   private failed = false;
   private disposed = false;
+  /** Last engine that produced data (target of "switch back" after a failure). */
+  private lastGoodEngine: string | null = null;
+  private starvedFrames = 0;
+  private fedFrames = 0;
+  private limitedShown = false;
+  /** A dismissable notice (engine not available) is showing: data arriving must not hide it. */
+  private notice = false;
 
   constructor(opts: AppOptions) {
-    const spec = (this.spec = opts.spec ?? CFR_F1);
     const url = parseUrlOptions(opts.search ?? '');
-    const op = clampOperatingPoint(spec, { ...(opts.operatingPoint ?? CFR_RON_CONDITIONS), ...url.op });
+    this.uiContainer = opts.uiContainer;
+    this.syncUrl = opts.syncUrl ?? true;
     this.framing = url.framing ?? 'chamber';
+    const base = opts.simulatorOptions ?? DEFAULT_SIMULATOR_OPTIONS;
+    // ?sim=mock: the lightweight single-cylinder stand-in (extra fields pass through to the worker).
+    this.simulatorOptions = url.simulator ? ({ ...base, simulator: url.simulator } as SimulatorOptions) : base;
 
-    // If anything below throws (e.g. no WebGL 2), release what was already created.
-    const created: { dispose(): void }[] = [];
-    const track = <T extends { dispose(): void }>(x: T): T => {
-      created.push(x);
-      return x;
-    };
+    const requested: EngineDefinition = opts.spec
+      ? definitionForSpec(opts.spec)
+      : resolveEngine(opts.engineId, url.engine, loadPref<string | null>(ENGINE_PREF, null));
+    this.focus = Math.max(0, Math.min(requested.spec.cylinders - 1, url.focusCylinder ?? 0));
+    const op = initialOperatingPoint(requested, url.op, opts.operatingPoint);
+    const playback: PlaybackState = { timeScale: url.timeScale ?? DEFAULT_TIME_SCALE, paused: url.paused ?? false };
+
+    // ---- shell ----
+    this.stage = new Stage(opts.viewport);
+    let session: EngineSession | null = null;
+    let startError: { def: EngineDefinition; err: unknown } | null = null;
+    let overlay: ViewportOverlay | null = null;
     try {
-      // ---- 3D ----
-      this.stage = track(new Stage(opts.viewport));
-      this.engine = track(new EngineModel(spec, op.compressionRatio));
-      this.stage.scene.add(this.engine.root);
-      this.combustion = track(new CombustionVisuals(spec));
-      this.engine.cylinderFrame.add(this.combustion.root);
-      this.stage.addEmitters(this.combustion.root); // flame, spark, tracers: the only bloom sources
-      this.engine.root.updateMatrixWorld(true);
-      this.stage.fitToBounds(new THREE.Box3().setFromObject(this.engine.root));
-      this.stage.setFraming(this.framingView(), false);
-
       const legend = createTemperatureLegendElement();
-      this.overlay = track(
-        new ViewportOverlay(opts.viewport, {
-          onFraming: (f) => this.setFraming(f),
-          legend: legend.element,
-        }),
-      );
+      this.overlay = overlay = new ViewportOverlay(opts.viewport, {
+        onFraming: (f) => this.setFraming(f),
+        legend: legend.element,
+        engines: opts.spec ? [] : engineChoices(),
+        engineId: requested.id,
+        onEngine: (id) => this.setEngine(id),
+      });
       this.overlay.setFraming(this.framing);
-      this.overlay.setStatus('Starting the simulator…', 'Spawning the physics worker and running the first cycle.');
 
-      // ---- simulation ----
-      this.sim = track(new SimClient(spec, op, opts.simulatorOptions ?? DEFAULT_SIMULATOR_OPTIONS));
-      this.conductor = new Conductor(
-        spec,
-        this.sim,
-        this.engine,
-        this.combustion,
-        {
-          onCompressionRatio: (cr, prev) => this.followCylinder(cr, prev),
-          onView: (v) => this.applyView(v),
-          onFirstSnapshot: () => this.onData(),
-        },
-        { timeScale: url.timeScale ?? DEFAULT_TIME_SCALE, paused: url.paused ?? false },
-      );
-
-      // ---- UI ----
-      this.ui = track(
-        new UIController(opts.uiContainer, {
-          spec,
-          initialOperatingPoint: op,
-          onOperatingPointChange: this.conductor.handleOperatingPoint,
-          onPlaybackChange: this.conductor.handlePlayback,
-          onStep: this.conductor.handleStep,
-          onViewChange: this.conductor.handleView,
-          onReset: () => {
-            this.conductor.handleReset();
-            this.hasData = false;
-            this.startedAt = NaN;
-          },
-        }),
-      );
-      this.conductor.attachUi(this.ui);
-    } catch (err) {
-      for (let i = created.length - 1; i >= 0; i--) {
-        try {
-          created[i].dispose();
-        } catch {
-          /* best effort */
-        }
+      // ---- first engine (fall back to the default one if it cannot be built) ----
+      try {
+        session = this.buildSession(requested, op, playback);
+      } catch (err) {
+        if (opts.spec || requested.id === DEFAULT_ENGINE_ID) throw err;
+        startError = { def: requested, err };
+        const def = ENGINES[DEFAULT_ENGINE_ID];
+        this.focus = 0;
+        session = this.buildSession(def, initialOperatingPoint(def), playback);
       }
+    } catch (err) {
+      overlay?.dispose();
+      this.stage.dispose();
       throw err;
     }
-    this.sim.ready.catch((err: unknown) => this.fail('The simulation worker failed to start.', err));
-    // The UI announces its initial playback state in a microtask; apply URL overrides after it.
-    if (url.timeScale !== undefined || url.paused !== undefined) {
-      queueMicrotask(() => {
-        if (!this.disposed) this.ui.setPlayback({ timeScale: url.timeScale, paused: url.paused });
-      });
-    }
+    this.session = session;
+    this.afterSwap(null, url.timeScale !== undefined || url.paused !== undefined ? playback : null, null);
+    if (startError) this.reportEngineError(startError.def, startError.err);
 
     window.addEventListener('keydown', this.onKey);
+  }
+
+  // ------------------------------------------------------------------ public API
+
+  /** The running engine's registry entry. */
+  get engine(): EngineDefinition {
+    return this.session.def;
+  }
+  get engineId(): string {
+    return this.session.def.id;
+  }
+  get spec(): EngineSpec {
+    return this.session.spec;
+  }
+  /** Current session parts (replaced by setEngine; do not keep references). */
+  get sim() {
+    return this.session.sim;
+  }
+  get conductor() {
+    return this.session.conductor;
+  }
+  get ui() {
+    return this.session.ui;
+  }
+  get mechanism() {
+    return this.session.engine;
+  }
+  get combustion() {
+    return this.session.gas;
   }
 
   /** Start the animation loop. */
@@ -172,6 +192,10 @@ export class App {
     return this.framing;
   }
 
+  get focusCylinder(): number {
+    return this.focus;
+  }
+
   /** Frame the combustion chamber (close-up through the cutaway) or the whole engine. */
   setFraming(f: Framing, animate = true): void {
     this.framing = f;
@@ -179,28 +203,136 @@ export class App {
     this.stage.setFraming(this.framingView(), animate);
   }
 
+  /** Focus cylinder (0-based): UI readouts and charts, and the 'chamber' close-up. */
+  setFocusCylinder(index: number, animate = true): void {
+    const n = this.session.spec.cylinders;
+    const i = Math.max(0, Math.min(n - 1, Math.floor(index)));
+    if (i === this.focus) return;
+    this.focus = i;
+    this.session.ui.setFocusCylinder(i);
+    if (this.framing === 'chamber') this.stage.setFraming(this.framingView(), animate);
+  }
+
+  /**
+   * Switch to another registry engine, keeping playback speed, view mode and camera framing. Returns
+   * false (and keeps the running engine) if the id is unknown or the new engine cannot be built.
+   */
+  setEngine(id: string): boolean {
+    if (this.disposed) return false;
+    if (!isEngineId(id)) return false;
+    const def = ENGINES[id as keyof typeof ENGINES];
+    const old = this.session;
+    if (def.id === old.def.id) return true;
+    const playback = { ...old.conductor.playback };
+    const view = { ...old.conductor.view };
+    const prevFocus = this.focus;
+    this.focus = Math.min(this.focus, def.spec.cylinders - 1);
+    this.overlay.setEngineEnabled(false);
+    let next: EngineSession;
+    try {
+      next = this.buildSession(def, initialOperatingPoint(def), playback);
+    } catch (err) {
+      this.focus = prevFocus;
+      this.overlay.setEngineEnabled(true);
+      this.overlay.setEngine(old.def.id);
+      this.reportEngineError(def, err);
+      return false;
+    }
+    this.session = next;
+    old.dispose();
+    this.afterSwap(old.def, playback, view);
+    this.overlay.setEngineEnabled(true);
+    return true;
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.stop();
     window.removeEventListener('keydown', this.onKey);
-    this.ui.dispose();
-    this.sim.dispose();
-    this.combustion.dispose();
-    this.engine.dispose();
+    this.session.dispose();
     this.overlay.dispose();
     this.stage.dispose();
   }
 
   // ------------------------------------------------------------------
 
+  private buildSession(def: EngineDefinition, op: OperatingPoint, playback: PlaybackState): EngineSession {
+    let session: EngineSession | null = null;
+    session = new EngineSession({
+      stage: this.stage,
+      uiContainer: this.uiContainer,
+      def,
+      operatingPoint: clampOperatingPoint(def.spec, op),
+      simulatorOptions: this.simulatorOptions,
+      playback,
+      focusCylinder: this.focus,
+      hooks: {
+        onCompressionRatio: (cr, prev) => this.followCylinder(cr, prev),
+        onView: (v) => this.applyView(v),
+        onFirstSnapshot: () => this.onData(session),
+      },
+      onReset: () => {
+        this.hasData = false;
+        this.startedAt = NaN;
+      },
+      onFocusCylinder: (i) => this.setFocusCylinder(i),
+    });
+    const s = session;
+    s.sim.onError((message) => {
+      if (this.session === s) this.fail('The simulator stopped with an error.', new Error(message));
+    });
+    return s;
+  }
+
+  /** Stage, overlay, title and persistence after a session became current. */
+  private afterSwap(previous: EngineDefinition | null, playback: PlaybackState | null, view: ViewState | null): void {
+    const s = this.session;
+    this.hasData = false;
+    this.failed = false;
+    this.notice = false;
+    this.startedAt = NaN;
+    this.starvedFrames = 0;
+    this.fedFrames = 0;
+    this.overlay.setLimited((this.limitedShown = false));
+    this.stage.fitToBounds(s.bounds());
+    this.stage.setFraming(this.framingView(), false);
+    this.overlay.setEngine(s.def.id);
+    this.overlay.setStatus(
+      'Starting the simulator…',
+      s.spec.cylinders > 1
+        ? `Spawning the physics worker and running the first cycles of the ${s.def.label} (${s.spec.cylinders} cylinders).`
+        : 'Spawning the physics worker and running the first cycle.',
+    );
+    document.title = engineTitle(s.def);
+    // The UI announces its own initial playback / view state in a microtask; re-apply ours after it.
+    if (playback || view) {
+      queueMicrotask(() => {
+        if (this.disposed || this.session !== s) return;
+        if (playback) s.ui.setPlayback(playback);
+        if (view) s.ui.setView(view);
+      });
+    }
+    if (previous) {
+      savePref(ENGINE_PREF, s.def.id);
+      if (this.syncUrl && typeof history !== 'undefined' && typeof location !== 'undefined') {
+        try {
+          history.replaceState(history.state, '', `${location.pathname}${searchWithEngine(location.search, s.def.id)}${location.hash}`);
+        } catch {
+          /* sandboxed frames may refuse; the URL is a convenience */
+        }
+      }
+    }
+  }
+
   private readonly tick = (now: number): void => {
     if (this.disposed) return;
     this.raf = requestAnimationFrame(this.tick);
     if (Number.isNaN(this.startedAt)) this.startedAt = now;
+    const session = this.session;
     let s: EngineSnapshot | null = null;
     try {
-      s = this.conductor.frame(now);
+      s = session.conductor.frame(now);
     } catch (err) {
       this.fail('The render loop stopped on an error.', err);
       this.stop();
@@ -210,21 +342,65 @@ export class App {
       this.overlay.setStatus(
         'Still waiting for the simulator…',
         'No snapshots have arrived yet. Check the browser console for worker errors.',
+        false,
+        this.switchBackActions(),
       );
     }
-    this.stage.render(this.conductor.lastFrameSeconds);
+    this.updateLimited(s !== null && session.sim.starved);
+    this.stage.render(session.conductor.lastFrameSeconds);
   };
 
-  private onData(): void {
+  /** Show the simulation-limited hint after a sustained stall of playback behind the worker. */
+  private updateLimited(starved: boolean): void {
+    if (starved) {
+      this.starvedFrames++;
+      this.fedFrames = 0;
+    } else {
+      this.fedFrames++;
+      this.starvedFrames = 0;
+    }
+    const show = this.limitedShown ? this.fedFrames < LIMITED_FRAMES : this.starvedFrames >= LIMITED_FRAMES;
+    if (show !== this.limitedShown) this.overlay.setLimited((this.limitedShown = show));
+  }
+
+  private onData(session: EngineSession | null): void {
+    if (!session || session !== this.session) return;
     this.hasData = true;
-    if (!this.failed) this.overlay.setStatus(null);
+    this.lastGoodEngine = session.def.id;
+    if (!this.failed && !this.notice) this.overlay.setStatus(null);
   }
 
   private fail(title: string, err: unknown): void {
     this.failed = true;
-    const detail = err instanceof Error ? err.message : String(err);
+    this.notice = false;
+    const detail = errorSummary(err instanceof Error ? err.message : String(err));
     console.error(`[octane] ${title}`, err);
-    this.overlay.setStatus(title, detail, true);
+    this.overlay.setStatus(title, detail, true, this.switchBackActions());
+  }
+
+  /** "Back to <engine>" for the last engine that worked (or the default engine). */
+  private switchBackActions(): StatusAction[] {
+    const current = this.session.def.id;
+    const target = this.lastGoodEngine && this.lastGoodEngine !== current ? this.lastGoodEngine : current !== DEFAULT_ENGINE_ID ? DEFAULT_ENGINE_ID : null;
+    if (!target || !isEngineId(target)) return [];
+    const def = ENGINES[target as keyof typeof ENGINES];
+    return [{ label: `Back to ${def.label}`, onClick: () => this.setEngine(def.id) }];
+  }
+
+  /** An engine could not be built: say so; the running engine continues. */
+  private reportEngineError(def: EngineDefinition, err: unknown): void {
+    const detail = errorSummary(err instanceof Error ? err.message : String(err));
+    console.error(`[octane] could not start the ${def.label}`, err);
+    this.notice = true;
+    this.overlay.setStatus(`The ${def.label} is not available.`, `${detail}\nStill running the ${this.session.def.label}.`, true, [
+      {
+        label: 'Dismiss',
+        onClick: () => {
+          this.notice = false;
+          this.overlay.setStatus(this.hasData || this.failed ? null : 'Starting the simulator…');
+        },
+      },
+    ]);
   }
 
   private applyView(v: ViewState): void {
@@ -234,17 +410,16 @@ export class App {
     this.overlay.setLegendVisible(temperature);
   }
 
-  /** Keep the chamber in frame when the cylinder is raised/lowered for a new CR. */
+  /** Keep the chamber in frame when the cylinder is raised/lowered for a new CR (variable-CR engines). */
   private followCylinder(cr: number, prev: number): void {
     if (this.framing !== 'chamber') return;
-    const L = this.engine.layout;
-    const dy = L.headY(cr) - L.headY(prev);
+    const dy = this.session.engine.chamberShift(cr, prev);
     if (Number.isFinite(dy) && dy !== 0) this.stage.shiftView(0, dy, 0);
   }
 
   /** Recommended view for the current framing, pulled back on narrow (portrait) viewports. */
-  private framingView() {
-    const v = recommendedCameraView(this.spec, this.engine.compressionRatio, this.framing);
+  private framingView(): CameraView {
+    const v = this.session.cameraView(this.framing, this.focus);
     const k = framingDistanceScale(this.stage.camera.aspect);
     if (k !== 1) v.position.sub(v.target).multiplyScalar(k).add(v.target);
     return v;

@@ -97,6 +97,12 @@ export interface UrlOptions {
   paused?: boolean;
   /** Initial camera framing (?view=engine). */
   framing?: Framing;
+  /** Engine registry id (?engine=ford-model-t); validated by the app against the registry. */
+  engine?: string;
+  /** Focus cylinder, 0-based (?cyl=2 → cylinder 2 → 1). */
+  focusCylinder?: number;
+  /** Simulator implementation (?sim=mock: the lightweight single-cylinder stand-in). */
+  simulator?: 'physics' | 'mock';
 }
 
 const num = (q: URLSearchParams, key: string): number | undefined => {
@@ -128,8 +134,31 @@ export function parseUrlOptions(search: string): UrlOptions {
   if (paused !== null) out.paused = paused !== '0' && paused !== 'false';
   const view = q.get('view');
   if (view === 'engine' || view === 'chamber') out.framing = view;
+  const engine = q.get('engine')?.trim();
+  if (engine && /^[a-z0-9][a-z0-9-]*$/i.test(engine)) out.engine = engine;
+  const cyl = num(q, 'cyl');
+  if (cyl !== undefined && Number.isInteger(cyl) && cyl >= 1) out.focusCylinder = cyl - 1;
+  const sim = q.get('sim');
+  if (sim === 'mock' || sim === 'physics') out.simulator = sim;
   return out;
 }
+
+/**
+ * `search` with ?engine=<id> set (other parameters kept, in order). Operating-point knobs that belong to
+ * the previous engine (cr, on, rpm, spark, phi) are dropped when `dropOpKnobs`, so a reload starts the new
+ * engine from its own defaults. Returns the search string including its leading '?' ('' when empty).
+ */
+export function searchWithEngine(search: string, id: string, dropOpKnobs = true): string {
+  const q = new URLSearchParams(search);
+  if (dropOpKnobs) for (const k of OP_KNOBS) q.delete(k);
+  q.delete('cyl');
+  q.set('engine', id);
+  const s = q.toString();
+  return s ? `?${s}` : '';
+}
+
+/** URL keys that set operating-point fields (parseUrlOptions). */
+export const OP_KNOBS: readonly string[] = ['cr', 'on', 'rpm', 'spark', 'phi'];
 
 /** Aspect ratio the recommended camera views are composed for. */
 export const FRAMING_REFERENCE_ASPECT = 1.6;
@@ -142,6 +171,24 @@ export const FRAMING_REFERENCE_ASPECT = 1.6;
 export function framingDistanceScale(aspect: number, maxScale = 2.5): number {
   if (!(aspect > 0)) return 1;
   return Math.min(maxScale, Math.max(1, FRAMING_REFERENCE_ASPECT / aspect));
+}
+
+/**
+ * A short, readable form of an error message for the status card: stack frames ("    at …") and
+ * repeated lines dropped, at most `maxLines` lines and `maxChars` characters (the console keeps the rest).
+ */
+export function errorSummary(message: string, maxLines = 3, maxChars = 360): string {
+  const out: string[] = [];
+  for (const raw of message.split('\n')) {
+    const line = raw.trim();
+    if (!line || /^at\s/.test(line)) continue;
+    const bare = line.replace(/^Error:\s*/, '');
+    if (out.some((l) => l.includes(bare))) continue;
+    out.push(line);
+    if (out.length >= maxLines) break;
+  }
+  const s = out.join('\n');
+  return s.length > maxChars ? `${s.slice(0, maxChars - 1)}…` : s;
 }
 
 /** Clamp an operating point's CR into the spec's range. */

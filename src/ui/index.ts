@@ -10,21 +10,31 @@
  * `update(s, recent)`: `recent` may be any window of raw (non-interpolated) snapshots
  * up to the playback time — e.g. `simClient.recentSnapshots(previousPlaybackTime)`.
  * Each snapshot is ingested once; those later than `s.t` are ignored until reached.
+ *
+ * Multi-cylinder engines: every cylinder keeps its own trace history and spark
+ * capture (fed with cylinder views, cylinder-view.ts), so switching the FOCUS
+ * cylinder (HUD strip, chart toolbar, Cycles tab, or setFocusCylinder) shows its
+ * history at once; a further store holds every cylinder's pressure against the
+ * engine angle for the all-cylinders chart.
  */
 import '../style.css';
 import type { EngineSpec } from '../physics/core/engine-spec';
 import type { OperatingPoint } from '../physics/core/operating-point';
 import type { CycleSummary, EngineSnapshot } from '../physics/core/snapshot';
+import type { EngineDefinition } from '../physics/engines/index';
 import { TracePanel, type TraceFrame } from './charts/trace-panel';
 import { Controls, type RenderMode } from './controls';
 import { CyclesView } from './cycles-view';
+import { clampCylinder, createCylinderViewTarget, cylinderCount, cylinderView, CylinderViewPool } from './cylinder-view';
+import { definitionForSpec } from './engine-ui';
 import { Hud } from './hud';
 import { SidePanel } from './panel';
 import { DEFAULT_TIME_SCALE, snapTimeScale, STEP_LARGE_DEG, STEP_SMALL_DEG, stepTimeScale } from './playback';
 import { SparkCapture } from './spark-capture';
-import { CycleTraceStore, emptySelection } from './trace-store';
+import { CycleTraceStore, cylinderPressureSampler, emptySelection, type TraceSelection } from './trace-store';
 
 export type { RenderMode } from './controls';
+export { definitionForSpec, engineTitle } from './engine-ui';
 
 export interface UIControllerOptions {
   spec: EngineSpec;
@@ -34,6 +44,12 @@ export interface UIControllerOptions {
   onStep: (deg: number) => void;
   onViewChange: (v: { cutaway: boolean; mode: RenderMode }) => void;
   onReset: () => void;
+  /** Engine registry entry (controls profile, presets, label); default: the spec's entry. */
+  engine?: EngineDefinition;
+  /** Initial focus cylinder, 0-based (multi-cylinder engines). */
+  focusCylinder?: number;
+  /** The user picked a focus cylinder (strip, chart toolbar or Cycles tab). */
+  onFocusCylinderChange?: (index: number) => void;
 }
 
 /** Previous cycles kept for the charts. */
@@ -46,8 +62,17 @@ export class UIController {
   private readonly panel: SidePanel;
   private readonly traces: TracePanel;
   private readonly cycles: CyclesView;
-  private readonly store = new CycleTraceStore(HISTORY_CYCLES);
-  private readonly spark = new SparkCapture();
+  /** One trace store and spark capture per cylinder. */
+  private readonly stores: CycleTraceStore[] = [];
+  private readonly sparks: SparkCapture[] = [];
+  /** Playhead view of each cylinder (reused). */
+  private readonly views: EngineSnapshot[] = [];
+  private readonly viewPool = new CylinderViewPool();
+  /** All cylinders' pressure vs the engine angle (multi-cylinder engines only). */
+  private readonly overlay: CycleTraceStore | null = null;
+  private readonly overlaySel: TraceSelection = emptySelection();
+  private readonly nCyl: number;
+  private focus = 0;
   private readonly sel = emptySelection();
   private readonly frame: TraceFrame;
   private timeScale = DEFAULT_TIME_SCALE;
@@ -57,11 +82,24 @@ export class UIController {
   private readonly ro: ResizeObserver | null = null;
   private disposed = false;
   private lastAdvance = NaN;
+  private lastMarker = NaN;
 
   constructor(
     container: HTMLElement,
     private readonly opts: UIControllerOptions,
   ) {
+    const spec = opts.spec;
+    const def = opts.engine ?? definitionForSpec(spec);
+    const n = (this.nCyl = cylinderCount(spec));
+    this.focus = clampCylinder(opts.focusCylinder ?? 0, n);
+    for (let i = 0; i < n; i++) {
+      this.stores.push(new CycleTraceStore(HISTORY_CYCLES));
+      this.sparks.push(new SparkCapture());
+      this.views.push(createCylinderViewTarget());
+    }
+    if (n > 1) this.overlay = new CycleTraceStore(HISTORY_CYCLES, 2048, cylinderPressureSampler(n));
+    const shower = spec.ignition.type === 'trembler-magneto';
+
     this.frame = {
       sel: this.sel,
       version: -1,
@@ -71,6 +109,9 @@ export class UIController {
       spark: null,
       sparkVersion: -1,
       lastCycle: null,
+      overlay: this.overlay ? this.overlaySel : null,
+      overlayVersion: -1,
+      engineTheta: -360,
     };
     this.root = document.createElement('div');
     this.root.className = 'oct-ui';
@@ -80,29 +121,45 @@ export class UIController {
     guiHost.className = 'oct-gui-host';
     this.root.appendChild(guiHost);
 
-    this.controls = new Controls(guiHost, opts.spec, opts.initialOperatingPoint, {
-      onOperatingPointChange: (patch) => this.queuePatch(patch),
-      onViewChange: (v) => opts.onViewChange(v),
-      onTogglePause: () => this.togglePause(),
-      onTimeScale: (ts) => this.setTimeScale(ts, false),
-      onStep: (deg) => this.step(deg),
-      onReset: () => this.reset(),
-    });
+    this.controls = new Controls(
+      guiHost,
+      spec,
+      opts.initialOperatingPoint,
+      {
+        onOperatingPointChange: (patch) => this.queuePatch(patch),
+        onViewChange: (v) => opts.onViewChange(v),
+        onTogglePause: () => this.togglePause(),
+        onTimeScale: (ts) => this.setTimeScale(ts, false),
+        onStep: (deg) => this.step(deg),
+        onReset: () => this.reset(),
+      },
+      def,
+    );
 
+    const pick = (i: number): void => {
+      this.setFocusCylinder(i);
+      opts.onFocusCylinderChange?.(this.focus);
+    };
     this.panel = new SidePanel(this.root);
-    this.traces = new TracePanel(this.panel.tracesHost, opts.spec, this.panel.scroll);
-    this.cycles = new CyclesView(this.panel.cyclesHost);
+    this.traces = new TracePanel(this.panel.tracesHost, spec, this.panel.scroll, { cylinders: n, focus: this.focus, onFocus: pick, shower });
+    this.cycles = new CyclesView(this.panel.cyclesHost, { cylinders: n, cylinder: this.focus, onCylinder: pick });
     this.panel.onChange(() => {
       if (this.panel.open && this.panel.tab === 'traces') this.traces.invalidate();
       if (this.panel.open && this.panel.tab === 'cycles') this.cycles.invalidate();
     });
 
-    this.hud = new Hud(this.root, opts.spec, {
-      onTogglePause: () => this.togglePause(),
-      onStep: (deg) => this.step(deg),
-      onFaster: () => this.setTimeScale(stepTimeScale(this.timeScale, 1)),
-      onSlower: () => this.setTimeScale(stepTimeScale(this.timeScale, -1)),
-    });
+    this.hud = new Hud(
+      this.root,
+      spec,
+      {
+        onTogglePause: () => this.togglePause(),
+        onStep: (deg) => this.step(deg),
+        onFaster: () => this.setTimeScale(stepTimeScale(this.timeScale, 1)),
+        onSlower: () => this.setTimeScale(stepTimeScale(this.timeScale, -1)),
+        onFocusCylinder: pick,
+      },
+      { focus: this.focus, brake: n > 1 || def.ui.loadModels.includes('vehicle'), vehicle: !!spec.vehicle },
+    );
     this.hud.setLastCycle(null);
     this.syncPlaybackViews();
     this.syncOpViews();
@@ -129,29 +186,54 @@ export class UIController {
   update(s: EngineSnapshot, recent: EngineSnapshot[]): void {
     if (this.disposed) return;
     this.flush();
-    if (this.store.checkDiscontinuity(s.t, s.cycle, s.rpm)) this.spark.clear();
-    this.store.ingest(recent, s.t);
-    this.spark.ingest(recent, s.t);
-    this.store.select(s.t, HISTORY_CYCLES - 1, this.sel);
+    const n = this.nCyl;
+    for (let i = 0; i < n; i++) {
+      const v = cylinderView(s, i, this.views[i]);
+      const store = this.stores[i];
+      if (store.checkDiscontinuity(v.t, v.cycle, v.rpm)) this.sparks[i].clear();
+      // Single-cylinder streams (no cylinders[]) map to the raw snapshots themselves.
+      const rv = s.cylinders ? this.viewPool.map(recent, i) : recent;
+      store.ingest(rv, s.t);
+      this.sparks[i].ingest(rv, s.t);
+      if (!s.cylinders) break;
+    }
+    const ov = this.overlay;
+    if (ov) {
+      ov.checkDiscontinuity(s.t, s.cycle, s.rpm);
+      ov.ingest(recent, s.t);
+      ov.select(s.t, 0, this.overlaySel);
+    }
+    // A stream without cylinders[] only feeds cylinder 1's store.
+    const f = s.cylinders ? this.focus : 0;
+    const view = cylinderView(s, f, this.views[f]);
+    this.stores[f].select(s.t, HISTORY_CYCLES - 1, this.sel);
 
-    this.hud.update(s);
+    this.hud.update(view, s);
     const op = this.controls.operatingPoint;
-    const f = this.frame;
-    f.version = this.store.version;
-    f.playhead = s;
-    f.sparkDeg = -op.sparkAdvanceDeg;
-    f.compressionRatio = op.compressionRatio;
-    f.spark = this.spark.display;
-    f.sparkVersion = this.spark.version;
-    f.lastCycle = this.cycles.latest;
-    this.traces.update(f, this.panel.open && this.panel.tab === 'traces');
+    const spark = this.sparks[f];
+    const fr = this.frame;
+    fr.version = this.stores[f].version;
+    fr.playhead = view;
+    fr.sparkDeg = this.sparkMarkerDeg(f, op);
+    fr.compressionRatio = op.compressionRatio;
+    fr.spark = spark.display;
+    fr.sparkVersion = spark.version;
+    fr.lastCycle = this.cycles.latestFor(f);
+    fr.overlayVersion = ov ? ov.version : -1;
+    fr.engineTheta = s.thetaDeg;
+    if (fr.sparkDeg !== this.lastMarker) {
+      this.lastMarker = fr.sparkDeg;
+      this.hud.setSparkAdvance(-fr.sparkDeg);
+    }
+    this.traces.update(fr, this.panel.open && this.panel.tab === 'traces');
     this.cycles.render(this.panel.open && this.panel.tab === 'cycles');
   }
 
   pushCycle(c: CycleSummary): void {
     if (this.disposed) return;
     this.cycles.push(c);
-    this.hud.setLastCycle(c);
+    if ((c.cylinder ?? 0) === this.focus) this.hud.setLastCycle(c);
+    if (c.engine) this.hud.setEngineCycle(c.engine);
   }
 
   /** Current playback state (also delivered through onPlaybackChange). */
@@ -169,10 +251,28 @@ export class UIController {
     return this.controls.operatingPoint;
   }
 
+  /** Focus cylinder, 0-based. */
+  get focusCylinder(): number {
+    return this.focus;
+  }
+
+  /** Show cylinder `index` (0-based) in the HUD readouts, θ / p–V / spark charts and Cycles tab (no callback). */
+  setFocusCylinder(index: number): void {
+    const i = clampCylinder(index, this.nCyl);
+    if (i === this.focus) return;
+    this.focus = i;
+    this.hud.setFocus(i);
+    this.traces.setFocus(i);
+    this.cycles.setCylinder(i);
+    this.hud.setLastCycle(this.cycles.latestFor(i));
+    this.lastMarker = NaN;
+  }
+
   /** Forget chart history (call if the simulation is reset from outside the UI). */
   clearHistory(): void {
-    this.store.clear();
-    this.spark.clear();
+    for (const st of this.stores) st.clear();
+    for (const sp of this.sparks) sp.clear();
+    this.overlay?.clear();
     this.traces.invalidate();
   }
 
@@ -181,6 +281,12 @@ export class UIController {
     if (p.timeScale !== undefined) this.timeScale = snapTimeScale(p.timeScale);
     if (p.paused !== undefined) this.paused = p.paused;
     this.emitPlayback();
+  }
+
+  /** Programmatic view control (keeps the controls in sync, fires onViewChange). */
+  setView(v: { cutaway: boolean; mode: RenderMode }): void {
+    this.controls.setView(v);
+    this.opts.onViewChange({ ...this.controls.view });
   }
 
   dispose(): void {
@@ -199,6 +305,17 @@ export class UIController {
   }
 
   // ------------------------------------------------------------------ internals
+
+  /**
+   * Spark marker (θ of the focus cylinder): the first gap breakdown of its latest ignition event as the
+   * physics produced it — with a magneto and trembler coils the spark lags the lever (timer make) by the
+   * coil's rpm-dependent firing time — falling back to the lever / commanded angle before any spark.
+   */
+  private sparkMarkerDeg(cyl: number, op: OperatingPoint): number {
+    const ev = this.sparks[cyl].display;
+    if (ev && Number.isFinite(ev.firstSparkDeg)) return ev.firstSparkDeg;
+    return -op.sparkAdvanceDeg;
+  }
 
   private queuePatch(patch: Partial<OperatingPoint>): void {
     this.pending = { ...(this.pending ?? {}), ...patch };
@@ -223,7 +340,11 @@ export class UIController {
     const op = this.controls.operatingPoint;
     if (op.sparkAdvanceDeg !== this.lastAdvance) {
       this.lastAdvance = op.sparkAdvanceDeg;
-      this.hud.setSparkAdvance(op.sparkAdvanceDeg);
+      // Before the first spark of the focus cylinder the marker shows the lever.
+      if (!this.sparks[this.focus].display) {
+        this.lastMarker = -op.sparkAdvanceDeg;
+        this.hud.setSparkAdvance(op.sparkAdvanceDeg);
+      }
     }
   }
 
@@ -250,6 +371,7 @@ export class UIController {
     this.clearHistory();
     this.cycles.clear();
     this.hud.setLastCycle(null);
+    this.hud.setEngineCycle(null);
     this.opts.onReset();
   }
 
@@ -291,7 +413,11 @@ export class UIController {
         this.panel.setOpen(!this.panel.open);
         break;
       default:
-        handled = false;
+        // 1–9: focus that cylinder (multi-cylinder engines).
+        if (this.nCyl > 1 && /^[1-9]$/.test(e.key) && Number(e.key) <= this.nCyl) {
+          this.setFocusCylinder(Number(e.key) - 1);
+          this.opts.onFocusCylinderChange?.(this.focus);
+        } else handled = false;
     }
     if (handled) {
       e.preventDefault();

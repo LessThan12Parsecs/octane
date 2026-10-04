@@ -1,5 +1,6 @@
 /**
- * Octane entry point: mounts the app into index.html's viewport and UI hosts.
+ * Octane entry point: mounts the app into index.html's viewport and UI hosts. The engine comes from
+ * ?engine=<id>, the remembered choice or the default; the app switches engines in place (App.setEngine).
  */
 import { startApp, type App } from './app/index';
 

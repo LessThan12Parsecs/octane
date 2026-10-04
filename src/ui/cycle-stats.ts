@@ -2,8 +2,8 @@
  * Cycle-results bookkeeping: per-cycle metric definitions (units, formatting,
  * flags), cycle-to-cycle statistics (COV of IMEP etc.) and CSV export. Pure.
  */
-import type { CycleSummary } from '../physics/core/snapshot';
-import { fmt, fractionToPct, isfcToGPerKWh, jToMJ, kgToMg, paToBar } from './units';
+import type { CycleSummary, EngineCycleSummary } from '../physics/core/snapshot';
+import { fmt, fractionToPct, isfcToGPerKWh, jToMJ, kgToMg, mpsToMph, nmToLbft, paToBar, wattsToHp, wattsToKW } from './units';
 
 export type MetricFlag = 'knock' | 'misfire' | null;
 
@@ -51,6 +51,46 @@ export const CYCLE_METRICS: readonly MetricDef[] = [
   { key: 'mTrap', label: 'Trapped mass', unit: 'mg', hint: 'Cylinder mass at IVC', decimals: 0, value: (c) => kgToMg(c.trappedMass) },
   { key: 'mFuel', label: 'Fuel mass', unit: 'mg', hint: 'Fuel mass burned this cycle', decimals: 2, value: (c) => kgToMg(c.fuelMass) },
 ];
+
+/** An engine-level metric (EngineCycleSummary, one per engine cycle). */
+export interface EngineMetricDef {
+  key: string;
+  label: string;
+  unit: string;
+  hint: string;
+  decimals: number;
+  value: (e: EngineCycleSummary) => number;
+}
+
+/** Engine rows of the results table (multi-cylinder / free-speed engines report EngineCycleSummary). */
+export const ENGINE_METRICS: readonly EngineMetricDef[] = [
+  { key: 'rpm', label: 'Speed', unit: 'rpm', hint: 'Mean crankshaft speed over the engine cycle', decimals: 0, value: (e) => e.rpmMean },
+  { key: 'brakeTorque', label: 'Brake torque', unit: 'N·m', hint: 'Mean brake torque = indicated − friction (− inertia)', decimals: 1, value: (e) => e.brakeTorque },
+  { key: 'brakeTorqueLbft', label: 'Brake torque', unit: 'lb·ft', hint: 'Mean brake torque in the period unit (Ford rated in lb-ft)', decimals: 1, value: (e) => nmToLbft(e.brakeTorque) },
+  { key: 'brakePower', label: 'Brake power', unit: 'kW', hint: 'Brake power = brake torque × ω', decimals: 2, value: (e) => wattsToKW(e.brakePower) },
+  { key: 'brakeHp', label: 'Brake power', unit: 'hp', hint: 'Brake power in mechanical horsepower (550 ft·lbf/s)', decimals: 1, value: (e) => wattsToHp(e.brakePower) },
+  { key: 'bmep', label: 'BMEP', unit: 'bar', hint: 'Brake mean effective pressure over the total displacement', decimals: 2, value: (e) => paToBar(e.bmep) },
+  { key: 'imepEngine', label: 'IMEP net (all cyl.)', unit: 'bar', hint: 'Net IMEP, mean over the cylinders', decimals: 2, value: (e) => paToBar(e.imepNet) },
+  { key: 'fmep', label: 'FMEP', unit: 'bar', hint: 'Friction mean effective pressure', decimals: 2, value: (e) => paToBar(e.fmep) },
+  { key: 'etaVEngine', label: 'η volumetric (engine)', unit: '%', hint: 'Air through the carburettor vs ambient density × total displacement', decimals: 1, value: (e) => fractionToPct(e.volumetricEfficiency) },
+  { key: 'bsfc', label: 'BSFC', unit: 'g/kWh', hint: 'Brake specific fuel consumption', decimals: 0, value: (e) => isfcToGPerKWh(e.bsfc) },
+  { key: 'etaB', label: 'η brake', unit: '%', hint: 'Brake thermal efficiency (fuel LHV basis)', decimals: 1, value: (e) => fractionToPct(e.brakeEfficiency) },
+  { key: 'vehicleSpeed', label: 'Road speed', unit: 'mph', hint: 'Mean vehicle speed (vehicle load)', decimals: 1, value: (e) => (e.vehicleSpeed === undefined ? NaN : mpsToMph(e.vehicleSpeed)) },
+];
+
+/** Mean of an engine metric (NaN values ignored). */
+export function engineMetricMean(def: EngineMetricDef, list: readonly EngineCycleSummary[]): number {
+  let s = 0;
+  let n = 0;
+  for (const e of list) {
+    const v = def.value(e);
+    if (Number.isFinite(v)) {
+      s += v;
+      n++;
+    }
+  }
+  return n ? s / n : NaN;
+}
 
 /** Format one metric for one cycle ("—" for NaN). */
 export function formatMetric(def: MetricDef, c: CycleSummary): string {
@@ -148,16 +188,33 @@ export function computeCycleStats(cycles: readonly CycleSummary[]): CycleStats {
   };
 }
 
-/** CSV of all metrics, one row per cycle (raw numbers in the displayed units). */
-export function cyclesToCsv(cycles: readonly CycleSummary[]): string {
-  const head = ['cycle', ...CYCLE_METRICS.map((d) => (d.unit ? `${d.label} [${d.unit}]` : d.label))];
+/**
+ * CSV of all metrics, one row per cycle (raw numbers in the displayed units). Multi-cylinder data adds a
+ * 'cylinder' column (1-based) and, when `engineOf` yields engine summaries, the ENGINE_METRICS columns.
+ */
+export function cyclesToCsv(
+  cycles: readonly CycleSummary[],
+  engineOf: (c: CycleSummary) => EngineCycleSummary | undefined = (c) => c.engine,
+): string {
+  const label = (d: { label: string; unit: string }): string => (d.unit ? `${d.label} [${d.unit}]` : d.label);
+  const withCyl = cycles.some((c) => c.cylinder !== undefined);
+  const withEngine = cycles.some((c) => engineOf(c) !== undefined);
+  const head = [
+    'cycle',
+    ...(withCyl ? ['cylinder'] : []),
+    ...CYCLE_METRICS.map(label),
+    ...(withEngine ? ENGINE_METRICS.map((d) => `engine ${label(d)}`) : []),
+  ];
   const esc = (s: string): string => (/[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
+  const num = (v: number): string => (Number.isFinite(v) ? String(Number(v.toPrecision(10))) : '');
   const lines = [head.map(esc).join(',')];
   for (const c of cycles) {
     const row = [String(c.cycle)];
-    for (const d of CYCLE_METRICS) {
-      const v = d.value(c);
-      row.push(Number.isFinite(v) ? String(Number(v.toPrecision(10))) : '');
+    if (withCyl) row.push(String((c.cylinder ?? 0) + 1));
+    for (const d of CYCLE_METRICS) row.push(num(d.value(c)));
+    if (withEngine) {
+      const e = engineOf(c);
+      for (const d of ENGINE_METRICS) row.push(e ? num(d.value(e)) : '');
     }
     lines.push(row.join(','));
   }

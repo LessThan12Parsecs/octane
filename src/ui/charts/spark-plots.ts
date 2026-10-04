@@ -158,13 +158,21 @@ class SparkSubPlot {
   }
 }
 
+/**
+ * Default window of a trembler-coil shower, µs around the first breakdown: the coil needs ≈ 2–3.5 ms from
+ * timer make to the first spark and then buzzes at ≈ 200 Hz for the rest of the contact [ECCT; Cool, via
+ * engines/model-t.ts], 87° of crank ≈ 14.5 ms at 1000 rpm.
+ */
+export const SPARK_SHOWER_WINDOW_US: [number, number] = [-4000, 12000];
+
 export class SparkPlots {
-  readonly zoom = new ZoomGroup(SPARK_DEFAULT_WINDOW_US[0], SPARK_DEFAULT_WINDOW_US[1]);
+  readonly zoom: ZoomGroup;
   private readonly xs: number[] = [];
   private readonly plots: SparkSubPlot[];
   private lastEv: SparkEvent | null = null;
 
-  constructor(host: HTMLElement, width: number) {
+  constructor(host: HTMLElement, width: number, window: [number, number] = SPARK_DEFAULT_WINDOW_US) {
+    this.zoom = new ZoomGroup(window[0], window[1]);
     const defs: SubDef[] = [
       {
         yLabel: 'V [kV]',

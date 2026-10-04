@@ -63,6 +63,41 @@ export function sampleChannels(s: EngineSnapshot, out: Float64Array): Float64Arr
   return out;
 }
 
+/**
+ * Maps a snapshot to one sample row of a store. Channels 0 and 1 must be t and θ (CH.t, CH.theta): the
+ * store splits traces on them and the θ plots use column 1 as x.
+ */
+export interface TraceSampler {
+  readonly channels: number;
+  sample(s: EngineSnapshot, out: Float64Array): Float64Array;
+}
+
+/** The default sampler: the 16 single-cylinder channels of CH. */
+export const CYLINDER_SAMPLER: TraceSampler = { channels: N_CH, sample: sampleChannels };
+
+/** Column of cylinder i's pressure in a cylinderPressureSampler store. */
+export const overlayPressureChannel = (i: number): number => 2 + i;
+
+/**
+ * Sampler for the "all cylinders" pressure overlay: t, ENGINE θ (cylinder 1's angle), then every
+ * cylinder's pressure in bar (NaN when the snapshot has no such cylinder).
+ */
+export function cylinderPressureSampler(cylinders: number): TraceSampler {
+  return {
+    channels: 2 + cylinders,
+    sample(s: EngineSnapshot, out: Float64Array): Float64Array {
+      out[CH.t] = s.t;
+      out[CH.theta] = s.thetaDeg;
+      const cyl = s.cylinders;
+      for (let i = 0; i < cylinders; i++) {
+        const c = cyl ? cyl[i] : i === 0 ? s : undefined;
+        out[2 + i] = c ? paToBar(c.pressure) : NaN;
+      }
+      return out;
+    },
+  };
+}
+
 /** One engine cycle's samples, column-major, growable without per-sample allocation. */
 export class CycleTrace {
   cycle = -1;
@@ -73,9 +108,12 @@ export class CycleTrace {
   /** Crank angle of the first sample flagged autoignited (NaN if none). */
   knockDeg = NaN;
 
-  constructor(capacity = 2048) {
+  constructor(
+    capacity = 2048,
+    readonly channels = N_CH,
+  ) {
     this.cols = [];
-    for (let i = 0; i < N_CH; i++) this.cols.push(new Float64Array(Math.max(16, capacity)));
+    for (let i = 0; i < channels; i++) this.cols.push(new Float64Array(Math.max(16, capacity)));
   }
 
   get capacity(): number {
@@ -90,16 +128,17 @@ export class CycleTrace {
   }
 
   push(sample: Float64Array): void {
+    const nc = this.channels;
     if (this.n === this.capacity) {
       const cap = this.capacity * 2;
-      for (let i = 0; i < N_CH; i++) {
+      for (let i = 0; i < nc; i++) {
         const next = new Float64Array(cap);
         next.set(this.cols[i]);
         this.cols[i] = next;
       }
     }
     const k = this.n++;
-    for (let i = 0; i < N_CH; i++) this.cols[i][k] = sample[i];
+    for (let i = 0; i < nc; i++) this.cols[i][k] = sample[i];
   }
 
   get tStart(): number {
@@ -140,7 +179,7 @@ export class CycleTraceStore {
   /** Oldest → newest. */
   readonly traces: CycleTrace[] = [];
   private readonly pool: CycleTrace[] = [];
-  private readonly sample = new Float64Array(N_CH);
+  private readonly sample: Float64Array;
   /** Time of the last ingested snapshot. */
   lastT = -Infinity;
   /** Incremented whenever the stored data changes (cheap dirty check for charts). */
@@ -149,7 +188,10 @@ export class CycleTraceStore {
   constructor(
     readonly maxCycles = 6,
     private readonly initialCapacity = 2048,
-  ) {}
+    private readonly sampler: TraceSampler = CYLINDER_SAMPLER,
+  ) {
+    this.sample = new Float64Array(sampler.channels);
+  }
 
   clear(): void {
     while (this.traces.length) this.pool.push(this.traces.pop()!);
@@ -203,7 +245,7 @@ export class CycleTraceStore {
       } else if (s.thetaDeg < cur.lastTheta) {
         continue; // keep θ monotonic within a trace (x must be sorted for the charts)
       }
-      cur.push(sampleChannels(s, this.sample));
+      cur.push(this.sampler.sample(s, this.sample));
       if (s.knock.autoignited && !cur.knocked) {
         cur.knocked = true;
         cur.knockDeg = s.thetaDeg;
@@ -217,7 +259,7 @@ export class CycleTraceStore {
   private startTrace(cycle: number): CycleTrace {
     let tr: CycleTrace;
     if (this.traces.length >= this.maxCycles) tr = this.traces.shift()!;
-    else tr = this.pool.pop() ?? new CycleTrace(this.initialCapacity);
+    else tr = this.pool.pop() ?? new CycleTrace(this.initialCapacity, this.sampler.channels);
     tr.reset(cycle);
     this.traces.push(tr);
     return tr;

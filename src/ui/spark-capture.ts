@@ -3,6 +3,14 @@
  * snapshot stream as a time trace for the µs–ms spark chart. Keeps the last
  * complete event on display until the next one reaches breakdown, then shows the
  * new one live as it unfolds.
+ *
+ * Trembler (vibrator) coils fire a SHOWER of sparks for as long as the ignition
+ * timer grounds the coil: charging → breakdown → arc/glow → charging → … The
+ * snapshot then carries `spark.timerClosed` (and `breakdownCount`,
+ * `firstSparkDeg`); one event is one timer contact, from the contact closing
+ * until it opens and the last discharge has died away, however many sparks it
+ * contains. Feed one SparkCapture per cylinder (cylinder views) in a
+ * multi-cylinder engine.
  */
 import type { EngineSnapshot, SparkPhase } from '../physics/core/snapshot';
 import { Float64Column } from './ring-buffer';
@@ -35,6 +43,16 @@ export class SparkEvent {
   energy = 0;
   /** Crank angle at breakdown, deg. */
   breakdownDeg = NaN;
+  /**
+   * Local crank angle of the FIRST breakdown of the event, deg: the simulator's `spark.firstSparkDeg`
+   * when it reports one, else the angle of the first discharge sample (NaN before breakdown).
+   */
+  firstSparkDeg = NaN;
+  /** Gap breakdowns in the event (a trembler shower has many; an inductive spark one). */
+  sparkCount = 0;
+  /** The event is a trembler shower (the stream reports the timer contact). */
+  shower = false;
+  private inDischarge = false;
   readonly t = new Float64Column(1024);
   /** kV */
   readonly vSec = new Float64Column(1024);
@@ -58,6 +76,10 @@ export class SparkEvent {
     this.complete = false;
     this.energy = 0;
     this.breakdownDeg = NaN;
+    this.firstSparkDeg = NaN;
+    this.sparkCount = 0;
+    this.shower = false;
+    this.inDischarge = false;
     this.t.clear();
     this.vSec.clear();
     this.iSec.clear();
@@ -75,6 +97,11 @@ export class SparkEvent {
     this.vBd.push(voltsToKV(sp.breakdownVoltage));
     this.phase.push(SPARK_PHASE_CODE[sp.phase] ?? 0);
     this.energy = sp.energyDelivered;
+    const discharging = isDischargePhase(sp.phase);
+    if (discharging && !this.inDischarge) this.sparkCount++;
+    this.inDischarge = discharging;
+    if (sp.breakdownCount !== undefined && sp.breakdownCount > this.sparkCount) this.sparkCount = sp.breakdownCount;
+    if (sp.firstSparkDeg !== undefined && Number.isFinite(sp.firstSparkDeg)) this.firstSparkDeg = sp.firstSparkDeg;
   }
 
   /** Reference time for the chart x axis (breakdown if known, else dwell start). */
@@ -131,9 +158,14 @@ export interface SparkCaptureOptions {
   tail: number;
   /** Close an event this long after breakdown even if it never reports 'done', s. */
   maxAfterBreakdown: number;
+  /**
+   * Trembler showers: close an event this long after its first breakdown even if the timer never
+   * reports the contact open, s (an 87° contact lasts ≈ 0.1 s at 150 rpm).
+   */
+  maxShower: number;
 }
 
-const DEFAULTS: SparkCaptureOptions = { tail: 0.5e-3, maxAfterBreakdown: 8e-3 };
+const DEFAULTS: SparkCaptureOptions = { tail: 0.5e-3, maxAfterBreakdown: 8e-3, maxShower: 0.25 };
 
 export class SparkCapture {
   private building = new SparkEvent();
@@ -142,6 +174,8 @@ export class SparkCapture {
   private hasShown = false;
   private lastT = -Infinity;
   private lastEventCycle = NaN;
+  /** The timer contact has been seen open since the last trembler event started (a new contact may begin). */
+  private contactReopened = true;
   private readonly opts: SparkCaptureOptions;
   /** Incremented when the displayed event changes. */
   version = 0;
@@ -155,6 +189,7 @@ export class SparkCapture {
     this.hasShown = false;
     this.lastT = -Infinity;
     this.lastEventCycle = NaN;
+    this.contactReopened = true;
     this.building.reset(-1, NaN);
     this.shown.reset(-1, NaN);
     this.version++;
@@ -185,23 +220,36 @@ export class SparkCapture {
 
   /** Returns true if the displayed event changed. */
   private step(s: EngineSnapshot): boolean {
-    const phase = s.spark.phase;
+    const sp = s.spark;
+    const phase = sp.phase;
+    /** Trembler stream: the snapshot reports the timer contact. */
+    const timer = sp.timerClosed;
     let restarted = false;
+    if (timer === false) this.contactReopened = true;
 
     if (!this.active) {
-      // A new event starts with a dwell; a discharge only opens one if this cycle has
+      // A new event starts with a dwell, or with the timer contact closing (trembler: only a NEW contact,
+      // not the rest of one whose event was force-closed); a discharge only opens one if this cycle has
       // none yet (stream joined mid-spark), not after a forced close of a long discharge.
-      if (phase === 'charging' || (isDischargePhase(phase) && s.cycle !== this.lastEventCycle)) {
+      const starts =
+        timer === undefined
+          ? phase === 'charging' || (isDischargePhase(phase) && s.cycle !== this.lastEventCycle)
+          : timer && (this.contactReopened || s.cycle !== this.lastEventCycle);
+      if (starts) {
         this.building.reset(s.cycle, s.t);
+        this.building.shower = timer !== undefined;
         this.active = true;
         this.lastEventCycle = s.cycle;
+        this.contactReopened = false;
       } else {
         return false;
       }
-    } else if (phase === 'charging' && Number.isFinite(this.building.tBreakdown)) {
-      // A new dwell started before the previous event was closed: close it and restart.
+    } else if (phase === 'charging' && Number.isFinite(this.building.tBreakdown) && timer !== true) {
+      // A new dwell started before the previous event was closed: close it and restart. (A trembler
+      // re-charging while the timer contact is still closed is the next spark of the same shower.)
       this.finish();
       this.building.reset(s.cycle, s.t);
+      this.building.shower = timer !== undefined;
       this.active = true;
       this.lastEventCycle = s.cycle;
       restarted = true;
@@ -214,19 +262,23 @@ export class SparkCapture {
     if (!Number.isFinite(ev2.tBreakdown) && isDischargePhase(phase)) {
       ev2.tBreakdown = s.t;
       ev2.breakdownDeg = s.thetaDeg;
+      if (!Number.isFinite(ev2.firstSparkDeg)) ev2.firstSparkDeg = s.thetaDeg;
       changed = true;
     }
+    // The discharge (shower) has ended: no conduction, and for a trembler the timer contact is open.
+    const quiet = timer === true ? false : timer === false ? !isDischargePhase(phase) : phase === 'done' || phase === 'off';
     if (Number.isFinite(ev2.tBreakdown)) {
-      if (!Number.isFinite(ev2.tEnd) && (phase === 'done' || phase === 'off')) ev2.tEnd = s.t;
+      if (!Number.isFinite(ev2.tEnd) && quiet) ev2.tEnd = s.t;
+      else if (Number.isFinite(ev2.tEnd) && !quiet && ev2.shower) ev2.tEnd = NaN; // contact bounced closed again
       const tailDone = Number.isFinite(ev2.tEnd) && s.t - ev2.tEnd >= this.opts.tail;
-      const tooLong = s.t - ev2.tBreakdown >= this.opts.maxAfterBreakdown;
+      const tooLong = s.t - ev2.tBreakdown >= (ev2.shower ? this.opts.maxShower : this.opts.maxAfterBreakdown);
       if (tailDone || tooLong) {
         if (!Number.isFinite(ev2.tEnd)) ev2.tEnd = s.t;
         this.finish();
         changed = true;
       }
-    } else if (phase === 'done' || phase === 'off') {
-      // Dwell ended without breakdown (e.g. insufficient voltage): keep it as a (failed) event.
+    } else if (quiet && (timer !== undefined || phase === 'done' || phase === 'off')) {
+      // Dwell (contact) ended without breakdown (e.g. insufficient voltage): keep it as a (failed) event.
       ev2.tEnd = s.t;
       this.finish();
       changed = true;

@@ -1,9 +1,15 @@
 /**
  * Bottom HUD strip: 720° cycle dial (strokes, valve events, spark timing, crank
  * needle), instantaneous state readouts, knock lamp and the playback transport.
+ *
+ * Multi-cylinder engines: the dial and the in-cylinder readouts follow the FOCUS
+ * cylinder (its local angle), a firing-order strip shows every cylinder's stroke
+ * (click a cylinder to focus it), and free-speed / vehicle engines get brake
+ * torque-power and road-speed cells.
  */
 import type { EngineSpec } from '../physics/core/engine-spec';
-import type { CycleSummary, EngineSnapshot } from '../physics/core/snapshot';
+import type { CycleSummary, EngineCycleSummary, EngineSnapshot } from '../physics/core/snapshot';
+import { firingStrip, type FiringStripEntry } from './cylinder-view';
 import { STROKE_COLOR, SERIES, STATUS } from './charts/theme';
 import {
   cycleDialAngleDeg,
@@ -17,7 +23,7 @@ import {
 } from './engine-cycle';
 import { GatedMean } from './cycle-mean';
 import { formatTimeScale, STEP_LARGE_DEG, STEP_SMALL_DEG } from './playback';
-import { fmt, fmtSimTime, fractionToPct, paToBar } from './units';
+import { fmt, fmtSimTime, fractionToPct, mpsToKmh, mpsToMph, paToBar, wattsToHp } from './units';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const C = 40; // dial centre
@@ -30,7 +36,20 @@ export interface HudCallbacks {
   onStep: (deg: number) => void;
   onFaster: () => void;
   onSlower: () => void;
+  /** A cylinder of the firing-order strip was clicked (0-based). */
+  onFocusCylinder?: (index: number) => void;
 }
+
+export interface HudOptions {
+  /** Initial focus cylinder, 0-based. */
+  focus?: number;
+  /** Show the brake torque / power cell (free-speed or multi-cylinder engines). */
+  brake?: boolean;
+  /** Show the road-speed cell (engines with a vehicle). */
+  vehicle?: boolean;
+}
+
+const STROKE_INITIAL: Readonly<Record<string, string>> = { intake: 'I', compression: 'C', power: 'P', exhaust: 'E' };
 
 /** Text node that only touches the DOM when its value changes. */
 class Slot {
@@ -77,11 +96,21 @@ export class Hud {
   private lastStroke = '';
   private lastXb = -1;
   private readonly mapMean = new GatedMean();
+  private readonly strip: { el: HTMLButtonElement; stroke: HTMLElement; key: string }[] = [];
+  private readonly stripEntries: FiringStripEntry[] = [];
+  private focus = 0;
+  private engineCycle: EngineCycleSummary | null = null;
 
-  constructor(host: HTMLElement, spec: EngineSpec, cb: HudCallbacks) {
+  constructor(
+    host: HTMLElement,
+    private readonly spec: EngineSpec,
+    cb: HudCallbacks,
+    opts: HudOptions = {},
+  ) {
     this.el = document.createElement('footer');
     this.el.className = 'oct-hud';
     host.appendChild(this.el);
+    this.focus = Math.max(0, opts.focus ?? 0);
 
     // ---- dial ----
     const dialWrap = document.createElement('div');
@@ -130,6 +159,37 @@ export class Hud {
     this.el.appendChild(th);
     this.strokeEl = th.querySelector('.oct-stroke-name') as HTMLElement;
 
+    // ---- firing-order strip (multi-cylinder) ----
+    if (spec.cylinders > 1) {
+      const strip = document.createElement('div');
+      strip.className = 'oct-hud-strip';
+      strip.setAttribute('role', 'group');
+      strip.setAttribute('aria-label', 'Cylinders in firing order');
+      const cap = document.createElement('div');
+      cap.className = 'oct-hud-label';
+      cap.textContent = 'Firing order';
+      const row = document.createElement('div');
+      row.className = 'oct-hud-strip-row';
+      for (const e of firingStrip(spec, makeIdleSnapshot(), this.stripEntries)) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'oct-cyl-chip';
+        b.dataset.cyl = String(e.index);
+        b.title = `Cylinder ${e.number}: click to focus the readouts, charts and close-up on it`;
+        b.innerHTML = `<span class="oct-cyl-n"></span><span class="oct-cyl-s"></span>`;
+        (b.firstElementChild as HTMLElement).textContent = String(e.number);
+        const idx = e.index;
+        b.addEventListener('click', () => {
+          cb.onFocusCylinder?.(idx);
+          b.blur();
+        });
+        row.appendChild(b);
+        this.strip.push({ el: b, stroke: b.lastElementChild as HTMLElement, key: '' });
+      }
+      strip.append(cap, row);
+      this.el.appendChild(strip);
+    }
+
     // ---- readouts ----
     const cells = document.createElement('div');
     cells.className = 'oct-hud-cells';
@@ -150,6 +210,8 @@ export class Hud {
     cell('flame', 'Flame', '', 'Flame stage: kernel → turbulent → burn-out');
     cell('spark', 'Spark', '', 'Ignition phase: charging (dwell) → breakdown → arc → glow', '');
     cell('knock', 'Knock', '', 'End-gas Livengood–Wu integral (autoignition at 100 %) — lamp lights on autoignition');
+    if (opts.brake) cell('brake', 'Brake', '', 'Brake torque and power: mean of the last engine cycle (instantaneous load torque until one is complete)');
+    if (opts.vehicle) cell('road', 'Road speed', '', 'Vehicle speed (vehicle load model)');
     cell('cycle', 'Cycle', '', 'Completed cycles and simulated time');
     this.el.appendChild(cells);
     this.xbBar = cells.querySelector('.oct-hud-bar-fill') as HTMLElement;
@@ -206,6 +268,24 @@ export class Hud {
       this.slots[e.dataset.k!] = new Slot(e);
     });
     this.setPlayback(1, false);
+    this.setFocus(this.focus);
+  }
+
+  /** Focus cylinder (0-based): the dial and readouts show it, its strip chip is outlined. */
+  setFocus(index: number): void {
+    this.focus = index;
+    for (const c of this.strip) {
+      const on = Number(c.el.dataset.cyl) === index;
+      c.el.classList.toggle('is-focus', on);
+      c.el.setAttribute('aria-pressed', String(on));
+    }
+    this.mapMean.reset();
+    this.lastSparkPhase = '';
+  }
+
+  /** Latest engine-level cycle results (brake torque / power), or null. */
+  setEngineCycle(e: EngineCycleSummary | null): void {
+    this.engineCycle = e;
   }
 
   setSparkAdvance(advanceDeg: number): void {
@@ -230,7 +310,11 @@ export class Hud {
     this.slots.last?.set(c ? `${fmt(paToBar(c.imepNet), 2)} bar · η ${fmt(fractionToPct(c.indicatedEfficiency), 1)} %` : '—');
   }
 
-  update(s: EngineSnapshot): void {
+  /**
+   * @param s      the focus cylinder's view of the playback snapshot (cylinder-view.ts), or the snapshot
+   * @param engine the playback snapshot itself (engine-level fields, every cylinder); default `s`
+   */
+  update(s: EngineSnapshot, engine: EngineSnapshot = s): void {
     const sl = this.slots;
     const a = cycleDialAngleDeg(s.thetaDeg);
     if (Math.abs(a - this.lastNeedle) > 0.05) {
@@ -259,9 +343,12 @@ export class Hud {
     }
     sl.flame.set(s.flame.stage);
     const sp = s.spark.phase;
-    if (sp !== this.lastSparkPhase) {
-      this.lastSparkPhase = sp;
-      sl.spark.set(sp);
+    const count = s.spark.breakdownCount;
+    const sparkKey = count === undefined ? sp : `${sp}|${count}`;
+    if (sparkKey !== this.lastSparkPhase) {
+      this.lastSparkPhase = sparkKey;
+      // Trembler shower: phase plus the number of sparks so far in this timer contact.
+      sl.spark.set(count !== undefined && count > 0 ? `${sp} · ${count}×` : sp);
       this.sparkDot.dataset.phase = sp;
     }
     const lw = s.knock.integral;
@@ -272,10 +359,46 @@ export class Hud {
       this.lamp.style.color = lampState === 'knock' ? STATUS.critical : lampState === 'warn' ? STATUS.warning : '';
     }
     sl.knock.set(s.knock.autoignited ? 'KNOCK' : `∫ ${fmt(Math.min(lw, 9.99) * 100, 0)} %`);
-    sl.cycle.set(`#${s.cycle} · ${fmtSimTime(s.t)}`);
+    sl.cycle.set(`#${engine.cycle} · ${fmtSimTime(s.t)}`);
+
+    if (sl.brake) {
+      const ec = this.engineCycle;
+      if (ec) sl.brake.set(`${fmt(ec.brakeTorque, 1)} N·m · ${fmt(wattsToHp(ec.brakePower), 1)} hp`);
+      else if (engine.loadTorque !== undefined) {
+        const p = engine.loadTorque * ((2 * Math.PI * engine.rpm) / 60);
+        sl.brake.set(`${fmt(engine.loadTorque, 1)} N·m · ${fmt(wattsToHp(p), 1)} hp`);
+      } else sl.brake.set('—');
+    }
+    if (sl.road) {
+      const v = engine.vehicleSpeed;
+      sl.road.set(v === undefined ? '—' : `${fmt(mpsToMph(v), 1)} mph · ${fmt(mpsToKmh(v), 0)} km/h`);
+    }
+    if (this.strip.length) this.updateStrip(engine);
+  }
+
+  private updateStrip(engine: EngineSnapshot): void {
+    const entries = firingStrip(this.spec, engine, this.stripEntries);
+    for (let k = 0; k < entries.length && k < this.strip.length; k++) {
+      const e = entries[k];
+      const chip = this.strip[k];
+      const key = `${e.stroke}|${e.sparking ? 1 : 0}|${e.timerClosed ? 1 : 0}`;
+      if (key === chip.key) continue;
+      chip.key = key;
+      chip.el.style.setProperty('--stroke', STROKE_COLOR[e.stroke]);
+      chip.el.dataset.stroke = e.stroke;
+      chip.el.classList.toggle('is-spark', e.sparking);
+      chip.el.classList.toggle('is-timer', e.timerClosed);
+      chip.stroke.textContent = STROKE_INITIAL[e.stroke] ?? '';
+      chip.el.setAttribute('aria-label', `Cylinder ${e.number}: ${STROKE_LABEL[e.stroke]}${e.sparking ? ', sparking' : ''}`);
+    }
   }
 
   dispose(): void {
     this.el.remove();
   }
+}
+
+/** Minimal snapshot for laying out the strip before data arrives (engine angle −360°). */
+function makeIdleSnapshot(): EngineSnapshot {
+  return { thetaDeg: -360, spark: { phase: 'off' } } as EngineSnapshot;
 }

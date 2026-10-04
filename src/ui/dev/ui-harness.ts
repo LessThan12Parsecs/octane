@@ -3,15 +3,24 @@
  * Open http://localhost:5173/src/ui/dev/ui-harness.html with `npm run dev`.
  * Mimics the SimClient contract loosely: raw snapshots at an adaptive cadence
  * (finer around the spark and knock), played back at timeScale × wall time.
+ * ?engine=ford-model-t drives the multi-cylinder UI from MultiMockStream (phase-shifted
+ * single-cylinder cartoons with a trembler-shower cartoon).
  */
 import '../../style.css';
 import { CFR_F1 } from '../../physics/engines/cfr';
+import { getEngine } from '../../physics/engines/index';
 import type { OperatingPoint } from '../../physics/core/operating-point';
 import type { EngineSnapshot } from '../../physics/core/snapshot';
 import { UIController } from '../index';
 import { MockStream } from './mock-stream';
+import { MultiMockStream } from './multi-mock-stream';
 
-const op: OperatingPoint = {
+const q0 = new URLSearchParams(location.search);
+const engineId = q0.get('engine');
+const def = engineId ? getEngine(engineId) : null;
+const spec = def ? def.spec : CFR_F1;
+
+const cfrOp: OperatingPoint = {
   speedMode: 'fixed',
   rpm: 600,
   loadTorque: 0,
@@ -29,7 +38,8 @@ const op: OperatingPoint = {
   coolantTemperature: 373.15,
 };
 
-const mock = new MockStream(CFR_F1, op);
+const op: OperatingPoint = def && def.id !== 'cfr-f1' ? { ...def.defaultOperatingPoint } : cfrOp;
+const mock = spec.cylinders > 1 ? new MultiMockStream(spec, op) : new MockStream(spec, op);
 let timeScale = 1 / 50;
 let paused = false;
 let playT = 0;
@@ -41,6 +51,7 @@ let current: EngineSnapshot = mock.step(0.5);
 let sparkDeg = -op.sparkAdvanceDeg;
 
 function cadenceDeg(theta: number, rpm: number): number {
+  if (mock instanceof MultiMockStream) return mock.inSparkWindow() ? 20e-6 * 6 * rpm : 0.5; // 20 µs during timer contacts
   if (theta >= sparkDeg - 1 && theta < sparkDeg + 12) return 4e-6 * 6 * rpm; // 4 µs around the spark
   if (theta >= -20 && theta < 60) return 0.05; // resolve knock oscillation
   return 0.5;
@@ -48,7 +59,7 @@ function cadenceDeg(theta: number, rpm: number): number {
 
 function generateUntil(t: number): void {
   while (mock.t < t) {
-    const s = mock.step(cadenceDeg(mock.theta, 600));
+    const s = mock.step(cadenceDeg(mock.theta, op.rpm));
     pending.push(s);
   }
 }
@@ -58,7 +69,8 @@ viewport.innerHTML =
   '<div style="position:absolute;inset:0;display:grid;place-items:center;color:#6b7480;font:12px ui-monospace,Menlo,monospace">3D viewport (EngineModel renders here)</div>';
 
 const ui = new UIController(document.getElementById('ui')!, {
-  spec: CFR_F1,
+  spec,
+  engine: def ?? undefined,
   initialOperatingPoint: op,
   onOperatingPointChange: (patch) => {
     mock.setOperatingPoint(patch);
@@ -109,8 +121,9 @@ function advance(dtWall: number): void {
   for (const c of mock.drainCycles()) ui.pushCycle(c);
 }
 
-// URL knobs: ?warm=<sim s>&ts=<scale>&pause=1&tab=cycles&scroll=<px>&zoom=a,b&perf=1
-const q = new URLSearchParams(location.search);
+// URL knobs: ?engine=<id>&warm=<sim s>&ts=<scale>&pause=1&tab=cycles&scroll=<px>&zoom=a,b&perf=1&cyl=<n>
+const q = q0;
+if (q.get('cyl')) ui.setFocusCylinder(Number(q.get('cyl')) - 1);
 const warm = Number(q.get('warm') ?? 0);
 if (warm > 0) {
   // Fast-forward: feed frames of 1/60 s wall at a large time scale.
