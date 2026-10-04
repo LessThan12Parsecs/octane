@@ -1,6 +1,9 @@
 /**
  * Cycle simulator (public API of src/physics/cycle): ONE physically consistent, energy-conserving
- * quasi-dimensional model of the CFR engine that wires every physics module together.
+ * quasi-dimensional engine model that wires every physics module together — the CFR F-1 (one
+ * cylinder) and multi-cylinder engines (spec.cylinders + spec.layout: N cylinders on one crank at
+ * their firing offsets, sharing the intake and exhaust plenums; cycle-model.ts = the engine,
+ * cylinder.ts = one cylinder; a one-cylinder spec runs the former single-cylinder model bit for bit).
  *
  * ── Formulation (details in cycle-model.ts and closure.ts) ──────────────────────────────────
  *  - Time is the independent variable; classical RK4 over all continuous states; steps never
@@ -41,16 +44,24 @@
  *    next cycle start θ = −360), reset(), advanceToNextSnapshot(), drainCycleSummaries(), time,
  *    runCycles(n), recordTrace(cycle?), trace, model.
  *  - {@link CycleModel}: the engine model itself (stepUntil, runCycles, recordTrace, conservation
- *    inventories systemMass / elementInventory / speciesInventory / systemEnergy, ledgers in y).
- *  - {@link runClosedCycle}: closed-cycle-only run from a prescribed IVC state (validation).
+ *    inventories systemMass / elementInventory / speciesInventory / systemEnergy, ledgers in y and
+ *    workLedger / heatLedger summed over the cylinders). `cylinders[i]` ({@link Cylinder}) exposes each
+ *    cylinder's state at its local angle; the legacy single-cylinder fields (p, Tu, closure, knockOsc, …)
+ *    are cylinder 0's.
+ *  - Summaries: one CycleSummary per cylinder and local cycle (`cylinder` = index for N > 1, `cycle` =
+ *    the cylinder's local cycle number); cylinder 0's carries the EngineCycleSummary (`engine`: brake /
+ *    indicated / friction torque, power, MEPs over the total displacement, air and fuel flow, η_v,
+ *    BSFC, brake efficiency, load).
+ *  - {@link runClosedCycle}: closed-cycle-only run from a prescribed IVC state (validation; one cylinder).
  *  - {@link CycleModelOptions}: heatTransfer, combustionModel, wiebe, knock, ignitionDelayModel,
  *    knockIntegral, turbulentFlameClosure, calibration parameters (burnRateMultiplier,
  *    taylorScaleMultiplier, turbulenceLengthScaleFactor, turbulenceProduction, woschniMultiplier,
  *    intakePortHeatTransferMultiplier, venturiDischargeCoefficient, intakeRestrictionArea,
  *    dischargeCoefficientMultiplier, knockDecayTime, knockStratificationDT, knockExcitationTime),
- *    numerical controls. Defaults = the ONE global CFR F-1 calibration ({@link CFR_CALIBRATION},
- *    calibration.ts: values, literature ranges, evidence); neutral values give the uncalibrated
- *    model.
+ *    numerical controls. Defaults are keyed by EngineSpec.id (options.ts: NEUTRAL_CYCLE_MODEL_OPTIONS ←
+ *    ENGINE_CYCLE_OPTION_DEFAULTS[id] ← caller): one calibration set per engine ({@link CFR_CALIBRATION},
+ *    {@link MODEL_T_CALIBRATION}, calibration.ts: values, literature ranges, evidence); the neutral set
+ *    gives the uncalibrated model. DEFAULT_CYCLE_MODEL_OPTIONS is the resolved CFR set.
  *
  * ── Summary definitions (CycleSummary) ──────────────────────────────────────────────────────
  * IMEP from the thermodynamic pressure (the synthesised knock oscillation is excluded);
@@ -83,6 +94,11 @@ import type { CycleModelOptions } from './options';
 export { EngineSimulator, type SnapshotOptions } from './engine-simulator';
 export {
   CycleModel,
+  Cylinder,
+  cylinderCount,
+  cylinderStateIndex,
+  stateLength,
+  CYLINDER_BLOCK_SIZE,
   newCycleTrace,
   swapNO,
   resolveDelayModel,
@@ -95,11 +111,17 @@ export {
   type ClosedCycleInit,
   type CycleTrace,
   type CycleProfile,
+  type CylinderStateIndex,
 } from './cycle-model';
 export { ZoneClosure } from './closure';
-export { CFR_CALIBRATION, CFR_KNOCK_DELAY_MODEL, type CalibratedParameter } from './calibration';
+export { CFR_CALIBRATION, CFR_KNOCK_DELAY_MODEL, MODEL_T_CALIBRATION, type CalibratedParameter, type CalibrationSet } from './calibration';
 export {
   DEFAULT_CYCLE_MODEL_OPTIONS,
+  NEUTRAL_CYCLE_MODEL_OPTIONS,
+  ENGINE_CYCLE_OPTION_DEFAULTS,
+  engineCycleOptionDefaults,
+  calibrationOptions,
+  defaultOperatingPointOf,
   resolveCycleOptions,
   sanitizeOperatingPoint,
   type CombustionModel,

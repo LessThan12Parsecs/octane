@@ -4,6 +4,9 @@
  * must stay in, the source of that range, and the validation evidence that set it. The same set
  * serves every operating point (RON, MON, all octane numbers, spark timings, fuels); nothing is
  * tuned per operating point. DEFAULT_CYCLE_MODEL_OPTIONS (options.ts) takes its defaults from here.
+ * Multi-engine (Model T integration): one set PER ENGINE, selected by EngineSpec.id through the
+ * engine-keyed option defaults of options.ts — CFR_CALIBRATION ('cfr-f1') and MODEL_T_CALIBRATION
+ * ('ford-model-t', transferred CFR values, nothing fitted yet; see below).
  *
  * Validation round 2 (fixer pass, 2026-09-30). The model changed under the calibration: crevice zone,
  * lumped wall temperatures, rate-controlled NO in the burned-zone energy, venturi metering AIR at the
@@ -189,3 +192,74 @@ export const CFR_CALIBRATION = Object.freeze({
  * or two-stage) remain available as options.
  */
 export const CFR_KNOCK_DELAY_MODEL = 'douaud-eyzat-llnl' as const;
+
+/** A per-engine calibration set: the same parameters as {@link CFR_CALIBRATION}. */
+export type CalibrationSet = { readonly [K in keyof typeof CFR_CALIBRATION]: CalibratedParameter };
+
+/**
+ * Transfer one CFR parameter to another engine: same value, range and source; the evidence states that
+ * the value is NOT fitted to that engine and names the data that would set it.
+ */
+function transferred(p: CalibratedParameter, wouldBeSetBy: string): CalibratedParameter {
+  return Object.freeze({
+    value: p.value,
+    range: p.range,
+    source: p.source,
+    evidence: `UNVERIFIED for this engine: the CFR F-1 value transferred unchanged (nothing fitted). Would be set by: ${wouldBeSetBy}`,
+  });
+}
+
+/**
+ * Ford Model T calibration (Model T integration, 2026-10). No measured Model T cylinder-pressure traces
+ * exist, so NOTHING here is fitted: every value is the CFR F-1 value transferred (DESIGN.md calibration
+ * policy, one set per engine; the universal closures marksteinMultiplier and kernelHandoffMultiple are the
+ * same physics on both engines). Each entry names the Model T evidence that would set it. The global
+ * targets are Ford's WOT torque/power table (engines/model-t.ts MODEL_T_FORD_WOT_TABLE, ±1.5 % rounding,
+ * transmission-output basis) and Upton's MBT spark advance vs speed (modelTUptonMbtDeg). Reasons the CFR
+ * values should NOT be expected to carry over: the CFR burn constants were fitted with a shrouded overhead
+ * intake valve and a disc chamber, while the Model T has an unshrouded side valve feeding an L-head pocket
+ * (weaker, differently structured turbulence, a longer flame path), a much larger surface/volume ratio, a
+ * thermosyphon jacket, and a Holley/Kingston carburettor venturi of another size and Reynolds number.
+ */
+export const MODEL_T_CALIBRATION: CalibrationSet = Object.freeze({
+  burnRateMultiplier: transferred(
+    CFR_CALIBRATION.burnRateMultiplier,
+    "Upton's MBT spark advance vs speed on a Ford engine at WOT (J. SAE 1923, 0.108R/(1 + 0.001R) deg: MBT puts CA50 " +
+      'near 8–10° ATDC, so the MBT curve measures the burn duration and its growth with rpm) together with the shape of ' +
+      "Ford's WOT torque curve (FSB Fig. 84) at a fixed volumetric efficiency.",
+  ),
+  taylorScaleMultiplier: transferred(
+    CFR_CALIBRATION.taylorScaleMultiplier,
+    'the same MBT-vs-rpm data as C_T (C_λ sets the burn-up tail CA50→CA90, which moves the MBT angle at low speed).',
+  ),
+  kernelHandoffMultiple: transferred(
+    CFR_CALIBRATION.kernelHandoffMultiple,
+    'universal closure (Forte C_m1 = 2, not engine-fitted); a trembler spark shower (several breakdowns per event) may ' +
+      'need its own hand-off criterion: check the misfire limit at idle (≈ 400 rpm, throttle nearly shut, spark retarded).',
+  ),
+  marksteinMultiplier: transferred(
+    CFR_CALIBRATION.marksteinMultiplier,
+    'universal closure (Bradley 1998 measured/theory ratio, not engine-fitted); unchanged.',
+  ),
+  woschniMultiplier: transferred(
+    CFR_CALIBRATION.woschniMultiplier,
+    "the WOT brake efficiency (Ford's dyno table with a fuel-flow measurement, or period road-test fuel economy at a " +
+      'known speed) and the jacket heat rejection of the thermosyphon system; the L-head pocket adds surface that the ' +
+      'per-area Woschni coefficient does not know about.',
+  ),
+  intakePortHeatTransferMultiplier: transferred(
+    CFR_CALIBRATION.intakePortHeatTransferMultiplier,
+    'the WOT torque level at 500–900 rpm (FSB Fig. 84: 69–83 lb ft), which fixes the volumetric efficiency once the burn ' +
+      'is set; the siamesed intake ports run through the water jacket of the block (spec.manifolds.intakePortLength UNVERIFIED).',
+  ),
+  venturiDischargeCoefficient: transferred(
+    CFR_CALIBRATION.venturiDischargeCoefficient,
+    'the WOT torque fall-off above 1000 rpm (FSB Fig. 84: 82 → 47 lb ft at 1000 → 1900 rpm), mostly carburettor and ' +
+      'manifold restriction; a measured air flow of a Holley NH / Kingston L-4 venturi would set it directly.',
+  ),
+  knockStratificationDT: transferred(
+    CFR_CALIBRATION.knockStratificationDT,
+    'knock intensity — no measurements exist; the period practice of retarding the spark lever on hills (audible spark ' +
+      'knock at WOT and low speed on ≈ 40–55 ON gasoline) only bounds the knock ONSET (the delay model), not the intensity.',
+  ),
+});

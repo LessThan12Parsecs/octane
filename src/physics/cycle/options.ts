@@ -5,19 +5,37 @@
  * Calibration policy (DESIGN.md): only genuinely uncertain closures are exposed as multipliers
  * — burn rate (entrainment speed u_T = C·u′ and burn-up length), turbulence length scale,
  * Woschni coefficient, intake-port heat transfer, venturi / valve discharge coefficients, knock
- * options — and ONE global parameter set serves all operating points: the defaults are the CFR F-1
- * calibration of calibration.ts (validation round 1).
+ * options — and ONE parameter set per ENGINE serves all of its operating points (calibration.ts).
+ *
+ * Defaults are layered (Model T integration): {@link NEUTRAL_CYCLE_MODEL_OPTIONS} (engine-independent
+ * switches, numerics and universal closures; the engine-fitted closures at their uncalibrated literature
+ * values; no engine hardware) ← the per-engine defaults keyed by EngineSpec.id
+ * ({@link ENGINE_CYCLE_OPTION_DEFAULTS}: calibration set, friction inputs, valve lash, crankcase pressure,
+ * knock pickup and band) ← the caller's options ({@link resolveCycleOptions}). A spec without an id is
+ * treated as a CFR derivative (the pre-registry behaviour); an unregistered id gets the neutral set.
+ * {@link DEFAULT_CYCLE_MODEL_OPTIONS} is the resolved CFR F-1 set.
  */
-import type { OperatingPoint } from '../core/operating-point';
+import type { OperatingPoint, LoadSpec } from '../core/operating-point';
 import type { EngineSpec } from '../core/engine-spec';
 import type { IgnitionSystemOptions } from '../ignition';
 import type { WoschniVariant } from '../heat-transfer';
 import type { PnhFrictionInputs } from '../mechanics/friction';
 import type { IgnitionDelayModel } from '../chemistry/ignition-delay';
 import { CFR_CRANKCASE_GAUGE_PRESSURE, CFR_FRICTION, CFR_KNOCK_PICKUP, CFR_RON_CONDITIONS, CFR_VALVE_LASH } from '../engines/cfr';
-import { EXCITATION_TIME_PRF, KNOCK_DECAY_TIME } from '../chemistry/knock';
-import { CFR_CALIBRATION, CFR_KNOCK_DELAY_MODEL } from './calibration';
+import { MODEL_T, MODEL_T_FRICTION, MODEL_T_VALVE_LASH } from '../engines/model-t';
+import { engineOfSpec } from '../engines';
+import { END_GAS_STRATIFICATION_DT, EXCITATION_TIME_PRF, KNOCK_DECAY_TIME } from '../chemistry/knock';
+import { CFR_CALIBRATION, CFR_KNOCK_DELAY_MODEL, MODEL_T_CALIBRATION, type CalibrationSet } from './calibration';
 import { moistAirEnhancementFactor, waterSaturationPressure } from '../thermo/fuels';
+
+/** ISO 5167-4:2022 classical Venturi tube with an "as cast" convergent section, C = 0.984 (fetched
+ * summary of ISO 5167-4 §5.5.4, 2026-09-30) — the round-1 default and the upper end of the
+ * calibration range of options.venturiDischargeCoefficient (calibrated CFR value 0.6,
+ * calibration.ts): the 9/16 in CFR venturi (throat Re ≈ 1e4, fuel-nozzle bridge) is far below the
+ * standard's 2e5 ≤ Re range and not an ISO tube. Modelled as an orifice (no diffuser recovery; the
+ * throttle module estimates the unrecovered loss as negligible at CFR flows). The neutral
+ * (uncalibrated) venturi coefficient. */
+export const VENTURI_DISCHARGE_COEFFICIENT = 0.984;
 
 /**
  * Burn-rate model:
@@ -239,48 +257,52 @@ export interface CycleModelOptions {
 }
 
 /**
- * Defaults: the uncalibrated literature sub-models, with the calibrated closures of the ONE global
- * CFR F-1 parameter set (calibration.ts, CFR_CALIBRATION — values, literature ranges and evidence).
- * Pass the neutral values (multipliers 1, venturi C_D 0.984, port multiplier 0) to get the
- * uncalibrated model.
+ * Engine-independent defaults: sub-model switches, numerical controls and the UNIVERSAL closures
+ * (default knock-delay model CFR_KNOCK_DELAY_MODEL, Markstein multiplier = the Bradley 1998
+ * measured/theory ratio, kernel hand-off multiple = Forte's C_m1 — calibration.ts: not fitted to an
+ * engine); the ENGINE-FITTED closures at their uncalibrated literature values (multipliers 1, venturi
+ * C_D 0.984 = ISO 5167-4, adiabatic intake port, end-gas stratification 15 K = knock.ts
+ * END_GAS_STRATIFICATION_DT); no engine hardware (no friction, zero valve lash, crankcase at ambient,
+ * unfiltered MAPO). The knock pickup is a geometric placeholder replaced per spec
+ * ({@link engineCycleOptionDefaults}). Pass these values to get the uncalibrated model of any engine.
  */
-export const DEFAULT_CYCLE_MODEL_OPTIONS: Readonly<CycleModelOptions> = Object.freeze({
+export const NEUTRAL_CYCLE_MODEL_OPTIONS: Readonly<CycleModelOptions> = Object.freeze({
   heatTransfer: true,
   combustionModel: 'entrainment' as CombustionModel,
   wiebe: Object.freeze({ durationDeg: 50, a: -Math.log(0.001), m: 2 }) as WiebeOptions,
   knock: true,
   ignitionDelayModel: CFR_KNOCK_DELAY_MODEL as IgnitionDelayModelId,
-  burnRateMultiplier: CFR_CALIBRATION.burnRateMultiplier.value,
-  taylorScaleMultiplier: CFR_CALIBRATION.taylorScaleMultiplier.value,
+  burnRateMultiplier: 1,
+  taylorScaleMultiplier: 1,
   kernelHandoffMultiple: CFR_CALIBRATION.kernelHandoffMultiple.value,
   marksteinMultiplier: CFR_CALIBRATION.marksteinMultiplier.value,
   turbulentFlameClosure: 'kk-taylor' as TurbulentFlameClosure,
   knockIntegral: 'single' as KnockIntegralMode,
-  venturiDischargeCoefficient: CFR_CALIBRATION.venturiDischargeCoefficient.value,
+  venturiDischargeCoefficient: VENTURI_DISCHARGE_COEFFICIENT,
   intakeRestrictionArea: 0,
-  intakePortHeatTransferMultiplier: CFR_CALIBRATION.intakePortHeatTransferMultiplier.value,
+  intakePortHeatTransferMultiplier: 0,
   turbulenceLengthScaleFactor: 1,
   turbulenceProduction: 1,
   swirlMomentumEfficiency: 0,
-  woschniMultiplier: CFR_CALIBRATION.woschniMultiplier.value,
+  woschniMultiplier: 1,
   heatTransferCorrelation: 'woschni' as const,
   woschniCombustionTermMultiplier: 1,
   woschniVariant: 'woschni1967' as WoschniVariant,
   dischargeCoefficientMultiplier: 1,
   knockDecayTime: KNOCK_DECAY_TIME,
-  knockStratificationDT: CFR_CALIBRATION.knockStratificationDT.value,
+  knockStratificationDT: END_GAS_STRATIFICATION_DT,
   knockExcitationTime: EXCITATION_TIME_PRF,
   knockSourceShells: 16,
   knockBrushAutoignition: true,
-  knockSensor: Object.freeze([CFR_KNOCK_PICKUP.position[0], CFR_KNOCK_PICKUP.position[2]]) as readonly [number, number],
-  mapoBand: Object.freeze([4000, 18000]) as readonly [number, number],
+  knockSensor: Object.freeze([0, 0]) as readonly [number, number],
+  mapoBand: null,
   maxStepDeg: 0.25,
   fineStepDeg: 0.05,
   knockBurnStep: 2e-6,
   warmupCycles: 3,
-  valveLash: CFR_VALVE_LASH,
-  crankcaseGaugePressure: CFR_CRANKCASE_GAUGE_PRESSURE,
-  friction: CFR_FRICTION,
+  valveLash: 0,
+  crankcaseGaugePressure: 0,
+  friction: null,
   burnoutFraction: 1e-5,
   zoneHeatLossMinTime: 1e-4,
   ignition: Object.freeze({}) as IgnitionSystemOptions,
@@ -291,9 +313,94 @@ export const DEFAULT_CYCLE_MODEL_OPTIONS: Readonly<CycleModelOptions> = Object.f
   creviceModel: true,
 });
 
-/** Merge user options over the defaults (shallow; `wiebe` merged one level). */
-export function resolveCycleOptions(o: Partial<CycleModelOptions> = {}): CycleModelOptions {
-  const d = DEFAULT_CYCLE_MODEL_OPTIONS;
+/** The calibrated closures of a calibration set as cycle-model options. */
+export function calibrationOptions(cal: CalibrationSet): Partial<CycleModelOptions> {
+  return {
+    burnRateMultiplier: cal.burnRateMultiplier.value,
+    taylorScaleMultiplier: cal.taylorScaleMultiplier.value,
+    kernelHandoffMultiple: cal.kernelHandoffMultiple.value,
+    marksteinMultiplier: cal.marksteinMultiplier.value,
+    venturiDischargeCoefficient: cal.venturiDischargeCoefficient.value,
+    intakePortHeatTransferMultiplier: cal.intakePortHeatTransferMultiplier.value,
+    woschniMultiplier: cal.woschniMultiplier.value,
+    knockStratificationDT: cal.knockStratificationDT.value,
+  };
+}
+
+/**
+ * Per-engine option defaults, keyed by EngineSpec.id (engines/index.ts registry ids): the engine's
+ * calibration set plus its hardware — friction inputs, valve lash, crankcase pressure, knock pickup
+ * and MAPO band.
+ */
+export const ENGINE_CYCLE_OPTION_DEFAULTS: Readonly<Record<string, Readonly<Partial<CycleModelOptions>>>> = Object.freeze({
+  'cfr-f1': Object.freeze({
+    ...calibrationOptions(CFR_CALIBRATION),
+    ignitionDelayModel: CFR_KNOCK_DELAY_MODEL as IgnitionDelayModelId,
+    // CFR D-1 detonation pickup in the head face (cfr.ts CFR_KNOCK_PICKUP); measurement band of the ANL data
+    knockSensor: Object.freeze([CFR_KNOCK_PICKUP.position[0], CFR_KNOCK_PICKUP.position[2]]) as readonly [number, number],
+    mapoBand: Object.freeze([4000, 18000]) as readonly [number, number],
+    valveLash: CFR_VALVE_LASH,
+    crankcaseGaugePressure: CFR_CRANKCASE_GAUGE_PRESSURE,
+    friction: CFR_FRICTION,
+  }),
+  'ford-model-t': Object.freeze({
+    ...calibrationOptions(MODEL_T_CALIBRATION),
+    ignitionDelayModel: CFR_KNOCK_DELAY_MODEL as IgnitionDelayModelId,
+    // UNVERIFIED placeholder (no knock instrumentation exists for the Model T): a head-face point near the
+    // liner on the side opposite the valve pocket, inside the bore disc where the cylindrical-bore acoustic
+    // modes of KnockOscillator are defined (all non-axisymmetric modes have an antinode at the wall). The
+    // L-head chamber's own modes and pickup belong to the chamber model.
+    knockSensor: Object.freeze([0.5 * MODEL_T.geometry.bore - 0.003, 0]) as readonly [number, number],
+    // unfiltered modal sum: the CFR's 4–18 kHz band is a property of the ANL instrumentation, and the L-head's
+    // (1,0)-type mode is expected at 2–4 kHz (chamber area notes) — UNVERIFIED
+    mapoBand: null,
+    valveLash: MODEL_T_VALVE_LASH,
+    // UNVERIFIED: the crankcase breathes to the atmosphere through the oil-filler breather (no PCV, no pump)
+    crankcaseGaugePressure: 0,
+    friction: MODEL_T_FRICTION,
+  }),
+});
+
+/**
+ * Defaults: the uncalibrated literature sub-models with the calibrated closures and hardware of the
+ * CFR F-1 (calibration.ts CFR_CALIBRATION — values, literature ranges and evidence), i.e.
+ * NEUTRAL_CYCLE_MODEL_OPTIONS ← ENGINE_CYCLE_OPTION_DEFAULTS['cfr-f1'].
+ */
+export const DEFAULT_CYCLE_MODEL_OPTIONS: Readonly<CycleModelOptions> = Object.freeze({
+  ...NEUTRAL_CYCLE_MODEL_OPTIONS,
+  ...ENGINE_CYCLE_OPTION_DEFAULTS['cfr-f1'],
+} as CycleModelOptions);
+
+const engineDefaultsCache = new Map<string, Readonly<CycleModelOptions>>();
+
+/**
+ * Resolved default options of an engine: the CFR set for 'cfr-f1' and for specs without an id (ad-hoc
+ * CFR derivatives, the pre-registry behaviour); NEUTRAL ← ENGINE_CYCLE_OPTION_DEFAULTS[id] for a
+ * registered id; the neutral set with a generic head-face knock pickup near the liner for any other id.
+ */
+export function engineCycleOptionDefaults(spec: EngineSpec): Readonly<CycleModelOptions> {
+  const id = spec.id;
+  if (id === undefined || id === 'cfr-f1') return DEFAULT_CYCLE_MODEL_OPTIONS;
+  const eng = ENGINE_CYCLE_OPTION_DEFAULTS[id];
+  if (eng) {
+    let r = engineDefaultsCache.get(id);
+    if (!r) {
+      r = Object.freeze({ ...NEUTRAL_CYCLE_MODEL_OPTIONS, ...eng } as CycleModelOptions);
+      engineDefaultsCache.set(id, r);
+    }
+    return r;
+  }
+  // unregistered engine: neutral, with a generic pickup in the head face 3 mm inside the liner (like the CFR D-1)
+  const knockSensor = Object.freeze([0, -(0.5 * spec.geometry.bore - 0.003)]) as readonly [number, number];
+  return Object.freeze({ ...NEUTRAL_CYCLE_MODEL_OPTIONS, knockSensor } as CycleModelOptions);
+}
+
+/**
+ * Merge user options over the defaults (shallow; `wiebe` merged one level). With a spec the defaults are
+ * that engine's ({@link engineCycleOptionDefaults}); without one, the CFR set (DEFAULT_CYCLE_MODEL_OPTIONS).
+ */
+export function resolveCycleOptions(o: Partial<CycleModelOptions> = {}, spec?: EngineSpec): CycleModelOptions {
+  const d = spec ? engineCycleOptionDefaults(spec) : DEFAULT_CYCLE_MODEL_OPTIONS;
   const r: CycleModelOptions = { ...d, ...stripUndefined(o) } as CycleModelOptions;
   r.wiebe = { ...d.wiebe, ...(o.wiebe ?? {}) };
   r.maxStepDeg = clamp(r.maxStepDeg, 1e-3, 2);
@@ -331,8 +438,10 @@ export const MAX_INTAKE_WATER_FRACTION = 0.2;
  * φ = 0 is air only (the drained-carburettor ASTM compression-pressure check); above 2.5 the
  * burned-gas equilibrium (no condensed carbon) approaches infeasibility near φ ≈ 3.1 (DESIGN.md
  * integration notes). Relative humidity is limited so that x_H2O ≤ MAX_INTAKE_WATER_FRACTION.
- * Non-finite or missing numeric fields (and an invalid speed mode / fuel) are replaced by the
- * corresponding field of `fallback` (default: CFR_RON_CONDITIONS) before clamping.
+ * Non-finite or missing numeric fields (and an invalid speed mode / fuel / load / ignition source) are
+ * replaced by the corresponding field of `fallback` (default: the engine's default operating point,
+ * {@link defaultOperatingPointOf}) before clamping. The optional `load` (copied, validated) and
+ * `ignitionSource` are kept.
  */
 export function sanitizeOperatingPoint(spec: EngineSpec, op: OperatingPoint, fallback?: OperatingPoint): OperatingPoint {
   const [crMin, crMax] = spec.geometry.compressionRatioRange;
@@ -340,8 +449,18 @@ export function sanitizeOperatingPoint(spec: EngineSpec, op: OperatingPoint, fal
   // Non-finite / missing numeric fields (NaN, ±Infinity, undefined) are repaired BEFORE clamping —
   // clamp() passes NaN through, and NaN rpm / φ threw inside the model (the worker then stopped) while
   // an undefined spark advance silently disabled the spark (validation round 2). The repair value is
-  // the caller's previous operating point, else the ASTM D2699 Research-method preset.
-  const fb = fallback ?? CFR_RON_CONDITIONS;
+  // the caller's previous operating point, else the engine's default operating point (CFR: the ASTM
+  // D2699 Research-method preset).
+  const fb = fallback ?? defaultOperatingPointOf(spec);
+  if (o.load !== undefined) {
+    const l = sanitizeLoad(spec, o.load, fb.load);
+    if (l) o.load = l;
+    else delete o.load;
+  }
+  if (o.ignitionSource !== undefined && o.ignitionSource !== 'magneto' && o.ignitionSource !== 'battery') {
+    if (fb.ignitionSource === 'magneto' || fb.ignitionSource === 'battery') o.ignitionSource = fb.ignitionSource;
+    else delete o.ignitionSource;
+  }
   for (const k of NUMERIC_FIELDS) {
     const v = o[k] as unknown;
     if (typeof v !== 'number' || !Number.isFinite(v)) (o[k] as number) = fb[k] as number;
@@ -367,4 +486,38 @@ export function sanitizeOperatingPoint(spec: EngineSpec, op: OperatingPoint, fal
   o.coolantTemperature = clamp(o.coolantTemperature, 250, 450);
   if (o.fuel.kind === 'PRF') o.fuel = { kind: 'PRF', octaneNumber: clamp(o.fuel.octaneNumber, 0, 100) };
   return o;
+}
+
+/**
+ * Default operating point of an engine: the registry's (engines/index.ts) for a registered spec.id,
+ * else the CFR Research-method preset (the pre-registry fallback).
+ */
+export function defaultOperatingPointOf(spec: EngineSpec): OperatingPoint {
+  return engineOfSpec(spec)?.defaultOperatingPoint ?? CFR_RON_CONDITIONS;
+}
+
+/** Largest |road grade| accepted for the 'vehicle' load (rise/run). A validity limit: 0.5 ≈ 27°. */
+const MAX_GRADE = 0.5;
+
+/**
+ * A validated copy of a load spec, or the fallback's (copied) when it is malformed, or undefined
+ * (= constant loadTorque) when neither is valid. 'vehicle' needs spec.vehicle and a gear it lists (or
+ * 'neutral'); 'brake' needs refRpm > 0 and a finite exponent (clamped to [0, 4]).
+ */
+function sanitizeLoad(spec: EngineSpec, l: LoadSpec, fb: LoadSpec | undefined): LoadSpec | undefined {
+  const ok = (x: LoadSpec | undefined): LoadSpec | undefined => {
+    if (!x || typeof x !== 'object') return undefined;
+    if (x.kind === 'constant') return { kind: 'constant' };
+    if (x.kind === 'brake') {
+      if (!(Number.isFinite(x.refRpm) && x.refRpm > 0 && Number.isFinite(x.exponent))) return undefined;
+      return { kind: 'brake', refRpm: x.refRpm, exponent: clamp(x.exponent, 0, 4) };
+    }
+    if (x.kind === 'vehicle') {
+      const v = spec.vehicle;
+      if (!v || typeof x.gear !== 'string' || !(x.gear === 'neutral' || x.gear in v.gears)) return undefined;
+      return { kind: 'vehicle', gear: x.gear, grade: Number.isFinite(x.grade) ? clamp(x.grade, -MAX_GRADE, MAX_GRADE) : 0 };
+    }
+    return undefined;
+  };
+  return ok(l) ?? ok(fb);
 }

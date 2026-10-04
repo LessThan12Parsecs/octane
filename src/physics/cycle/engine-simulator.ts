@@ -4,11 +4,15 @@
  * render contract (src/physics/core/snapshot.ts).
  *
  * Snapshot cadence:
- *  - every options.snapshotEveryDeg crank degrees on a grid anchored at θ = −360;
- *  - an event snapshot at the spark command (primary switch-off) and at knock onset;
- *  - dense time-based samples: 5 µs from switch-off until 100 µs after the first breakdown
- *    (or 0.5 ms without breakdown), then 50 µs until the discharge has ended (≤ 5 ms), and
+ *  - every options.snapshotEveryDeg crank degrees (engine angle) on a grid anchored at θ = −360;
+ *  - an event snapshot at every cylinder's spark command (primary switch-off) and knock onset;
+ *  - dense time-based samples (every cylinder's): 5 µs from switch-off until 100 µs after the first
+ *    breakdown (or 0.5 ms without breakdown), then 50 µs until the discharge has ended (≤ 5 ms), and
  *    10 µs for the first 3 ms of knock ringing.
+ * Multi-cylinder engines (spec.cylinders > 1): EngineSnapshot.cylinders holds every cylinder at its
+ * local angle (CylinderSnapshot); the top-level per-cylinder fields are cylinder 0's; gasTorque is the
+ * engine's (sum), and frictionTorque / loadTorque are added. A single-cylinder spec (the CFR) gets
+ * exactly the former snapshot (no cylinders array, no extra fields).
  * Conventions kept from the mock simulator (the front-end relies on them):
  * temperatureUnburned = temperatureMean and temperatureBurned = 0 without a burned zone;
  * flame.radius at 'done' covers the chamber; laminar/turbulent speeds 0 after burn-out;
@@ -19,21 +23,13 @@
  */
 import type { EngineSpec } from '../core/engine-spec';
 import type { OperatingPoint } from '../core/operating-point';
-import type { CycleSummary, CylinderPhase, EngineSnapshot } from '../core/snapshot';
+import type { CycleSummary, CylinderPhase, CylinderSnapshot, EngineSnapshot } from '../core/snapshot';
 import { DEG } from '../core/constants';
 import { NS, SP } from '../core/species';
 import { newCrankTrainState } from '../mechanics';
 import { newFlameGeometryResult } from '../combustion';
-import {
-  CycleModel,
-  I_MB,
-  I_OM,
-  MODE_BURNED,
-  MODE_OPEN,
-  MODE_TWO,
-  swapNO,
-  type CycleTrace,
-} from './cycle-model';
+import { CycleModel, I_OM, MODE_BURNED, MODE_OPEN, MODE_TWO, swapNO, type CycleTrace } from './cycle-model';
+import type { Cylinder } from './cylinder';
 import type { CycleModelOptions } from './options';
 
 /** Snapshot cadence options (structurally the worker's SimulatorOptions). */
@@ -53,6 +49,9 @@ export const DENSE_KNOCK_DT = 10e-6;
 export const DENSE_KNOCK_DURATION = 3e-3;
 
 type FlameStage = EngineSnapshot['flame']['stage'];
+
+/** Per-cylinder part of a snapshot with this cylinder's gas torque (built by cylinderSnapshot). */
+type CylinderPart = Omit<CylinderSnapshot, 'index' | 'thetaDeg' | 'cycle'>;
 
 export class EngineSimulator {
   readonly model: CycleModel;
@@ -93,7 +92,7 @@ export class EngineSimulator {
     return this.model.drainSummaries();
   }
 
-  /** Run n complete cycles without snapshots and return their summaries (validation hook). */
+  /** Run n complete engine cycles without snapshots and return their summaries (validation hook). */
   runCycles(n: number): CycleSummary[] {
     const s = this.model.runCycles(n);
     this.lastTime = this.model.t;
@@ -119,119 +118,216 @@ export class EngineSimulator {
       const d = this.snapshotEveryDeg;
       let thTarget = -360 + (Math.floor((th + 360) / d + 1e-7) + 1) * d;
       if (thTarget > 360) thTarget = 360;
-      // snapshot exactly at the spark command
-      const sp = m.ignCmd.sparkDeg;
-      if (m.ign && Number.isNaN(m.tSparkCmd) && sp > th + 1e-9 && sp < thTarget) thTarget = sp;
+      // snapshot exactly at every cylinder's spark command (engine angle of its local spark angle)
+      for (const c of m.cylinders) {
+        if (!c.ign || !Number.isNaN(c.tSparkCmd)) continue;
+        const sp = c.engineAngle(c.ignCmd.sparkDeg);
+        if (sp > th + 1e-9 && sp < thTarget) thTarget = sp;
+      }
       m.stepUntil(this.nextDenseTime(), thTarget);
     }
     this.lastTime = m.t;
     return this.makeSnapshot();
   }
 
-  /** Next dense-sampling time after the current time (Infinity if none). */
+  /** Next dense-sampling time after the current time over all cylinders (Infinity if none). */
   private nextDenseTime(): number {
     const m = this.model;
     const t = m.t;
     let next = Infinity;
-    const ign = m.ign;
-    if (ign && m.dwellSeen && !Number.isNaN(m.tSparkCmd)) {
-      const ts = m.tSparkCmd;
-      const s = ign.state;
-      const bd = s.breakdownDelay;
-      // 5 µs from switch-off until 100 µs after the first breakdown (0.5 ms without one) ...
-      const tFineEnd = Number.isNaN(bd) ? ts + 0.5e-3 : ts + bd + DENSE_SPARK_AFTER_BREAKDOWN;
-      if (t < tFineEnd - 1e-12) {
-        next = Math.min(ts + (Math.floor((t - ts) / DENSE_SPARK_DT + 1e-6) + 1) * DENSE_SPARK_DT, tFineEnd);
-      } else {
-        // ... then 50 µs while the discharge lasts (≤ 5 ms after switch-off)
-        const active = s.phase === 'breakdown' || s.phase === 'arc' || s.phase === 'glow';
-        if (active && t < ts + DENSE_DISCHARGE_MAX) {
-          next = tFineEnd + (Math.floor((t - tFineEnd) / DENSE_DISCHARGE_DT + 1e-6) + 1) * DENSE_DISCHARGE_DT;
-        }
-      }
-    }
-    if (m.knockOnset && m.mode !== MODE_OPEN) {
-      const tk = m.tKnockOnset;
-      if (t < tk + DENSE_KNOCK_DURATION) next = Math.min(next, tk + (Math.floor((t - tk) / DENSE_KNOCK_DT + 1e-6) + 1) * DENSE_KNOCK_DT);
-    }
+    for (const c of m.cylinders) next = Math.min(next, denseTimeOf(c, t));
     return next;
-  }
-
-  private flameStage(): FlameStage {
-    const m = this.model;
-    if (m.mode === MODE_OPEN) return m.burnDone ? 'done' : 'none';
-    if (m.burnDone) return 'done';
-    if (m.flameActive) return m.frontAtWalls ? 'burnout' : 'turbulent';
-    if (m.ign && m.dwellSeen && m.ign.state.kernel.stage === 'kernel') return 'kernel';
-    if (m.mode === MODE_TWO && (m.opts.combustionModel === 'wiebe' || m.knockOnset)) return 'turbulent';
-    return 'none';
   }
 
   private makeSnapshot(): EngineSnapshot {
     const m = this.model;
-    const spec = m.spec;
+    const cyls = m.cylinders;
+    if (cyls.length === 1) return this.singleCylinderSnapshot();
+    const om = m.y[I_OM];
+    const alpha = m.op.speedMode === 'free' ? m.alpha : 0;
+    const pcc = m.op.ambientPressure + m.opts.crankcaseGaugePressure;
+    const list: CylinderSnapshot[] = [];
+    let gas = 0;
+    let other = 0;
+    let fric = 0;
+    for (const c of cyls) {
+      const part = this.cylinderSnapshot(c);
+      const th = c.theta;
+      // (gas torque from the THERMODYNAMIC pressure, see singleCylinderSnapshot)
+      const cts = c.dyn.evaluate(th * DEG, om, alpha, c.p, pcc, this.cts);
+      const f = m.friction.torque(c.ks.dxdTheta, om);
+      part.gasTorque = cts.gasTorque;
+      gas += cts.gasTorque;
+      other += cts.inertiaTorque + cts.gravityTorque;
+      fric += f;
+      list.push({ ...part, index: c.index, thetaDeg: th >= 360 ? th - 720 : th, cycle: c.cycle });
+    }
+    let net = gas + other + fric;
+    const free = m.op.speedMode === 'free';
+    if (free) net -= m.op.loadTorque;
+    const c0 = list[0];
+    const th = m.theta;
+    return {
+      t: m.t,
+      cycle: m.cycle,
+      thetaDeg: th >= 360 ? th - 720 : th,
+      rpm: m.rpm,
+      pistonDisplacement: c0.pistonDisplacement,
+      clearanceHeight: c0.clearanceHeight,
+      rodAngle: c0.rodAngle,
+      intakeLift: c0.intakeLift,
+      exhaustLift: c0.exhaustLift,
+      phase: c0.phase,
+      volume: c0.volume,
+      pressure: c0.pressure,
+      temperatureMean: c0.temperatureMean,
+      temperatureUnburned: c0.temperatureUnburned,
+      temperatureBurned: c0.temperatureBurned,
+      massFractionBurned: c0.massFractionBurned,
+      mass: c0.mass,
+      heatReleaseRate: c0.heatReleaseRate,
+      heatLossRate: c0.heatLossRate,
+      flame: c0.flame,
+      spark: c0.spark,
+      intakeMassFlow: c0.intakeMassFlow,
+      exhaustMassFlow: c0.exhaustMassFlow,
+      intakeManifoldPressure: m.pInt,
+      exhaustManifoldPressure: m.pExh,
+      knock: c0.knock,
+      burnedComposition: c0.burnedComposition,
+      gasTorque: gas,
+      netTorque: net,
+      frictionTorque: -fric,
+      // load: the constant load in free mode; in fixed mode the dynamometer absorbs the net crank torque
+      // (it holds α = 0)
+      loadTorque: free ? m.op.loadTorque : net,
+      cylinders: list,
+    };
+  }
+
+  /** The single-cylinder snapshot (the CFR contract, unchanged). */
+  private singleCylinderSnapshot(): EngineSnapshot {
+    const m = this.model;
+    const c = m.c0;
+    const part = this.cylinderSnapshot(c);
     const th = m.theta;
     const thDeg = th >= 360 ? th - 720 : th;
-    const ks = m.kin.evaluate(th * DEG, m.ks);
-    const osc = m.knockOscillation();
-    const pressure = m.p + osc;
-    const closed = m.mode !== MODE_OPEN;
-    const hasBurned = m.mode === MODE_TWO || m.mode === MODE_BURNED;
-    const stage = this.flameStage();
+    // mechanics
+    const om = m.y[I_OM];
+    const alpha = m.op.speedMode === 'free' ? m.alpha : 0;
+    const pcc = m.op.ambientPressure + m.opts.crankcaseGaugePressure;
+    // gas torque from the THERMODYNAMIC pressure: the synthesised knock field is a sum of rigid-wall
+    // modes with zero mean over the piston face (no net force; the free-speed dynamics use m.p too) —
+    // the pickup pressure made the reported torque ring by up to ±9 N m (validation round 2)
+    const cts = c.dyn.evaluate(th * DEG, om, alpha, c.p, pcc, this.cts);
+    let net = cts.gasTorque + cts.inertiaTorque + cts.gravityTorque + m.friction.torque(c.ks.dxdTheta, om);
+    if (m.op.speedMode === 'free') net -= m.op.loadTorque;
+    return {
+      t: m.t,
+      cycle: m.cycle,
+      thetaDeg: thDeg,
+      rpm: m.rpm,
+      pistonDisplacement: part.pistonDisplacement,
+      clearanceHeight: part.clearanceHeight,
+      rodAngle: part.rodAngle,
+      intakeLift: part.intakeLift,
+      exhaustLift: part.exhaustLift,
+      phase: part.phase,
+      volume: part.volume,
+      pressure: part.pressure,
+      temperatureMean: part.temperatureMean,
+      temperatureUnburned: part.temperatureUnburned,
+      temperatureBurned: part.temperatureBurned,
+      massFractionBurned: part.massFractionBurned,
+      mass: part.mass,
+      heatReleaseRate: part.heatReleaseRate,
+      heatLossRate: part.heatLossRate,
+      flame: part.flame,
+      spark: part.spark,
+      intakeMassFlow: part.intakeMassFlow,
+      exhaustMassFlow: part.exhaustMassFlow,
+      intakeManifoldPressure: m.pInt,
+      exhaustManifoldPressure: m.pExh,
+      knock: part.knock,
+      burnedComposition: part.burnedComposition,
+      gasTorque: cts.gasTorque,
+      netTorque: net,
+    };
+  }
+
+  private flameStage(c: Cylinder): FlameStage {
+    if (c.mode === MODE_OPEN) return c.burnDone ? 'done' : 'none';
+    if (c.burnDone) return 'done';
+    if (c.flameActive) return c.frontAtWalls ? 'burnout' : 'turbulent';
+    if (c.ign && c.dwellSeen && c.ign.state.kernel.stage === 'kernel') return 'kernel';
+    if (c.mode === MODE_TWO && (this.model.opts.combustionModel === 'wiebe' || c.knockOnset)) return 'turbulent';
+    return 'none';
+  }
+
+  /** Kinematics, gas state, flame, spark, gas exchange, knock and composition of one cylinder (local angle). */
+  private cylinderSnapshot(c: Cylinder): CylinderPart {
+    const spec = this.model.spec;
+    const th = c.theta;
+    const ks = c.kin.evaluate(th * DEG, c.ks);
+    const osc = c.knockOscillation();
+    const pressure = c.p + osc;
+    const closed = c.mode !== MODE_OPEN;
+    const hasBurned = c.mode === MODE_TWO || c.mode === MODE_BURNED;
+    const stage = this.flameStage(c);
     // temperatures
-    const Tmean = m.T;
-    const Tu = m.mode === MODE_BURNED ? 0 : m.mode === MODE_TWO ? m.Tu : Tmean;
-    const Tb = hasBurned ? m.Tb : 0;
+    const Tmean = c.T;
+    const Tu = c.mode === MODE_BURNED ? 0 : c.mode === MODE_TWO ? c.Tu : Tmean;
+    const Tb = hasBurned ? c.Tb : 0;
     // flame
-    const c = spec.sparkPlug.gapCenter;
+    const fc = spec.sparkPlug.gapCenter;
     let radius = 0;
     let area = 0;
     let SL = 0;
     let ST = 0;
-    const kst = m.ign && m.dwellSeen ? m.ign.state.kernel : null;
+    const kst = c.ign && c.dwellSeen ? c.ign.state.kernel : null;
     if (stage === 'kernel' && kst) {
-      radius = m.flameRadius();
-      m.flameGeom.evaluate(radius, m.h, this.fg);
+      radius = c.flameRadius();
+      c.flameGeom.evaluate(radius, c.h, this.fg);
       area = Math.max(0, this.fg.frontArea);
-      SL = m.SL;
+      SL = c.SL;
       ST = kst.turbulentSpeed;
     } else if (stage === 'turbulent' || stage === 'burnout') {
-      radius = m.flameActive ? m.rf : m.rb;
-      area = m.flameActive ? m.Af : 0;
-      if (!m.flameActive && radius > 0) {
-        m.flameGeom.evaluate(radius, m.h, this.fg);
+      radius = c.flameActive ? c.rf : c.rb;
+      area = c.flameActive ? c.Af : 0;
+      if (!c.flameActive && radius > 0) {
+        c.flameGeom.evaluate(radius, c.h, this.fg);
         area = Math.max(0, this.fg.frontArea);
       }
-      SL = m.SL;
-      ST = m.flameActive ? m.burnSpeed : area > 0 && m.rhoU > 0 ? m.burnRateStep / (m.rhoU * area) : 0;
+      SL = c.SL;
+      ST = c.flameActive ? c.burnSpeed : area > 0 && c.rhoU > 0 ? c.burnRateStep / (c.rhoU * area) : 0;
     } else if (stage === 'done') {
-      radius = m.flameGeom.maxRadius(m.h);
+      radius = c.flameGeom.maxRadius(c.h);
     }
     // phase
     let phase: CylinderPhase;
     if (!closed) phase = 'gas-exchange';
     else if (stage === 'kernel' || stage === 'turbulent' || stage === 'burnout') phase = 'combustion';
-    else if (m.burnDone || th > 0) phase = 'expansion';
+    else if (c.burnDone || th > 0) phase = 'expansion';
     else phase = 'compression';
     // composition
     const comp: EngineSnapshot['burnedComposition'] = { CO2: 0, H2O: 0, CO: 0, O2: 0, H2: 0, OH: 0, H: 0, O: 0, NO: 0, N2: 0 };
     let X: Float64Array;
-    if (hasBurned && m.y[I_MB] > 0) {
-      const r = m.closure.eq.result;
+    if (hasBurned && this.model.y[c.ix.MB] > 0) {
+      const r = c.closure.eq.result;
       const Nb = this.Nb;
       for (let k = 0; k < NS; k++) Nb[k] = r.N[k];
       const nb = r.nTotal;
-      swapNO(Nb, m.burnedNOFraction() * nb);
+      swapNO(Nb, c.burnedNOFraction() * nb);
       let n = 0;
       for (let k = 0; k < NS; k++) n += Nb[k];
       if (n > 0) {
         for (let k = 0; k < NS; k++) Nb[k] /= n;
         X = Nb;
-      } else X = m.closure.Xu; // (no equilibrium result yet: never 0/0)
+      } else X = c.closure.Xu; // (no equilibrium result yet: never 0/0)
     } else if (closed) {
-      X = m.closure.Xu;
+      X = c.closure.Xu;
     } else {
-      X = m.cyl.state.X;
+      X = c.cyl.state.X;
     }
     comp.CO2 = X[SP.CO2];
     comp.H2O = X[SP.H2O];
@@ -252,10 +348,10 @@ export class EngineSimulator {
       energyDelivered: 0,
       breakdownVoltage: 0,
     };
-    if (m.ign) {
-      const s = m.ign.state;
+    if (c.ign) {
+      const s = c.ign.state;
       spark.breakdownVoltage = s.breakdownVoltage;
-      if (m.dwellSeen) {
+      if (c.dwellSeen) {
         spark.phase = s.phase;
         spark.primaryCurrent = s.primaryCurrent;
         spark.secondaryVoltage = s.secondaryVoltage;
@@ -263,59 +359,74 @@ export class EngineSimulator {
         spark.energyDelivered = s.energyDelivered;
       }
     }
-    // mechanics
-    const om = m.y[I_OM];
-    const alpha = m.op.speedMode === 'free' ? m.alpha : 0;
-    const pcc = m.op.ambientPressure + m.opts.crankcaseGaugePressure;
-    // gas torque from the THERMODYNAMIC pressure: the synthesised knock field is a sum of rigid-wall
-    // modes with zero mean over the piston face (no net force; the free-speed dynamics use m.p too) —
-    // the pickup pressure made the reported torque ring by up to ±9 N m (validation round 2)
-    const cts = m.dyn.evaluate(th * DEG, om, alpha, m.p, pcc, this.cts);
-    let net = cts.gasTorque + cts.inertiaTorque + cts.gravityTorque + m.friction.torque(ks.dxdTheta, om);
-    if (m.op.speedMode === 'free') net -= m.op.loadTorque;
     return {
-      t: m.t,
-      cycle: m.cycle,
-      thetaDeg: thDeg,
-      rpm: m.rpm,
       pistonDisplacement: ks.x,
       clearanceHeight: ks.clearanceHeight,
       rodAngle: ks.beta,
-      intakeLift: m.ivLift.lift(th),
-      exhaustLift: m.evLift.lift(th),
+      intakeLift: c.ivLift.lift(th),
+      exhaustLift: c.evLift.lift(th),
       phase,
       volume: ks.volume,
       pressure,
       temperatureMean: Tmean,
       temperatureUnburned: Tu,
       temperatureBurned: Tb,
-      massFractionBurned: m.xb,
-      mass: m.mCyl,
-      heatReleaseRate: m.hrr,
-      heatLossRate: m.Qwall,
+      massFractionBurned: c.xb,
+      mass: c.mCyl,
+      heatReleaseRate: c.hrr,
+      heatLossRate: c.Qwall,
       flame: {
         stage,
         radius,
-        center: [c[0], c[1], c[2]],
+        center: [fc[0], fc[1], fc[2]],
         area,
         laminarSpeed: stage === 'done' ? 0 : SL,
         turbulentSpeed: stage === 'done' ? 0 : ST,
-        turbulenceIntensity: m.uPrime,
+        turbulenceIntensity: c.uPrime,
       },
       spark,
-      intakeMassFlow: closed ? 0 : m.mdotIv,
-      exhaustMassFlow: closed ? 0 : m.mdotEv,
-      intakeManifoldPressure: m.pInt,
-      exhaustManifoldPressure: m.pExh,
+      intakeMassFlow: closed ? 0 : c.mdotIv,
+      exhaustMassFlow: closed ? 0 : c.mdotEv,
       knock: {
         // (0 when the delay model does not cover the fuel — the integral is then disarmed)
-        integral: m.knockProgress,
-        autoignited: m.knockOnset,
+        integral: c.knockProgress,
+        autoignited: c.knockOnset,
         oscillation: osc,
       },
       burnedComposition: comp,
-      gasTorque: cts.gasTorque,
-      netTorque: net,
+      gasTorque: 0,
     };
   }
+}
+
+/**
+ * Next dense-sampling time of one cylinder after t (Infinity if none): 5 µs from its spark command
+ * (switch-off) until 100 µs after the first breakdown (0.5 ms without one), then 50 µs while the
+ * discharge lasts (≤ 5 ms after switch-off); 10 µs for the first 3 ms after its knock onset.
+ * Extension point: a trembler spark train extends the window over the whole timer contact.
+ */
+function denseTimeOf(c: Cylinder, t: number): number {
+  let next = Infinity;
+  const ign = c.ign;
+  if (ign && c.dwellSeen && !Number.isNaN(c.tSparkCmd)) {
+    const ts = c.tSparkCmd;
+    const s = ign.state;
+    const bd = s.breakdownDelay;
+    // 5 µs from switch-off until 100 µs after the first breakdown (0.5 ms without one) ...
+    const tFineEnd = Number.isNaN(bd) ? ts + 0.5e-3 : ts + bd + DENSE_SPARK_AFTER_BREAKDOWN;
+    if (t < tFineEnd - 1e-12) {
+      next = Math.min(ts + (Math.floor((t - ts) / DENSE_SPARK_DT + 1e-6) + 1) * DENSE_SPARK_DT, tFineEnd);
+    } else {
+      // ... then 50 µs while the discharge lasts (≤ 5 ms after switch-off)
+      const active = s.phase === 'breakdown' || s.phase === 'arc' || s.phase === 'glow';
+      if (active && t < ts + DENSE_DISCHARGE_MAX) {
+        next = tFineEnd + (Math.floor((t - tFineEnd) / DENSE_DISCHARGE_DT + 1e-6) + 1) * DENSE_DISCHARGE_DT;
+      }
+    }
+  }
+  if (c.knockOnset && c.mode !== MODE_OPEN) {
+    const tk = c.tKnockOnset;
+    if (t < tk + DENSE_KNOCK_DURATION) next = Math.min(next, tk + (Math.floor((t - tk) / DENSE_KNOCK_DT + 1e-6) + 1) * DENSE_KNOCK_DT);
+  }
+  return next;
 }
