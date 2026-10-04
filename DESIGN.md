@@ -7,6 +7,14 @@ simplest real engine that still exercises all the combustion physics we care abo
 kernel, turbulent flame, knock), and it gives us a hard end-to-end validation target: the
 knock-limited compression ratio vs. PRF octane number.
 
+The second engine is the **Ford Model T** (1924–25 high-head engine): an inline four with side valves
+(an L-head chamber offset over the valves), fixed CR ≈ 4, a flywheel magneto feeding four trembler
+(vibrator) coils through a roller timer, a carburettor with a butterfly throttle, and a free-running
+crank that can drive the car through its planetary gearbox. It exercises everything the CFR does not:
+several cylinders on one crank sharing the manifolds, a non-cylindrical chamber, a multi-spark
+electromechanical ignition and a real road load. The engine is chosen at run time (engine picker,
+`?engine=ford-model-t`); see §Multi-cylinder engines and the Ford Model T.
+
 ## Goals
 
 1. **Physics first.** Every subsystem is modelled from first principles as far as a real-time
@@ -30,10 +38,12 @@ src/
     gas-exchange/     valve lift, valve/throttle flow, plenums
     heat-transfer/    Woschni & co., wall heat flux split
     mechanics/        slider-crank kinematics, crank dynamics, friction
-    engines/          EngineSpec instances (cfr.ts)
-    cycle/            the cylinder model + time integrator that wires everything together
+    engines/          EngineSpec instances (cfr.ts, model-t.ts) + the engine registry (index.ts)
+    cycle/            the engine (crank, manifolds, integrator) + N cylinders that wire everything together
   worker/             Web Worker hosting the simulator + message protocol
-  render/             three.js scene (engine mechanism, in-cylinder gas/flame/spark visuals)
+  render/             three.js scene: engine-model.ts (render-model contract + registry), engine/ (CFR
+                      mechanism), engine-modelt/ (Model T mechanism), combustion/ (in-cylinder visuals)
+  app/                page shell + one disposable EngineSession per selected engine
   ui/                 controls, charts, playback
 tools/reference/      Python (Cantera) scripts that generate oracle data → test/fixtures/*.json
 test/fixtures/        committed oracle data
@@ -191,7 +201,14 @@ Implementers may add exports but must provide at least these. All inputs/outputs
   `integralLengthScale(...)`
 - `flame-geometry.ts` — `class FlameGeometry(bore, sparkCenter)`: `evaluate(r, h, out)` →
   `{ volume, frontArea, wettedHead, wettedPiston, wettedLiner }` for a sphere of radius r centred
-  at the gap intersected with the disc of height h; `radiusForVolume(V, h)`.
+  at the gap intersected with the disc of height h; `radiusForVolume(V, h)`; option
+  `allowSparkOutsideBore` (gap outside the bore planform, d > R).
+- `chamber.ts` — `createChamber(spec)` → `CombustionChamber` (the cycle model's ONLY geometry entry):
+  `evaluate(r, h, out)` (volume, front area, per-surface wetted areas and burned fractions, crevice
+  burned fraction), `radiusForVolume`, `maxRadius`, `inscribedRadius`, `chamberVolume(h)` (= V − V_crevice,
+  consistent with SliderCrank), `meanDepth(h)` (turbulence height), `surfaceAreas(h, out)`. `DiscChamber`
+  wraps FlameGeometry bit-identically (CFR); `LHeadChamber` = bore column ∪ (pocket rounded rectangle ∖
+  bore disc) prism, dV/dr = A_f exact on the fast path, tables shared by identical cylinders.
 - `entrainment.ts` — `entrainmentRates({rhoU, frontArea, uPrime, SL, me, mb, lambda}, out)`,
   `taylorMicroscale(L, uPrime, nu)`.
 
@@ -200,11 +217,25 @@ Implementers may add exports but must provide at least these. All inputs/outputs
 - `coil.ts` — `class IgnitionCoil(spec)`: `step(dt, dwellOn, gap)` — primary/secondary circuit with gap model
 - `kernel.ts` — `class SparkKernel`: kernel radius/temperature/mass growth from spark energy + chemistry,
   quench/misfire, hand-off radius
-- `index.ts` — `class IgnitionSystem(spec)` composing the above: `step(dt, thetaDeg, command, gas)`.
+- `index.ts` — `class IgnitionSystem(spec)` composing the above: `step(dt, thetaDeg, command, gas, omega?,
+  thetaEngineDeg?)`; `createIgnitionSystems(spec)` (one per cylinder).
+- Trembler-magneto (`source.ts`, `vibrator.ts`, `trembler-coil.ts`, wired in `index.ts`): primary supply = 6 V
+  battery or the AC flywheel magneto E = kω sin(N(θ − φ)) behind R_s + L_s; a 1-DOF vibrator armature
+  (pull ∝ I₁²/(g₀ − x)²) opens the points (events in the coil sub-step), the condenser rings, the gap
+  fires — a spark TRAIN for as long as the timer contact lasts. One ignition event = one timer contact;
+  the kernel is not declared misfired between sparks and can be re-seeded. `tremblerTimerCommand(spec,
+  lever)`: the spark lever sets the timer MAKE; the first spark is an output (coil firing time).
 
 ### gas-exchange (`src/physics/gas-exchange/`)
-- `valve-lift.ts` — `valveLift(spec, thetaDeg)`, `valveLiftRate(spec, thetaDeg)` (m/deg)
-- `valve-flow.ts` — `valveFlowArea(spec, lift)` (Heywood curtain/seat regimes), `valveDischargeCoefficient(spec, lift, reverse)`
+- `valve-lift.ts` — `valveLift(spec, thetaDeg)`, `valveLiftRate(spec, thetaDeg)` (m/deg);
+  `createLiftProfile(valve, lash)` → `LiftProfile` (polydyne default | exact three-arc lobe on a flat
+  follower (`cam-lift.ts`) | measured table), `resolveValveLash(valve, optionLash)` (ValveSpec.lash wins).
+- `valve-flow.ts` — `valveFlowArea(spec, lift)` (Heywood curtain/seat regimes), `valveDischargeCoefficient(spec, lift, reverse)`;
+  `createValveFlowModel(valve, kind, spec)` adds the side-valve pocket-roof stage and the pocket→bore
+  transfer restriction (crown height as third argument of `effectiveArea`).
+- `carburettor.ts` — `CarburettorFlowModel`: venturi and butterfly as two compressible orifices in series
+  (Newton on the intermediate pressure, correct when the throttle chokes) when `manifolds.venturiDiameter`
+  is set; the CFR keeps its venturi-as-throttle.
 - `orifice.ts` — `orificeMassFlow(CdA, p0, T0, R0, gamma0, pDown)` (kg/s ≥ 0, choked/unchoked)
 - `throttle.ts` — `throttleArea(diameter, opening)` (butterfly geometry + leakage)
 - `plenum.ts` — 0D filling/emptying volume with composition.
@@ -212,17 +243,32 @@ Implementers may add exports but must provide at least these. All inputs/outputs
 ### heat-transfer (`src/physics/heat-transfer/`)
 - `woschni.ts` — `woschniCoefficient(inputs)` (W/m²/K), plus `hohenbergCoefficient`, `annandFlux`;
   `wallHeatLoss(...)` split over head/piston/liner.
+- `wall-heat.ts` — `wallHeatLossSurfaces` / `wallHeatLossTwoZoneSurfaces`: six surfaces (head, piston,
+  liner, intake valve, exhaust valve, block deck) each with its own burned fraction; summed in the legacy
+  order so the CFR's five-surface numbers are bit-identical.
 
 ### mechanics (`src/physics/mechanics/`) and engine spec (`src/physics/engines/cfr.ts`)
 - `kinematics.ts` — `class SliderCrank(geometry, compressionRatio)`: `volume(θ)`, `dVdTheta(θ)`,
   `clearanceHeight(θ)`, `pistonDisplacement(θ)`, `rodAngle(θ)`, `pistonVelocity(θ, ω)`,
   `pistonAcceleration(θ, ω, α)`, `displacedVolume`, `clearanceVolume`, `linerArea(θ)`, …
-- `dynamics.ts` — gas torque, reciprocating/rotating inertia torque, crank angular acceleration.
-- `friction.ts` — FMEP correlation.
-- `CFR_F1: EngineSpec` — every number sourced.
+- `dynamics.ts` — gas torque, reciprocating/rotating inertia torque, crank angular acceleration;
+  `MultiCylinderCrankTrain.fromSpec(spec, kin)`: rigid inline crank, θ_i = θ − (offset_i mod 360°),
+  per-cylinder pressures, load inertia.
+- `friction.ts` — FMEP correlation; `FrictionTorqueModel(kin, ε, N)` + `torqueCylinders` (whole-engine FMEP
+  over N·V_d — constructing it without N gives 1/N of the friction); PNH valvetrain type 'L-head'.
+- `load.ts` — `LoadModel`: constant / brake (∝ n^k) / vehicle road load through the gearbox (reflected
+  inertia, drive vs overrun efficiency) / neutral.
+- `CFR_F1`, `MODEL_T: EngineSpec` — every number sourced or marked UNVERIFIED.
 
 ### cycle (`src/physics/cycle/`) — built after the modules
 - `class EngineSimulator(spec, op)`: `advance(dt)`, `snapshot()`, emits `CycleSummary`.
+- `cycle-model.ts` = the ENGINE (crank angle/speed, shared intake/exhaust plenums, carburettor/venturi and
+  outlet, RK4 stepping with event landing, warm-up, engine wrap and `EngineCycleSummary`); `cylinder.ts` =
+  one cylinder at its local angle θ_i = θ − layout.firingOffsetDeg[i] (state block, two-zone closure,
+  ignition, flame, knock, NO, events, local wraps and its `CycleSummary`). Cylinder 0 keeps the
+  single-cylinder state layout, so a one-cylinder spec runs the former model bit for bit.
+- Options resolve by `EngineSpec.id` (options.ts `ENGINE_CYCLE_OPTION_DEFAULTS`): neutral physics defaults ←
+  the engine's defaults (calibration set, friction, knock sensor/band, venturi C_D) ← the caller's options.
 
 ## Validation ladder
 
@@ -286,10 +332,11 @@ Facts the cycle model must respect. Each module's `index.ts` JSDoc has the detai
 - **Calibration policy:** only genuinely uncertain closures may be tuned (burn-rate multiplier /
   Taylor-scale constant, turbulence length-scale factor, Woschni multiplier, intake-port heat
   transfer, discharge coefficients, knock-intensity threshold / end-gas stratification), each within
-  a literature-supported range, with ONE global parameter set for all operating points (RON, MON,
-  all octane numbers), and every choice documented next to the parameter. The set lives in
-  `src/physics/cycle/calibration.ts` (`CFR_CALIBRATION`: value, range, source, evidence) and is the
-  default of `CycleModelOptions`.
+  a literature-supported range, with ONE parameter set per ENGINE for all its operating points (CFR: RON,
+  MON, all octane numbers), and every choice documented next to the parameter. The sets live in
+  `src/physics/cycle/calibration.ts` (`CFR_CALIBRATION`, `MODEL_T_CALIBRATION`: value, range, source,
+  evidence) and are selected by `EngineSpec.id`. Universal closures (Markstein ratio, kernel hand-off
+  multiple, knock-delay model) are shared; an engine fitted to little data says so in its evidence.
 - **cycle (validation round 1, fixer pass):**
   - Standard knock = MAPO ≈ 0.67 bar at the D-1 pickup (Rockstroh 2018; Hoth 2021 Table 6); the
     model's MAPO/peak pressure/max dp/dθ are sampling-independent (see cycle/index.ts definitions).
@@ -326,3 +373,35 @@ Facts the cycle model must respect. Each module's `index.ts` JSDoc has the detai
     the two ANL standard-knock states differ 2.2×), PRF ≤ 80 in RON knock 0.45–0.94 CR too early, the
     λ trend of MAPO is too weak; MBT ≈ 5° BTDC vs 9–10° measured; blowdown too fast (p(160)/p(141)
     −6.5 %); MON ASTM compression pressure +4.9 % (MON/RON +2.9 %: no mixture-heater flow loss).
+
+## Multi-cylinder engines and the Ford Model T
+
+**Contracts.** `EngineSpec.layout` gives the firing order, the firing-TDC offset of every cylinder
+(Model T 1-2-4-3: [0, 180, 540, 360]), the cylinder positions along the crank and the render-only mirror
+flags; absent = one cylinder at the origin. `geometry.chamber: 'l-head'` + `geometry.lHead` describe the
+side-valve chamber (bore column from the crown up to the cavity roof y = 0 ∪ a valve-pocket prism from
+the deck to the pocket roof; the Model T crown rises 5/16 in above the deck at TDC). `ValveSpec.cam`,
+`lash`, `seatY`, `liftDirection` describe a side valve driven by a real cam. `ignition.type
+'trembler-magneto'` is the Ford system. `EngineSpec.vehicle` + `OperatingPoint.load` ('constant' | 'brake'
+| 'vehicle') give the free-speed load; `OperatingPoint.ignitionSource` is the dash MAG/BAT switch and
+`sparkAdvanceDeg` is the spark LEVER (timer make) for a trembler engine.
+
+**Snapshots.** A multi-cylinder snapshot carries `cylinders[i]` (every cylinder at its local angle, own
+cycle counter and gas torque); the top-level per-cylinder fields are cylinder 1, and the engine-level
+fields are `gasTorque` (sum), `netTorque`, `frictionTorque` (> 0 opposing), `loadTorque`, `vehicleSpeed`,
+`firingCylinder`, `magnetoEmf`. Each cylinder emits its own `CycleSummary` (`summary.cylinder`);
+cylinder 1's carries `summary.engine` (brake torque, power, BMEP, FMEP, η_v over N·V_d, bsfc). The CFR's
+snapshot stream is unchanged (no `cylinders`).
+
+**Engine registry and app.** `src/physics/engines/index.ts` maps ids to {spec, default operating point,
+presets, UI profile}. The app shell (`src/app/app.ts`) keeps the WebGL stage alive and swaps a disposable
+`EngineSession` (render model from `createEngineModel(spec, op)`, one CombustionVisuals per cylinder frame
+with tracers and the chamber light on the featured cylinder, SimClient, Conductor, UI). The worker needs
+no engine knowledge: the spec it receives selects the physics defaults.
+
+**Validation.** `test/fixtures/modelt_period_data.json` (`tools/reference/modelt_data_period.py`, README
+alongside): Ford's WOT brake torque table, Upton's MBT relation, compression pressure, trembler-coil and
+magneto behaviour, timer/lever range and vehicle performance — global targets only (no Model T pressure
+trace exists in open sources). Known model-form limits: Euclidean flame sphere in the non-convex L-head
+(the pocket burns slightly early), knock model weakest at the period fuel's low octane, PNH friction
+extrapolated to a 1920s babbitt-bearing engine.
