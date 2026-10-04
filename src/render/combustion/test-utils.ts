@@ -4,7 +4,8 @@
  * Only imported by *.test.ts files.
  */
 import type { EngineSpec } from '../../physics/core/engine-spec';
-import type { EngineSnapshot } from '../../physics/core/snapshot';
+import type { CylinderSnapshot, EngineSnapshot } from '../../physics/core/snapshot';
+import { MODEL_T } from '../../physics/engines/model-t';
 
 const IN = 0.0254;
 export const TEST_BORE = 3.25 * IN;
@@ -80,4 +81,53 @@ export function flameSnap(o: DeepPartial<EngineSnapshot> = {}): EngineSnapshot {
     ...o,
     flame: { stage: 'turbulent', radius: 0.025, area: 2e-3, laminarSpeed: 0.8, turbulentSpeed: 3, turbulenceIntensity: 1.2, ...(o.flame ?? {}) },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Model T (L-head, four cylinders, trembler-magneto ignition)
+// ---------------------------------------------------------------------------
+
+/** MODEL_T with a sharp-cornered valve pocket (exact rectangle cross-sections for flux checks). */
+export function sharpLHeadSpec(): EngineSpec {
+  const g = MODEL_T.geometry;
+  const lh = g.lHead!;
+  return { ...MODEL_T, geometry: { ...g, lHead: { ...lh, pocket: { ...lh.pocket, cornerRadius: 0 } } } };
+}
+
+const MT_R = MODEL_T.geometry.bore / 2;
+const MT_LH = MODEL_T.geometry.lHead!;
+/** Model T bore-column depth at TDC (crown below the roof over the bore), m. */
+export const MT_DEPTH_TDC = -MT_LH.deckY - MT_LH.crownAboveDeckAtTDC;
+/** Model T valve-pocket volume (spec plan area × height), m³. */
+const MT_POCKET_V = 46.016e-4 * (MT_LH.pocket.roofY - MT_LH.deckY);
+
+/** A Model T cylinder-1 snapshot at piston displacement x (mid-compression, no flame); override any field. */
+export function modelTSnap(o: DeepPartial<EngineSnapshot> = {}, x = 0.005): EngineSnapshot {
+  const h = MT_DEPTH_TDC + x;
+  return snap({
+    rpm: 1000, pistonDisplacement: x, clearanceHeight: h, volume: Math.PI * MT_R * MT_R * h + MT_POCKET_V,
+    mass: 4e-4, pressure: 6e5, temperatureMean: 600, temperatureUnburned: 600,
+    ...o,
+    flame: { center: [...MODEL_T.sparkPlug.gapCenter] as [number, number, number], ...(o.flame ?? {}) },
+  });
+}
+
+/** The per-cylinder record of a snapshot (as the worker builds cylinders[i]). */
+export function cylinderOf(s: EngineSnapshot, index: number, thetaDeg = s.thetaDeg, cycle = s.cycle): CylinderSnapshot {
+  return {
+    index, thetaDeg, cycle, gasTorque: s.gasTorque,
+    pistonDisplacement: s.pistonDisplacement, clearanceHeight: s.clearanceHeight, rodAngle: s.rodAngle,
+    intakeLift: s.intakeLift, exhaustLift: s.exhaustLift, phase: s.phase, volume: s.volume, pressure: s.pressure,
+    temperatureMean: s.temperatureMean, temperatureUnburned: s.temperatureUnburned, temperatureBurned: s.temperatureBurned,
+    massFractionBurned: s.massFractionBurned, mass: s.mass, heatReleaseRate: s.heatReleaseRate, heatLossRate: s.heatLossRate,
+    flame: s.flame, spark: s.spark, intakeMassFlow: s.intakeMassFlow, exhaustMassFlow: s.exhaustMassFlow,
+    knock: s.knock, burnedComposition: s.burnedComposition,
+  };
+}
+
+/** An engine snapshot whose top level is cylinder 1 (= cylinders[0]) plus the given per-cylinder states. */
+export function engineSnap(cyl: EngineSnapshot[], thetas: number[] = cyl.map((c) => c.thetaDeg)): EngineSnapshot {
+  const top = { ...cyl[0] };
+  top.cylinders = cyl.map((c, i) => cylinderOf(c, i, thetas[i], c.cycle));
+  return top;
 }

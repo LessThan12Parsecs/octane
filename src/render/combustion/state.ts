@@ -39,8 +39,17 @@ import {
   VIS_GLARE_RADIUS,
   VIS_MIN_CHANNEL_RADIUS,
 } from './constants';
+import {
+  chamberDepth,
+  chamberShapeOf,
+  effectiveDepth,
+  farthestFootprintPoint,
+  projectIntoChamber,
+  type ChamberShape,
+} from './chamber';
 import { GasFlowModel } from './flow';
 import {
+  axialModeFrequency,
   brushParams,
   emptyBrush,
   knockModeFrequency,
@@ -60,6 +69,8 @@ export const MIN_EXPOSURE_S = 1e-5;
 const KNOCK_MAX_CYCLES_PER_FRAME = 0.15;
 /** Display clamp for emitters (keeps half-float targets finite). */
 const DISPLAY_CLAMP = 5e3;
+/** L-head chamber light: kept this fraction of R clear of the walls (as the disc's 0.8 R limit). */
+const LIGHT_WALL_MARGIN = 0.2;
 /** Typical sustaining voltages used only if the snapshot lacks a current (V). UNVERIFIED. */
 const ARC_SUSTAIN_V = 100;
 const GLOW_SUSTAIN_V = 450;
@@ -79,6 +90,8 @@ export interface KnockVisual {
   rms: number;
   /** Orientation of the (1,0) mode antinode, rad (toward the end-gas site). */
   axisAngle: number;
+  /** L-head axial mode: its sign at the end-gas site (±1; the disc's Bessel mode uses axisAngle). */
+  modeSign: number;
   /** End-gas autoignition site (x, z), m. */
   origin: [number, number];
   /** Radius of the expanding pressure front from the site, m. */
@@ -138,6 +151,8 @@ export class CombustionVisualState {
   readonly flow: GasFlowModel;
   readonly R: number;
   readonly bore: number;
+  /** Chamber shape (flat disc or L-head) the visuals fill. */
+  readonly shape: ChamberShape;
 
   // ---- time ----
   t = 0;
@@ -148,6 +163,7 @@ export class CombustionVisualState {
   cycle = -1;
 
   // ---- chamber ----
+  /** Depth of the piston crown below the cylinder-frame y = 0 (crown at y = −h), m (chamber.ts chamberDepth). */
   h = 0;
   volume = 0;
 
@@ -181,12 +197,14 @@ export class CombustionVisualState {
   frontFlux = 0;
 
   readonly knock: KnockVisual = {
-    active: false, amplitude: 0, envelopePa: 0, temporal: 0, rms: 0, axisAngle: Math.PI,
+    active: false, amplitude: 0, envelopePa: 0, temporal: 0, rms: 0, axisAngle: Math.PI, modeSign: 1,
     origin: [0, 0], ringRadius: 0, ringWidth: 0, standing: 1, frequency: 0, soundSpeed: 0, onsetTime: 0,
   };
 
   readonly spark: SparkVisual;
   readonly light: ChamberLight = { intensity: 0, color: [1, 1, 1], position: v3() };
+  /** Gap breakdowns flashed since construction (cumulative; fractional with interpolated counters). */
+  breakdownsSeen = 0;
 
   // ---- internals ----
   private hasPrev = false;
@@ -194,6 +212,8 @@ export class CombustionVisualState {
   private lastEnergy = 0;
   private lastKind: 'none' | 'arc' | 'glow' = 'none';
   private pendingFlashJ = 0;
+  /** Last cumulative breakdown count of the ignition event (trembler showers); NaN = not latched. */
+  private lastBreakdownCount = NaN;
   private flashCd = 0;
   private qRef = 0;
   private readonly gapAxis: V3;
@@ -204,11 +224,16 @@ export class CombustionVisualState {
   private readonly tmp2: V3 = v3();
   private readonly turb: V3 = v3();
   private rngState = 0x9e3779b9;
+  /** Length scale of the knock overlay's front: R for the disc, half the footprint length for an L-head, m. */
+  private readonly knockScale: number;
+  private readonly footprintPt: [number, number] = [0, 0];
 
   constructor(private readonly spec: EngineSpec) {
     this.flow = new GasFlowModel(spec);
     this.bore = spec.geometry.bore;
     this.R = this.bore / 2;
+    this.shape = chamberShapeOf(spec);
+    this.knockScale = this.shape.kind === 'l-head' ? 0.5 * (this.shape.s1 - this.shape.s0) : this.R;
     const sp = spec.sparkPlug;
     const al = Math.hypot(sp.axis[0], sp.axis[1], sp.axis[2]) || 1;
     this.gapAxis = [sp.axis[0] / al, sp.axis[1] / al, sp.axis[2] / al];
@@ -233,6 +258,7 @@ export class CombustionVisualState {
     this.lastEnergy = 0;
     this.lastKind = 'none';
     this.pendingFlashJ = 0;
+    this.lastBreakdownCount = NaN;
     this.flashCd = 0;
     this.qRef = 0;
     this.knock.active = false;
@@ -260,7 +286,7 @@ export class CombustionVisualState {
     this.t = s.t;
     this.cycle = s.cycle;
     this.hasPrev = true;
-    this.h = s.clearanceHeight;
+    this.h = chamberDepth(this.shape, s.clearanceHeight, s.pistonDisplacement);
     this.volume = s.volume;
 
     this.flow.update(s, dtSim);
@@ -302,7 +328,7 @@ export class CombustionVisualState {
     brushParams({
       uPrime: f.turbulenceIntensity > 0 ? f.turbulenceIntensity : this.flow.uPrime,
       laminarSpeed: f.laminarSpeed,
-      clearanceHeight: s.clearanceHeight,
+      clearanceHeight: this.shape.kind === 'l-head' ? effectiveDepth(this.shape, this.h) : s.clearanceHeight,
       radius: this.flameRadius,
       pressure: s.pressure,
       unburnedTemperature: Tu,
@@ -374,18 +400,32 @@ export class CombustionVisualState {
     const k = this.knock;
     const c = soundSpeed(s.temperatureMean > 0 ? s.temperatureMean : 300, molarMassOf(s.burnedComposition));
     k.soundSpeed = c;
-    k.frequency = knockModeFrequency(c, this.bore);
+    const lhead = this.shape.kind === 'l-head';
+    // Disc: Draper (1,0). L-head: lowest axial mode of the footprint (geometry.ts axialModeFrequency).
+    k.frequency = lhead ? axialModeFrequency(c, this.shape.s1 - this.shape.s0) : knockModeFrequency(c, this.bore);
 
     if (s.knock.autoignited && !k.active) {
       k.active = true;
       k.onsetTime = s.t;
-      // End-gas site: the liner point farthest from the flame centre.
       const cx = s.flame.center[0], cz = s.flame.center[2];
-      const n = Math.hypot(cx, cz);
-      const dx = n > 1e-6 ? -cx / n : -1, dz = n > 1e-6 ? -cz / n : 0;
-      k.origin[0] = dx * this.R;
-      k.origin[1] = dz * this.R;
-      k.axisAngle = Math.atan2(dz, dx);
+      if (lhead) {
+        // End-gas site: the footprint point farthest from the flame centre.
+        const o = this.footprintPt;
+        farthestFootprintPoint(cx, cz, this.shape, o);
+        k.origin[0] = o[0];
+        k.origin[1] = o[1];
+        k.axisAngle = Math.atan2(o[1] - cz, o[0] - cx);
+        const sh = this.shape;
+        const u = (o[0] * sh.axis[0] + o[1] * sh.axis[1] - sh.s0) / (sh.s1 - sh.s0);
+        k.modeSign = Math.cos(Math.PI * Math.min(Math.max(u, 0), 1)) >= 0 ? 1 : -1;
+      } else {
+        // End-gas site: the liner point farthest from the flame centre.
+        const n = Math.hypot(cx, cz);
+        const dx = n > 1e-6 ? -cx / n : -1, dz = n > 1e-6 ? -cz / n : 0;
+        k.origin[0] = dx * this.R;
+        k.origin[1] = dz * this.R;
+        k.axisAngle = Math.atan2(dz, dx);
+      }
     } else if (!s.knock.autoignited && k.active) {
       k.active = false;
     }
@@ -397,9 +437,9 @@ export class CombustionVisualState {
     k.amplitude = Math.min(1, k.envelopePa / OVERLAY_KNOCK_FULL_SCALE_PA);
 
     const since = k.active ? Math.max(s.t - k.onsetTime, 0) : Infinity;
-    k.ringRadius = Number.isFinite(since) ? c * since : 4 * this.R;
-    k.ringWidth = 0.12 * this.R;
-    k.standing = Math.min(1, k.ringRadius / (2 * this.R));
+    k.ringRadius = Number.isFinite(since) ? c * since : 4 * this.knockScale;
+    k.ringWidth = 0.12 * this.knockScale;
+    k.standing = Math.min(1, k.ringRadius / (2 * this.knockScale));
     const cyclesPerFrame = k.frequency * timeScale * dtWall;
     if (cyclesPerFrame <= KNOCK_MAX_CYCLES_PER_FRAME) {
       k.rms = 0;
@@ -430,10 +470,26 @@ export class CombustionVisualState {
     const wasDischarging = this.lastPhase === 'breakdown' || this.lastPhase === 'arc' || this.lastPhase === 'glow';
 
     // ---- breakdown events (restrikes included) ----
+    // Each gap breakdown releases the secondary capacitance's energy ½·C_sec·V_bd² (any ignition type:
+    // ignitionSecondaryCapacitance). With the cumulative per-event counter (trembler showers: several
+    // breakdowns per frame at real-time playback) every breakdown since the last frame flashes exactly
+    // once; without it a breakdown is a phase edge between consecutive frames.
     let breakdownElec = 0;
-    if ((phase === 'breakdown' && this.lastPhase !== 'breakdown') || (discharging && !wasDischarging)) {
+    const nbd = s.spark.breakdownCount;
+    let nNew = 0;
+    if (nbd !== undefined && Number.isFinite(nbd)) {
+      if (!Number.isNaN(this.lastBreakdownCount)) {
+        nNew = nbd - this.lastBreakdownCount;
+        if (nNew < 0) nNew = Math.max(nbd, 0); // a new ignition event restarted the count
+      } // else: first sample after a reset latches the counter (a seek must not replay a shower)
+      this.lastBreakdownCount = nbd;
+    } else if ((phase === 'breakdown' && this.lastPhase !== 'breakdown') || (discharging && !wasDischarging)) {
+      nNew = 1;
+    }
+    if (nNew > 0) {
+      this.breakdownsSeen += nNew;
       const V = Math.max(s.spark.breakdownVoltage, 0);
-      breakdownElec = 0.5 * this.secC * V * V;
+      breakdownElec = nNew * 0.5 * this.secC * V * V;
       this.pendingFlashJ += BREAKDOWN_RADIATIVE_EFFICIENCY * breakdownElec;
       sp.bow[0] = sp.bow[1] = sp.bow[2] = 0;
       this.turb[0] = this.turb[1] = this.turb[2] = 0;
@@ -585,6 +641,10 @@ export class CombustionVisualState {
     // Position: intensity-weighted between the burned-gas region and the spark gap.
     const Igas = Iflame + Iai + Iburned;
     const Igap = Ispark + Iflash;
+    if (this.shape.kind === 'l-head') {
+      this.lHeadLightPosition(Igas, Igap);
+      return;
+    }
     const px = this.allBurned ? 0 : this.flameCenter[0];
     const pz = this.allBurned ? 0 : this.flameCenter[2];
     const rr = Math.hypot(px, pz);
@@ -595,6 +655,33 @@ export class CombustionVisualState {
     L.position[0] = gx + (this.gapCenter[0] - gx) * w;
     L.position[1] = gy + (this.gapCenter[1] - gy) * w;
     L.position[2] = gz + (this.gapCenter[2] - gz) * w;
+  }
+
+  /**
+   * L-head light position: the burned region (flame centre at mid-depth of the piece it is over — bore
+   * column or pocket —, or the chamber's volume centroid once all gas is burned) kept LIGHT_WALL_MARGIN·R
+   * clear of the walls, pulled toward the gap by intensity, then clamped into the chamber again (the
+   * straight path between pocket and bore may cross the piston's top land).
+   */
+  private lHeadLightPosition(Igas: number, Igap: number): void {
+    const sh = this.shape, P = this.light.position, h = this.h;
+    let gx: number, gy: number, gz: number;
+    if (this.allBurned) {
+      const Vb = Math.PI * this.R * this.R * Math.max(h, 0), Vp = sh.pocketVolume, V = Vb + Vp;
+      gx = V > 0 ? (Vp * sh.pocketCentroid[0]) / V : 0;
+      gz = V > 0 ? (Vp * sh.pocketCentroid[1]) / V : 0;
+      gy = V > 0 ? (Vb * -0.5 * h + Vp * 0.5 * (sh.deckY + sh.roofY)) / V : -0.5 * h;
+    } else {
+      gx = this.flameCenter[0];
+      gz = this.flameCenter[2];
+      gy = gx * gx + gz * gz <= this.R * this.R ? -0.5 * h : 0.5 * (sh.deckY + sh.roofY);
+    }
+    projectIntoChamber(gx, gy, gz, sh, h, P, LIGHT_WALL_MARGIN);
+    const w = Igas + Igap > 0 ? Igap / (Igas + Igap) : 1;
+    const x = P[0] + (this.gapCenter[0] - P[0]) * w;
+    const y = P[1] + (this.gapCenter[1] - P[1]) * w;
+    const z = P[2] + (this.gapCenter[2] - P[2]) * w;
+    projectIntoChamber(x, y, z, sh, h, P);
   }
 }
 

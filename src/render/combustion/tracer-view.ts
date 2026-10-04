@@ -124,9 +124,10 @@ export class TracerView {
         r = FRESH[0]; g = FRESH[1]; b = FRESH[2];
       }
       if (s.state[i] === TracerState.PortOut || s.state[i] === TracerState.PortIn) {
-        // fade near the top of the port section
-        const L = s.portLen[s.valve[i]];
-        const y = s.position[3 * i + 1];
+        // fade toward the far end of the port section (distance from the seat along the port axis)
+        const v = s.valve[i];
+        const L = s.portLen[v];
+        const y = (s.position[3 * i + 1] - s.seatY[v]) * -s.openDir[v];
         a *= Math.min(1, Math.max(0, (1 - y / L) / 0.5));
       }
       c[k] = r; c[k + 1] = g; c[k + 2] = b; c[k + 3] = Math.max(a, 0);

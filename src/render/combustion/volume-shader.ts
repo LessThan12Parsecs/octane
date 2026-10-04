@@ -1,10 +1,20 @@
 /**
  * GLSL for the in-cylinder gas volume: a single ray-marched pass over the
- * chamber disc. The ray is clipped ANALYTICALLY to the chamber cylinder
- * (x²+z² ≤ R², −h ≤ y ≤ 0) and to the open valve heads, then split at the
- * flame-brush shells (sphere radii r + a and r − δ − a) so the thin front is
- * always sampled densely while the uniform regions need 1 sample each (or a
- * few when the knock overlay is on).
+ * chamber. The ray is clipped ANALYTICALLY to the chamber — the disc
+ * (x²+z² ≤ R², −h ≤ y ≤ 0), or for an L-head the union of the bore column and
+ * the valve pocket (chamber.ts rayChamberIntervals: ≤ 2 intervals) — and to the
+ * open valve heads, then split at the flame-brush shells (sphere radii r + a
+ * and r − δ − a) so the thin front is always sampled densely while the uniform
+ * regions need 1 sample each (or a few when the knock overlay is on).
+ *
+ * L-head proxies (volume.ts): bore cylinder (back faces), pocket prism (back
+ * faces) and the transfer arc where the pocket meets the bore circle (front
+ * faces = inward crossings). Each gives ≤ 1 fragment per pixel; a fragment
+ * survives only if its proxy (uPiece) owns the exit of the last visible gas
+ * interval (EXIT_* in chamber.ts), so exactly one fragment integrates the ray
+ * and it is depth-tested at the gas exit, like the disc's single proxy. A metal
+ * gap between two intervals stops the ray unless it lies in the engine's
+ * cut-away region (uCut*; the piston is never cut).
  *
  * Emission is integrated with exact per-segment extinction:
  *   L += T · E/κ · (1 − e^{−κ Δ}),   T *= e^{−κ Δ}
@@ -36,9 +46,22 @@ uniform float uR;
 uniform float uH;
 uniform vec4 uValve0;   // x, z, head radius, lift
 uniform vec4 uValve1;
+uniform vec2 uValveSeat0; // seat plane y, lift direction (−1 opens down into the bore, +1 up into the pocket)
+uniform vec2 uValveSeat1;
 uniform float uValveThick0;
 uniform float uValveThick1;
 uniform int uMode;      // 0 physical, 1 temperature
+
+// chamber shape
+uniform float uShape;      // 0 flat disc, 1 L-head
+uniform vec4 uPocketRect;  // pocket plan: inner rectangle (corner-arc centres) x0, x1, z0, z1
+uniform float uPocketRad;  // pocket plan corner radius
+uniform vec2 uPocketY;     // deck (valve-seat) plane y, pocket roof y
+uniform float uPiece;      // proxy drawn by this material: 0 bore column, 1 pocket prism, 2 transfer arc
+uniform float uBackoff;    // L-head orthographic ray back-off
+uniform float uCutOn;      // 1: the region {n·p > d for both planes} is cut away (engine cutaway)
+uniform vec4 uCut0;
+uniform vec4 uCut1;
 
 // flame
 uniform float uFlameOn;
@@ -71,6 +94,10 @@ uniform float uKnockAmp;
 uniform float uKnockTemporal;
 uniform float uKnockRms;
 uniform float uKnockAxis;
+uniform float uKnockShape;  // 0 (1,0) Bessel mode of the bore, 1 axial mode along the footprint
+uniform vec3 uKnockLine;    // footprint axis (ex, ez) and its start s0
+uniform float uKnockLen;    // footprint length along the axis
+uniform float uKnockSign;   // sign of the axial mode at the end-gas site
 uniform vec2 uKnockOrigin;
 uniform float uKnockRing;
 uniform float uKnockRingW;
@@ -124,11 +151,18 @@ float besselJ1(float x) {
   return x * (0.5 - x2 * (1.0 / 16.0 - x2 * (1.0 / 384.0 - x2 * (1.0 / 18432.0 - x2 * (1.0 / 1474560.0 - x2 / 176947200.0)))));
 }
 
-// Knock pressure field (normalised), signed. Standing (1,0) mode + expanding front from the end-gas site.
+// Knock pressure field (normalised), signed. Standing mode + expanding front from the end-gas site.
+// Disc: Draper (1,0) Bessel mode. L-head: lowest axial mode cos(π s/L) of the footprint (geometry.ts).
 float knockField(vec3 p) {
-  float r = min(length(p.xz) / uR, 1.0);
-  float phi = atan(p.z, p.x);
-  float shape = besselJ1(ALPHA10 * r) / J1_ALPHA10 * cos(phi - uKnockAxis);
+  float shape;
+  if (uKnockShape > 0.5) {
+    float s = clamp((dot(p.xz, uKnockLine.xy) - uKnockLine.z) / uKnockLen, 0.0, 1.0);
+    shape = uKnockSign * cos(3.14159265 * s);
+  } else {
+    float r = min(length(p.xz) / uR, 1.0);
+    float phi = atan(p.z, p.x);
+    shape = besselJ1(ALPHA10 * r) / J1_ALPHA10 * cos(phi - uKnockAxis);
+  }
   float standing = mix(shape * uKnockTemporal, abs(shape) * 0.7071, uKnockRms);
   float d = length(p.xz - uKnockOrigin);
   float ring = exp(-pow((d - uKnockRing) / uKnockRingW, 2.0)) * (1.0 - uKnockStanding);
@@ -145,8 +179,10 @@ vec2 raySphere(vec3 ro, vec3 rd, vec3 c, float r) {
   return vec2(-b - h, -b + h);
 }
 
-// Entry parameter of the ray into a valve head (short vertical cylinder), or 1e9.
-float rayValve(vec3 ro, vec3 rd, vec4 v, float thick) {
+// Entry parameter of the ray into a valve head (short vertical cylinder), or 1e9. The head occupies
+// the thickness just below the plane y = seatY + dir·lift (overhead: hanging below the lift plane;
+// side valve: its top face, flush with the deck when shut, risen by the lift).
+float rayValve(vec3 ro, vec3 rd, vec4 v, vec2 seat, float thick) {
   if (v.w <= 1e-5) return 1e9;
   vec2 o = ro.xz - v.xy;
   float a = dot(rd.xz, rd.xz);
@@ -162,7 +198,8 @@ float rayValve(vec3 ro, vec3 rd, vec4 v, float thick) {
   } else if (c > 0.0) {
     return 1e9;
   }
-  float y0 = -v.w - thick, y1 = -v.w;
+  float y1 = seat.x + seat.y * v.w;
+  float y0 = y1 - thick;
   float t0, t1;
   if (abs(rd.y) > 1e-12) {
     t0 = (y0 - ro.y) / rd.y;
@@ -240,14 +277,179 @@ void march(vec3 ro, vec3 rd, float t0, float t1, int n, bool shell, float unifor
   }
 }
 
+// Emission along [ta, tb], split at the flame-brush shells (front-to-back into accL/accT).
+void integrateInterval(vec3 ro, vec3 rd, float ta, float tb, float jitter) {
+  float o0 = tb, o1 = tb, i0 = tb, i1 = tb;
+  if (uAllBurned > 0.5) {
+    o0 = ta; i0 = ta; i1 = tb; o1 = tb;
+  } else if (uFlameOn > 0.5) {
+    float rOut = uFlameR + uWrinkleAmp;
+    float rIn = max(uFlameR - uBrush - uWrinkleAmp, 0.0);
+    vec2 so = raySphere(ro, rd, uFlameC, rOut);
+    if (so.x < so.y) {
+      vec2 si = rIn > 0.0 ? raySphere(ro, rd, uFlameC, rIn) : vec2(1e9, -1e9);
+      if (si.x >= si.y) { float m = 0.5 * (so.x + so.y); si = vec2(m, m); }
+      o0 = clamp(so.x, ta, tb);
+      i0 = clamp(si.x, ta, tb);
+      i1 = clamp(si.y, ta, tb);
+      o1 = clamp(so.y, ta, tb);
+    }
+  }
+  int nSmooth = uKnockAmp > 0.0 ? 8 : 1;
+  int nShell = 24;
+  float outsideB = uAllBurned > 0.5 ? 1.0 : 0.0;
+  march(ro, rd, ta, o0, nSmooth, false, outsideB, jitter);
+  march(ro, rd, o0, i0, nShell, true, 0.0, jitter);
+  march(ro, rd, i0, i1, nSmooth, false, 1.0, jitter);
+  march(ro, rd, i1, o1, nShell, true, 0.0, jitter);
+  march(ro, rd, o1, tb, nSmooth, false, outsideB, jitter);
+}
+
+// ---- L-head chamber (TS twin: chamber.ts rayChamberIntervals) ----
+
+// Ray ∩ y-slab [y0, y1]; empty: x > y.
+vec2 raySlabY(float oy, float dy, float y0, float y1) {
+  if (abs(dy) > 1e-12) {
+    float a = (y0 - oy) / dy, b = (y1 - oy) / dy;
+    return vec2(min(a, b), max(a, b));
+  }
+  return (oy < y0 || oy > y1) ? vec2(1e9, -1e9) : vec2(-1e9, 1e9);
+}
+
+// 2-D ray (xz) ∩ circle; empty: x > y.
+vec2 rayCircle2(vec2 o, vec2 d, vec2 c, float r) {
+  vec2 q = o - c;
+  float a = dot(d, d);
+  float cc = dot(q, q) - r * r;
+  if (a < 1e-12) return cc <= 0.0 ? vec2(-1e9, 1e9) : vec2(1e9, -1e9);
+  float b = 2.0 * dot(q, d);
+  float disc = b * b - 4.0 * a * cc;
+  if (disc < 0.0) return vec2(1e9, -1e9);
+  float sq = sqrt(disc);
+  return vec2((-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a));
+}
+
+// 2-D ray ∩ axis-aligned box [lo, hi]; empty: x > y.
+vec2 rayBox2(vec2 o, vec2 d, vec2 lo, vec2 hi) {
+  vec2 r = vec2(-1e9, 1e9);
+  if (abs(d.x) > 1e-12) {
+    float a = (lo.x - o.x) / d.x, b = (hi.x - o.x) / d.x;
+    r = vec2(max(r.x, min(a, b)), min(r.y, max(a, b)));
+  } else if (o.x < lo.x || o.x > hi.x) {
+    return vec2(1e9, -1e9);
+  }
+  if (abs(d.y) > 1e-12) {
+    float a = (lo.y - o.y) / d.y, b = (hi.y - o.y) / d.y;
+    r = vec2(max(r.x, min(a, b)), min(r.y, max(a, b)));
+  } else if (o.y < lo.y || o.y > hi.y) {
+    return vec2(1e9, -1e9);
+  }
+  return r;
+}
+
+vec2 hullOf(vec2 acc, vec2 r) {
+  return r.x <= r.y ? vec2(min(acc.x, r.x), max(acc.y, r.y)) : acc;
+}
+
+// 2-D ray ∩ rounded rectangle (convex: hull of two crossed boxes and four corner discs).
+vec2 rayRoundRect(vec2 o, vec2 d, vec4 inner, float rad) {
+  vec2 acc = vec2(1e9, -1e9);
+  acc = hullOf(acc, rayBox2(o, d, vec2(inner.x - rad, inner.z), vec2(inner.y + rad, inner.w)));
+  acc = hullOf(acc, rayBox2(o, d, vec2(inner.x, inner.z - rad), vec2(inner.y, inner.w + rad)));
+  if (rad > 0.0) {
+    acc = hullOf(acc, rayCircle2(o, d, inner.xz, rad));
+    acc = hullOf(acc, rayCircle2(o, d, inner.yz, rad));
+    acc = hullOf(acc, rayCircle2(o, d, inner.xw, rad));
+    acc = hullOf(acc, rayCircle2(o, d, inner.yw, rad));
+  }
+  return acc;
+}
+
+// Gas intervals (≤ 2, sorted) and the proxy owning each exit (0 bore, 1 pocket, 2 transfer arc).
+float gS0, gE0, gK0, gS1, gE1, gK1;
+int gN;
+
+void pushIv(float s, float e, float k) {
+  if (e <= s) return;
+  if (gN == 1 && s <= gE0) { if (e > gE0) { gE0 = e; gK0 = k; } return; }
+  if (gN == 2 && s <= gE1) { if (e > gE1) { gE1 = e; gK1 = k; } return; }
+  if (gN == 0) { gS0 = s; gE0 = e; gK0 = k; gN = 1; }
+  else if (gN == 1) { gS1 = s; gE1 = e; gK1 = k; gN = 2; }
+}
+
+void lheadIntervals(vec3 ro, vec3 rd) {
+  gN = 0;
+  gS0 = 0.0; gE0 = -1.0; gK0 = 0.0; gS1 = 0.0; gE1 = -1.0; gK1 = 0.0;
+  vec2 C = rayCircle2(ro.xz, rd.xz, vec2(0.0), uR);
+  bool cHit = C.x <= C.y;
+  vec2 A = vec2(1e9, -1e9);
+  if (cHit) {
+    vec2 sy = raySlabY(ro.y, rd.y, -uH, 0.0);
+    A = vec2(max(C.x, sy.x), min(C.y, sy.y));
+  }
+  vec2 P = rayRoundRect(ro.xz, rd.xz, uPocketRect, uPocketRad);
+  vec2 sp = raySlabY(ro.y, rd.y, uPocketY.x, uPocketY.y);
+  P = vec2(max(P.x, sp.x), min(P.y, sp.y));
+  bool pHit = P.y > P.x;
+  // pieces in ray order: pocket before the bore, bore column, pocket after the bore
+  if (pHit) {
+    if (!cHit) pushIv(P.x, P.y, 1.0);
+    else pushIv(P.x, min(P.y, C.x), C.x < P.y ? 2.0 : 1.0);
+  }
+  pushIv(A.x, A.y, 0.0);
+  if (pHit && cHit) pushIv(max(P.x, C.y), P.y, 1.0);
+  // keep t >= 0
+  if (gN > 0 && gE0 <= 0.0) { gS0 = gS1; gE0 = gE1; gK0 = gK1; gN -= 1; }
+  if (gN > 0 && gE0 <= 0.0) gN = 0;
+  gS0 = max(gS0, 0.0);
+  gS1 = max(gS1, 0.0);
+}
+
+bool inCut(vec3 p) {
+  return dot(uCut0.xyz, p) > uCut0.w && dot(uCut1.xyz, p) > uCut1.w;
+}
+
+// Metal between two gas intervals hides the second one unless it is cut away (never the piston).
+bool gapOpen(vec3 ro, vec3 rd, float t0, float t1) {
+  if (uCutOn < 0.5) return false;
+  vec3 m = ro + rd * (0.5 * (t0 + t1));
+  if (dot(m.xz, m.xz) < uR * uR && m.y < -uH) return false;
+  return inCut(ro + rd * t0) && inCut(ro + rd * t1);
+}
+
 void main() {
   vec3 ro, rd;
   if (uOrtho > 0.5) {
     rd = normalize(uCamDir);
-    ro = vCyl - rd * 4.0 * (uR + uH);
+    ro = vCyl - rd * (uShape > 0.5 ? uBackoff : 4.0 * (uR + uH));
   } else {
     ro = uCamPos;
     rd = normalize(vCyl - uCamPos);
+  }
+
+  if (uShape > 0.5) {
+    lheadIntervals(ro, rd);
+    if (gN == 0) discard;
+    bool both = gN == 2 && gapOpen(ro, rd, gE0, gS1);
+    // exactly one proxy fragment per pixel: the one at the exit of the last visible interval
+    if (abs((both ? gK1 : gK0) - uPiece) > 0.5) discard;
+    float tv = min(rayValve(ro, rd, uValve0, uValveSeat0, uValveThick0),
+                   rayValve(ro, rd, uValve1, uValveSeat1, uValveThick1));
+    accL = vec3(0.0);
+    accT = 1.0;
+    float jitter = hash13(vec3(gl_FragCoord.xy, uFrame));
+    float ta = gS0;
+    float tb = min(gE0, max(tv, ta));
+    if (tb > ta) integrateInterval(ro, rd, ta, tb, jitter);
+    if (both && tv >= gE0 && accT >= 0.004) {
+      ta = gS1;
+      tb = min(gE1, max(tv, ta));
+      if (tb > ta) integrateInterval(ro, rd, ta, tb, jitter);
+    }
+    gl_FragColor = vec4(accL, 1.0 - accT);
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+    return;
   }
 
   // ---- chamber disc ----
@@ -274,39 +476,14 @@ void main() {
   }
   ta = max(ta, 0.0);
   // ---- open valve heads occlude the gas behind them ----
-  tb = min(tb, max(rayValve(ro, rd, uValve0, uValveThick0), ta));
-  tb = min(tb, max(rayValve(ro, rd, uValve1, uValveThick1), ta));
+  tb = min(tb, max(rayValve(ro, rd, uValve0, uValveSeat0, uValveThick0), ta));
+  tb = min(tb, max(rayValve(ro, rd, uValve1, uValveSeat1, uValveThick1), ta));
   if (tb <= ta) discard;
 
   accL = vec3(0.0);
   accT = 1.0;
   float jitter = hash13(vec3(gl_FragCoord.xy, uFrame));
-
-  // ---- split at the flame brush shells ----
-  float o0 = tb, o1 = tb, i0 = tb, i1 = tb;
-  if (uAllBurned > 0.5) {
-    o0 = ta; i0 = ta; i1 = tb; o1 = tb;
-  } else if (uFlameOn > 0.5) {
-    float rOut = uFlameR + uWrinkleAmp;
-    float rIn = max(uFlameR - uBrush - uWrinkleAmp, 0.0);
-    vec2 so = raySphere(ro, rd, uFlameC, rOut);
-    if (so.x < so.y) {
-      vec2 si = rIn > 0.0 ? raySphere(ro, rd, uFlameC, rIn) : vec2(1e9, -1e9);
-      if (si.x >= si.y) { float m = 0.5 * (so.x + so.y); si = vec2(m, m); }
-      o0 = clamp(so.x, ta, tb);
-      i0 = clamp(si.x, ta, tb);
-      i1 = clamp(si.y, ta, tb);
-      o1 = clamp(so.y, ta, tb);
-    }
-  }
-  int nSmooth = uKnockAmp > 0.0 ? 8 : 1;
-  int nShell = 24;
-  float outsideB = uAllBurned > 0.5 ? 1.0 : 0.0;
-  march(ro, rd, ta, o0, nSmooth, false, outsideB, jitter);
-  march(ro, rd, o0, i0, nShell, true, 0.0, jitter);
-  march(ro, rd, i0, i1, nSmooth, false, 1.0, jitter);
-  march(ro, rd, i1, o1, nShell, true, 0.0, jitter);
-  march(ro, rd, o1, tb, nSmooth, false, outsideB, jitter);
+  integrateInterval(ro, rd, ta, tb, jitter);
 
   gl_FragColor = vec4(accL, 1.0 - accT);
   #include <tonemapping_fragment>
