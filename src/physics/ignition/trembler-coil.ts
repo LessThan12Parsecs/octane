@@ -37,13 +37,23 @@
  *    While the timer is open the primary is DISCONNECTED: I₁ ≡ 0 and the condenser holds its charge.
  *  - the gap (discharge.ts) as in coil.ts: breakdown at the threshold, glow/arc with V₂ algebraic,
  *    extinction, restrike — every breakdown of the train goes through the same SparkGap.
+ *  - re-ignition (discharge.ts module doc): with the gap conducting, the condenser ring drives the
+ *    secondary current through zero every half period of the leakage–C₁ ring (≈ 50 µs on the battery,
+ *    ≈ 125 µs with the magneto's L_s); the glow goes out at I_ext and the still-ionised channel re-ignites
+ *    at the recovering voltage V_r(t) once |V₂| rises to it with a sustaining current (|I₂| > I_ext and
+ *    V₂·I₂ < 0, i.e. |V₂| rising — EV_REIGNITION, located like the breakdown with V_r linear over the
+ *    sub-step and the conditions' own crossings). One points opening therefore gives ONE spark
+ *    (breakdown) that oscillates through re-ignitions, not a breakdown per current zero.
  *
  * Sub-steps (TremblerCoilOptions): 20 µs while the points are closed (primary L/R ≈ 7–10 ms;
  * trapezoidal is A-stable, the trip is an event and the make ring of the secondary is energy-exact),
- * 1 µs during the ring-up after a points opening and whenever |V₂| may reach the threshold, 4 µs while
- * the gap conducts (primary ring with the gap conducting ≈ 10 kHz: ω h ≈ 0.25; ≈ 90 % of the CPU is
- * conduction), 2 µs in the open-points ring between sparks (it sets the armature's return), 20 µs for
- * the free decay of the secondary once the timer is open. With the timer open, the
+ * 1 µs during the ring-up after a points opening and whenever |V₂| may reach the (re-ignition)
+ * threshold, 4 µs while the gap conducts (primary ring with the gap conducting ≈ 10 kHz: ω h ≈ 0.25;
+ * ≈ 90 % of the CPU is conduction), 2 µs in the open-points ring between sparks (it sets the armature's
+ * return), 20 µs for the free decay of the secondary once the timer is open: then I₁ ≡ 0 and the
+ * secondary is an isolated R₂–L₂–C₂ loop whose energy cannot grow, so |V₂| never exceeds
+ * √(V₂² + (L₂/C₂)I₂²) and the 20 µs step is used whenever that bound is below 0.9 × the threshold (the
+ * linear reach test overestimates the ring's peak ≈ 2.7×: review finding). With the timer open, the
  * secondary at rest and the armature at rest the coil is skipped (the ringing tail is snapped to rest
  * below ½C₂(25 V)², as in coil.ts).
  */
@@ -99,6 +109,7 @@ const EV_BREAKDOWN = 3;
 const EV_EXTINCTION = 4;
 const EV_POINTS_OPEN = 5;
 const EV_POINTS_CLOSE = 6;
+const EV_REIGNITION = 7;
 
 /**
  * One trembler coil + vibrator connected to a supply through its timer contact, with a spark-gap load.
@@ -168,6 +179,8 @@ export class TremblerCoil {
   peakSecondaryVoltage = 0;
   /** Diagnostic: sub-steps taken without event handling to break zero-length event loops. */
   forcedSubsteps = 0;
+  /** Diagnostic: integrator sub-steps taken since construction (CPU census). */
+  substepCount = 0;
 
   private readonly L1: number;
   private readonly R1: number;
@@ -318,6 +331,7 @@ export class TremblerCoil {
       // zero-length event guard as in coil.ts: after two stalled sub-steps the points events are
       // ignored for a sub-step (gap events stay active), after four all events
       const used = this.substep(h, gap, stalls < 2 ? 2 : stalls < 4 ? 1 : 0);
+      this.substepCount++;
       if (stalls >= 2) this.forcedSubsteps++;
       if (used > MIN_EVENT_PROGRESS || used >= h) stalls = 0;
       else stalls++;
@@ -358,9 +372,17 @@ export class TremblerCoil {
   private maxSubstep(gap: SparkGap): number {
     const o = this.opts;
     if (this.smode === S_COND) return o.conductingSubstep;
+    // conduction threshold: the breakdown threshold, or the (lower, rising) re-ignition voltage
+    let thr = gap.threshold(Math.abs(this.I2));
+    if (gap.recovering(this.time)) thr = gap.reignitionVoltage(this.time, thr);
+    if (!this.timerClosed && !gap.awaitingReentry) {
+      // timer open: I₁ ≡ 0, the R₂–L₂–C₂ loop's energy cannot grow (trapezoidal: exactly), so |V₂| stays
+      // below this amplitude; maxSubstep runs every sub-step, so a threshold that falls later is caught
+      const amp = Math.sqrt(this.V2 * this.V2 + (this.L2 / this.C2) * this.I2 * this.I2);
+      if (amp < 0.9 * thr) return o.idleSubstep;
+    }
     const hc = !this.timerClosed ? o.idleSubstep : this.pointsOpen ? o.openSubstep : o.closedSubstep;
     // |V₂| could reach the conduction threshold within a few candidate sub-steps (|dV₂/dt| = |I₂|/C₂)
-    const thr = gap.threshold(Math.abs(this.I2));
     const reach = Math.abs(this.V2) + (4 * hc * Math.abs(this.I2)) / this.C2;
     if (reach > 0.9 * thr) return o.ringUpSubstep;
     // ring-up right after a points opening (primary ring into the condenser + secondary ring)
@@ -483,6 +505,13 @@ export class TremblerCoil {
             event = EV_BREAKDOWN;
           }
         }
+        // re-ignition of the recovering channel (at most at the breakdown time: V_r ≤ threshold; a tie —
+        // V_r = threshold at the minimum-breakdown floor of hot low-density gas — is a re-ignition)
+        const th = this.reignitionFraction(h, gap, thr, v1a);
+        if (th < thBest || (th === thBest && event === EV_BREAKDOWN)) {
+          thBest = th;
+          event = EV_REIGNITION;
+        }
       } else {
         const iExt = gap.opts.extinctionCurrent;
         const i1 = x1[1] * this.sgn;
@@ -539,7 +568,9 @@ export class TremblerCoil {
       this.V1 = 0;
       this.lastCloseTime = this.time;
     } else if (event === EV_BREAKDOWN) {
-      this.startConduction(gap);
+      this.startConduction(gap, false);
+    } else if (event === EV_REIGNITION) {
+      this.startConduction(gap, true);
     } else if (event === EV_EXTINCTION) {
       gap.extinguish(this.time);
       this.smode = S_OPEN;
@@ -581,13 +612,53 @@ export class TremblerCoil {
     if (v2a > this.peakSecondaryVoltage) this.peakSecondaryVoltage = v2a;
   }
 
-  /** Open gap reached its threshold: start (or resume) conduction (as IgnitionCoil.startConduction). */
-  private startConduction(gap: SparkGap): void {
+  /**
+   * Fraction θ ∈ [0, 1] of the trial sub-step h (x0 → x1) at which the recovering channel re-ignites, or 2
+   * if it does not: |V₂| reaches V_r(t) with a sustaining current driving it (|I₂| > I_ext and V₂·I₂ < 0)
+   * at the end of the trial; θ is the latest of the linear crossings of |V₂| − V_r, |I₂| − I_ext and V₂·I₂.
+   * thr / v1a: breakdown threshold (current-independent while recovering) and |V₂| at the end of the trial.
+   */
+  private reignitionFraction(h: number, gap: SparkGap, thr: number, v1a: number): number {
+    if (!gap.recovering(this.time)) return 2;
+    const x0 = this.x0;
+    const x1 = this.x1;
+    const iExt = gap.opts.extinctionCurrent;
+    const i1a = Math.abs(x1[1]);
+    if (!(i1a > iExt) || !(x1[3] * x1[1] < 0)) return 2;
+    const vr1 = gap.reignitionVoltage(this.time + h, thr);
+    if (v1a < vr1) return 2;
+    const v0a = Math.abs(x0[3]);
+    const vr0 = gap.reignitionVoltage(this.time, thr);
+    let th = v0a >= vr0 ? 0 : (vr0 - v0a) / (v1a - v0a - (vr1 - vr0));
+    const i0a = Math.abs(x0[1]);
+    if (!(i0a > iExt)) {
+      const ti = (iExt - i0a) / (i1a - i0a);
+      if (ti > th) th = ti;
+    }
+    if (!(x0[3] * x0[1] < 0)) {
+      // V₂ or I₂ changed sign in the sub-step
+      if (x0[3] * x1[3] <= 0 && x0[3] !== x1[3]) {
+        const tv = x0[3] / (x0[3] - x1[3]);
+        if (tv > th) th = tv;
+      }
+      if (x0[1] * x1[1] <= 0 && x0[1] !== x1[1]) {
+        const ti = x0[1] / (x0[1] - x1[1]);
+        if (ti > th) th = ti;
+      }
+    }
+    return th < 0 ? 0 : th > 1 ? 1 : th;
+  }
+
+  /**
+   * Open gap reached its threshold: start (or resume) conduction (as IgnitionCoil.startConduction); with
+   * `reignition` the recovering channel re-ignites (SparkGap.reignite) instead of breaking down.
+   */
+  private startConduction(gap: SparkGap, reignition: boolean): void {
     const c2 = this.C2;
     const wasReentry = gap.awaitingReentry;
     const vAbs = Math.abs(this.V2);
     this.sgn = this.I2 > 0 ? 1 : this.I2 < 0 ? -1 : this.V2 < 0 ? 1 : -1;
-    const vAfter = gap.startConduction(vAbs, Math.abs(this.I2), c2, this.time);
+    const vAfter = reignition ? gap.reignite(vAbs, Math.abs(this.I2), c2, this.time) : gap.startConduction(vAbs, Math.abs(this.I2), c2, this.time);
     if (!gap.conducting) {
       const vNew = (this.V2 >= 0 ? 1 : -1) * vAfter;
       this.energyGap += 0.5 * c2 * (this.V2 * this.V2 - vNew * vNew);

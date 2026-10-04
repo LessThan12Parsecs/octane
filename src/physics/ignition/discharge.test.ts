@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { GapTransition, SparkGap } from './discharge';
+import { GapTransition, SparkGap, type SparkGapOptions } from './discharge';
 
 describe('SparkGap voltage–current characteristic', () => {
   it('glow: V = V_cf + 40.46·l[mm]·p[bar]^0.51·I^−0.32 (Kim & Anderson 1995)', () => {
@@ -140,5 +140,112 @@ describe('SparkGap consistency constraints (reviewer fixes)', () => {
     g.breakdownVoltage = 300;
     g.startConduction(g.threshold(0.05), 0.05, 46e-12, 0);
     for (const i of [0.1, 0.05, 0.01, 0.003]) expect(g.afterConductingStep(i, 0)).not.toBe(GapTransition.Restrike);
+  });
+});
+
+describe('SparkGap re-ignition of an extinguished channel (review: one breakdown per current zero)', () => {
+  /** Hot-kernel gap at the Model T spark state (5.3 bar): breakdown at 3.3 kV. */
+  function hotGap(opts: Partial<SparkGapOptions> = {}): SparkGap {
+    const g = new SparkGap(0.79e-3, opts);
+    g.pressure = 5.3e5;
+    g.breakdownVoltage = 3.3e3;
+    return g;
+  }
+
+  it('V_r rises from V_ri = (1+h)·V_glow(d, I_ext) to the breakdown threshold with τ_rec; window 5 τ_rec', () => {
+    const g = hotGap();
+    const tau = g.opts.reignitionTime;
+    expect(tau).toBe(30e-6);
+    g.startConduction(g.threshold(0.05), 0.05, 40e-12, 0);
+    expect(g.recovering(1e-6)).toBe(false); // conducting
+    g.extinguish(1e-3);
+    const vMin = g.minimumBreakdownVoltage();
+    const vFull = g.threshold(0);
+    expect(vFull).toBe(3.3e3);
+    expect(g.recovering(1e-3)).toBe(true);
+    expect(g.reignitionVoltage(1e-3, vFull)).toBeCloseTo(vMin, 9);
+    expect(g.reignitionVoltage(1e-3 + tau, vFull)).toBeCloseTo(vMin + (vFull - vMin) * (1 - Math.exp(-1)), 9);
+    expect(g.reignitionVoltage(1e-3 + 2 * tau, vFull)).toBeGreaterThan(g.reignitionVoltage(1e-3 + tau, vFull));
+    // V_ri is the sustainable-glow floor: above every glow voltage of the unstretched gap at I > I_ext
+    for (const i of [0.003, 0.01, 0.1]) expect(g.modeVoltage('glow', i)).toBeLessThan(g.reignitionVoltage(1e-3, vFull));
+    expect(g.recovering(1e-3 + 4.99 * tau)).toBe(true);
+    expect(g.recovering(1e-3 + 5.01 * tau)).toBe(false);
+    expect(g.recovering(1e-3 - 1e-9)).toBe(false);
+  });
+
+  it('no recovery window: before any extinction, after reset, after a Restrike, with τ_rec = 0, or a suppressed gap', () => {
+    const g = hotGap();
+    expect(g.recovering(0)).toBe(false);
+    g.extinguish(0);
+    g.reset();
+    expect(g.recovering(0)).toBe(false);
+    const off = hotGap({ reignitionTime: 0 });
+    off.extinguish(0);
+    expect(off.recovering(0)).toBe(false);
+    const s = hotGap();
+    s.extinguish(0);
+    s.suppressBreakdown = true;
+    expect(s.recovering(1e-6)).toBe(false);
+    // re-ignite, stretch the channel, restrike: a fresh breakdown across the gap, not a re-ignition
+    const r = hotGap();
+    r.flowVelocity = 20;
+    r.startConduction(r.threshold(0.05), 0.05, 40e-12, 0);
+    r.extinguish(10e-6);
+    r.reignite(r.reignitionVoltage(20e-6, r.threshold(0.05)), 0.05, 40e-12, 20e-6);
+    let code: number = GapTransition.None;
+    for (let i = 0; i < 1000 && code !== GapTransition.Restrike; i++) {
+      r.accumulate(0, 0, 0.05, 1e-6);
+      code = r.afterConductingStep(0.05, 20e-6);
+    }
+    expect(code).toBe(GapTransition.Restrike);
+    expect(r.mode).toBe('open');
+    expect(r.recovering(30e-6)).toBe(false);
+  });
+
+  it('a re-ignition continues the spark: counted apart, C₂ dump booked as capacitive arc, no breakdown phase', () => {
+    const g = hotGap();
+    const c2 = 40e-12;
+    g.startConduction(g.threshold(0.05), 0.05, c2, 0);
+    const bd = [g.breakdownCount, g.energyBreakdown, g.lastBreakdownTime, g.lastBreakdownVoltage, g.firstBreakdownTime];
+    g.extinguish(50e-6);
+    g.beginStep();
+    const t = 70e-6;
+    const vr = g.reignitionVoltage(t, g.threshold(0.03));
+    const e0 = { tot: g.energyTotal, cap: g.energyCapacitiveArc, gas: g.energyToGas };
+    const vAfter = g.reignite(vr, 0.03, c2, t);
+    expect(g.mode).toBe('glow');
+    expect(g.conducting).toBe(true);
+    expect(vAfter).toBeCloseTo(g.modeVoltage('glow', 0.03), 9);
+    const e = 0.5 * c2 * (vr * vr - vAfter * vAfter);
+    expect(e).toBeGreaterThan(0);
+    expect(g.energyTotal - e0.tot).toBeCloseTo(e, 15);
+    expect(g.energyCapacitiveArc - e0.cap).toBeCloseTo(e, 15);
+    expect(g.energyReignition).toBeCloseTo(e, 15);
+    expect(g.energyToGas - e0.gas).toBeCloseTo(g.opts.capacitiveArcEfficiency * e, 15);
+    expect(g.stepImpulseGasEnergy).toBeCloseTo(g.opts.capacitiveArcEfficiency * e, 15);
+    expect(g.reignitionCount).toBe(1);
+    expect([g.breakdownCount, g.energyBreakdown, g.lastBreakdownTime, g.lastBreakdownVoltage, g.firstBreakdownTime]).toEqual(bd);
+    expect(Number.isNaN(g.stepBreakdownTime)).toBe(true); // the owner does not re-seed the kernel
+    expect(g.recovering(t)).toBe(false); // conducting again
+    expect(g.energyToGas + g.energyToElectrodes + g.energyRadiated).toBeCloseTo(g.energyTotal, 15);
+    // above the arc–glow current the re-lit channel is an arc
+    g.extinguish(100e-6);
+    g.reignite(g.reignitionVoltage(110e-6, g.threshold(0.3)), 0.3, c2, 110e-6);
+    expect(g.mode).toBe('arc');
+    expect(g.reignitionCount).toBe(2);
+    expect(g.breakdownCount).toBe(1);
+  });
+
+  it('with a circuit current ≤ I_ext a re-ignition is a capacitive pulse only and a new window opens', () => {
+    const g = hotGap();
+    g.startConduction(g.threshold(0.05), 0.05, 40e-12, 0);
+    g.extinguish(50e-6);
+    const v = g.reignitionVoltage(60e-6, g.threshold(1e-3));
+    const vAfter = g.reignite(v, 1e-3, 40e-12, 60e-6);
+    expect(vAfter).toBeLessThanOrEqual(v);
+    expect(g.conducting).toBe(false);
+    expect(g.extinctionTime).toBe(60e-6);
+    expect(g.recovering(60e-6)).toBe(true);
+    expect(g.reignitionVoltage(60e-6, g.threshold(0))).toBeGreaterThan(vAfter); // no zero-time re-trigger
   });
 });

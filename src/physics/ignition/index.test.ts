@@ -89,6 +89,7 @@ describe('IgnitionSystem — CFR-like spark (CR 7, φ = 1, 13° BTDC, 3 ms dwell
     expect(r.duration).toBeGreaterThan(1e-3);
     expect(r.duration).toBeLessThan(3.2e-3);
     expect(s.breakdownCount).toBe(1);
+    expect(s.reignitionCount).toBe(0); // the inductive coil has no re-ignition model (discharge.ts)
     // breakdown ≈ 10 µs after switch-off at the density-dependent voltage
     expect(s.breakdownDelay).toBeGreaterThan(2e-6);
     expect(s.breakdownDelay).toBeLessThan(40e-6);
@@ -304,6 +305,9 @@ describe('IgnitionSystem — robustness (reviewer regressions)', () => {
       expect(Math.abs(ign.coil.energyResidual())).toBeLessThan(1e-12);
       const s = ign.state;
       expect(s.energyToGas + s.energyToElectrodes + s.energyRadiated).toBeCloseTo(s.energyDelivered, 12);
+      // re-ignition is a trembler-coil event only: the inductive path is unchanged (CFR bit-identical)
+      expect(s.reignitionCount).toBe(0);
+      expect(ign.gap.energyReignition).toBe(0);
     }
   });
 });

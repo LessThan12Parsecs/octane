@@ -36,15 +36,32 @@ const ORACLE_MAGNETO: MagnetoSpec = {
 /** Spark gap with the oracle's glow law at a fixed breakdown voltage (glow only, as the oracle). */
 class LoggingGap extends SparkGap {
   readonly bdTimes: number[] = [];
+  /** Re-ignition times, |V₂| at them, and the time since the extinction before each. */
+  readonly reigTimes: number[] = [];
+  readonly reigV: number[] = [];
+  readonly reigAge: number[] = [];
   override startConduction(vAbs: number, iAbs: number, c2: number, t: number): number {
     const n = this.breakdownCount;
     const r = super.startConduction(vAbs, iAbs, c2, t);
     if (this.breakdownCount > n) this.bdTimes.push(t);
     return r;
   }
+  override reignite(vAbs: number, iAbs: number, c2: number, t: number): number {
+    this.reigTimes.push(t);
+    this.reigV.push(vAbs);
+    this.reigAge.push(t - this.extinctionTime);
+    return super.reignite(vAbs, iAbs, c2, t);
+  }
 }
 function oracleGap(g: { Vbd: number; p: number; l: number }, suppress = false): LoggingGap {
-  const gap = new LoggingGap(g.l, { glowCathodeFall: P.glow.Vsheath, glowAnodeFall: 0, extinctionCurrent: P.glow.Iext, arcGlowCurrent: 1e3 });
+  const gap = new LoggingGap(g.l, {
+    glowCathodeFall: P.glow.Vsheath,
+    glowAnodeFall: 0,
+    extinctionCurrent: P.glow.Iext,
+    arcGlowCurrent: 1e3,
+    reignitionTime: P.reignition.tau,
+    transitionHysteresis: P.reignition.hyst,
+  });
   gap.pressure = g.p;
   gap.breakdownVoltage = g.Vbd;
   gap.suppressBreakdown = suppress;
@@ -214,11 +231,18 @@ describe('TremblerCoil — Radau oracle (tools/reference/ignition_trembler_oracl
       expect(Math.abs(r.trips[0] - c.trips[0])).toBeLessThan(1e-6);
       // instantaneous firing current: the 20 µs ramp sub-step aliases the secondary make ring (±1.5 %)
       expect(Math.abs(r.tripI[0] / c.tripI[0] - 1)).toBeLessThan(0.02);
-      // the spark train of the first trip: every breakdown before the re-close
+      // the spark of the first trip: ONE breakdown, then a re-ignition at (nearly) every current zero of the
+      // condenser ring before the re-close
       const nOracle = c.bds.filter((t) => t < c.closes[0]).length;
       const tsBds = r.gap.bdTimes.filter((t) => t < r.closes[0]);
+      expect(nOracle).toBe(1);
       expect(tsBds.length).toBe(nOracle);
-      for (let k = 0; k < nOracle; k++) expect(Math.abs(tsBds[k] - c.bds[k])).toBeLessThan(k === 0 ? 1e-6 : 8e-6);
+      expect(Math.abs(tsBds[0] - c.bds[0])).toBeLessThan(1e-6);
+      const rOracle = c.reigs.filter((t) => t < c.closes[0]);
+      const tsReigs = r.gap.reigTimes.filter((t) => t < r.closes[0]);
+      expect(rOracle.length).toBeGreaterThanOrEqual(8);
+      expect(tsReigs.length).toBe(rOracle.length);
+      for (let k = 0; k < rOracle.length; k++) expect(Math.abs(tsReigs[k] - rOracle[k])).toBeLessThan(8e-6);
       // re-close (depends on the force history through the whole train): ≤ 20 µs of ≈ 1.8–2.7 ms
       expect(Math.abs(r.closes[0] - c.closes[0])).toBeLessThan(20e-6);
       const a = r.atFirstClose!;
@@ -233,7 +257,7 @@ describe('TremblerCoil — Radau oracle (tools/reference/ignition_trembler_oracl
       if (REPORT)
         console.log(
           `bench ${c.V} V: trip ${(r.trips[0] * 1e3).toFixed(4)} vs ${(c.trips[0] * 1e3).toFixed(4)} ms, close ${(r.closes[0] * 1e3).toFixed(4)} vs ${(c.closes[0] * 1e3).toFixed(4)} ms, ` +
-            `bds ${tsBds.length}, E_gap ${(a.E_gap * 1e3).toFixed(3)} vs ${(o.E_gap * 1e3).toFixed(3)} mJ, trip 2 ${(r.trips[1] * 1e3).toFixed(3)} vs ${(c.trips[1] * 1e3).toFixed(3)} ms`,
+            `bds ${tsBds.length}, re-ignitions ${tsReigs.length} vs ${rOracle.length}, E_gap ${(a.E_gap * 1e3).toFixed(3)} vs ${(o.E_gap * 1e3).toFixed(3)} mJ, trip 2 ${(r.trips[1] * 1e3).toFixed(3)} vs ${(c.trips[1] * 1e3).toFixed(3)} ms`,
         );
     });
   }
@@ -282,7 +306,8 @@ describe('TremblerCoil — Radau oracle (tools/reference/ignition_trembler_oracl
     for (let k = 1; k < c.trips.length; k++) expect(Math.abs(r.trips[k] - c.trips[k])).toBeLessThan(30e-6);
     const deg = c.make + c.rpm * 6 * r.gap.bdTimes[0];
     expect(Math.abs(deg - c.firstSparkDeg!)).toBeLessThan(0.03); // 5 µs at 1000 rpm
-    expect(Math.abs(r.gap.bdTimes.length - c.bds.length)).toBeLessThanOrEqual(2);
+    expect(r.gap.bdTimes.length).toBe(c.bds.length); // one spark per trip
+    expect(Math.abs(r.gap.reigTimes.length - c.reigs.length)).toBeLessThanOrEqual(2);
     // the current broken by the timer depends on the buzz phase at the break (accumulated over 14.5 ms):
     // absolute tolerance, ≪ the ≈ 50 mJ of one spark (the break itself: analytic test below)
     expect(Math.abs(r.coil.energyTimerBreak - c.E_timer)).toBeLessThan(0.5e-3);
@@ -290,7 +315,7 @@ describe('TremblerCoil — Radau oracle (tools/reference/ignition_trembler_oracl
     expect(r.coil.energySupplied / c.E_sup).toBeCloseTo(1, 2);
     expect(Math.abs(r.coil.energyResidual())).toBeLessThan(1e-12);
     if (REPORT)
-      console.log(`magneto 1000: trips ${r.trips.map((t) => (t * 1e3).toFixed(4))} vs ${c.trips.map((t) => (t * 1e3).toFixed(4))} ms, bds ${r.gap.bdTimes.length} vs ${c.bds.length}, E_timer ${r.coil.energyTimerBreak} vs ${c.E_timer}`);
+      console.log(`magneto 1000: trips ${r.trips.map((t) => (t * 1e3).toFixed(4))} vs ${c.trips.map((t) => (t * 1e3).toFixed(4))} ms, bds ${r.gap.bdTimes.length} vs ${c.bds.length}, re-ignitions ${r.gap.reigTimes.length} vs ${c.reigs.length}, E_timer ${r.coil.energyTimerBreak} vs ${c.E_timer}`);
   });
 
   it('slow magneto pulses (150 rpm): the firing current approaches the pull-in current', () => {
@@ -314,12 +339,68 @@ describe('TremblerCoil — Radau oracle (tools/reference/ignition_trembler_oracl
 });
 
 describe('TremblerCoil — ledger, disconnected primary, timer break, caller step', () => {
-  it('closes the energy ledger to ≤ 1e-12 J over 50 ms of buzzing (≥ 9 breaks, ≥ 80 breakdowns)', () => {
+  it('closes the energy ledger to ≤ 1e-12 J over 50 ms of buzzing (≥ 8 breaks, one spark each, ≥ 80 re-ignitions)', () => {
     const r = bench(6, 50e-3);
-    expect(r.trips.length).toBeGreaterThanOrEqual(9);
-    expect(r.gap.breakdownCount).toBeGreaterThanOrEqual(80);
+    expect(r.trips.length).toBeGreaterThanOrEqual(8);
+    expect(r.gap.breakdownCount).toBe(r.trips.length);
+    expect(r.gap.reignitionCount).toBeGreaterThanOrEqual(80);
     expect(Math.abs(r.coil.energyResidual())).toBeLessThan(1e-12);
-    if (REPORT) console.log(`50 ms: ${r.trips.length} trips, ${r.gap.breakdownCount} breakdowns, residual ${r.coil.energyResidual()} J of ${r.coil.energySupplied} J`);
+    if (REPORT) console.log(`50 ms: ${r.trips.length} trips, ${r.gap.breakdownCount} breakdowns, ${r.gap.reignitionCount} re-ignitions, residual ${r.coil.energyResidual()} J of ${r.coil.energySupplied} J`);
+  });
+
+  it('re-ignites at the recovering voltage V_r(t) after each current zero, not at the breakdown voltage (review finding)', () => {
+    const r = bench(6, 6e-3);
+    const g = r.gap;
+    const tau = g.opts.reignitionTime;
+    const vMin = g.minimumBreakdownVoltage();
+    const vBd = g.threshold(0);
+    expect(g.reigTimes.length).toBeGreaterThanOrEqual(8);
+    for (let k = 0; k < g.reigTimes.length; k++) {
+      const age = g.reigAge[k];
+      expect(age).toBeGreaterThan(0);
+      expect(age).toBeLessThan(5 * tau);
+      const vr = vMin + (vBd - vMin) * (1 - Math.exp(-age / tau));
+      // event located on the sub-step's linear interpolation of |V₂| and V_r (≤ 1 µs sub-steps)
+      expect(Math.abs(g.reigV[k] / vr - 1)).toBeLessThan(0.01);
+      expect(g.reigV[k]).toBeLessThan(0.95 * vBd);
+    }
+    // the oracle re-ignites at the same voltages (the event function of the Radau model)
+    const o = fx.bench6.reigV.slice(0, g.reigV.length);
+    for (let k = 0; k < o.length; k++) expect(Math.abs(g.reigV[k] / o[k] - 1)).toBeLessThan(0.02);
+    if (REPORT) console.log(`re-ignition voltages (6 V bench, V_bd ${vBd} V, V_ri ${vMin.toFixed(0)} V): ${g.reigV.map((v) => v.toFixed(0)).join(', ')} V after ${g.reigAge.map((a) => (a * 1e6).toFixed(1)).join(', ')} µs`);
+  });
+
+  it('timer open: the free R₂–L₂–C₂ ring takes idle sub-steps below its energy bound, and still breaks down when the threshold falls below it', () => {
+    // post-extinction state of the review (V₂ ≈ 600 V, I₂ ≈ 2 mA) against a hot-kernel 3.3 kV threshold:
+    // amplitude √(V₂² + (L₂/C₂)I₂²) = 1.6 kV can never reach it (the linear reach test said 4.6 kV)
+    const free = (vbd: number, opts?: Partial<TremblerCoilOptions>, dt = 10e-3) => {
+      const coil = new TremblerCoil(oracleCoil(), PrimarySupply.dc(6, 0.05), 0.1, opts);
+      const gap = oracleGap({ Vbd: vbd, p: 5.3e5, l: P.engineGap.l });
+      coil.V2 = 600;
+      coil.I2 = 2e-3;
+      coil.resetLedger();
+      const n0 = coil.substepCount;
+      if (dt > 0) coil.step(dt, false, gap);
+      return { coil, gap, n: coil.substepCount - n0 };
+    };
+    const amp = Math.sqrt(600 ** 2 + (P.coil.L2 / P.coil.C2) * 2e-3 ** 2);
+    expect(amp).toBeCloseTo(1600, -1);
+    const idle = free(3.3e3);
+    expect(idle.gap.breakdownCount).toBe(0);
+    expect(idle.n).toBeLessThanOrEqual(10e-3 / 20e-6 + 2); // 20 µs idle sub-steps (was ≈ 7000 at 1 µs)
+    expect(Math.abs(idle.coil.energyResidual())).toBeLessThan(1e-15);
+    // the energy only decays (R₂), so |V₂| never exceeded the bound
+    expect(Math.sqrt(idle.coil.V2 ** 2 + (P.coil.L2 / P.coil.C2) * idle.coil.I2 ** 2)).toBeLessThan(amp);
+    // a threshold below the amplitude (e.g. falling with the expansion) is still reached, at the time of a
+    // 0.1 µs-sub-step reference
+    const fire = (opts?: Partial<TremblerCoilOptions>) => {
+      const r = free(1.3e3, opts, 0);
+      for (let t = 0; t < 1e-3 && r.gap.breakdownCount === 0; t += 20e-6) r.coil.step(20e-6, false, r.gap);
+      return r.gap.bdTimes[0];
+    };
+    const tRef = fire({ idleSubstep: 0.1e-6, ringUpSubstep: 0.1e-6 });
+    expect(tRef).toBeGreaterThan(0);
+    expect(Math.abs(fire() - tRef)).toBeLessThan(0.5e-6);
   });
 
   it('timer break: I₁ → 0 with the secondary flux linkage conserved, ½(L_p − M²/L₂)I₁² to the contact', () => {
@@ -377,6 +458,7 @@ describe('TremblerCoil — ledger, disconnected primary, timer break, caller ste
     for (const b of runs.slice(1)) {
       expect(Math.abs(b.trips[0] - a.trips[0])).toBeLessThan(0.5e-6);
       expect(b.gap.bdTimes.filter((t) => t < b.closes[0]).length).toBe(a.gap.bdTimes.filter((t) => t < a.closes[0]).length);
+      expect(b.gap.reigTimes.filter((t) => t < b.closes[0]).length).toBe(a.gap.reigTimes.filter((t) => t < a.closes[0]).length);
       expect(Math.abs(b.closes[0] - a.closes[0])).toBeLessThan(5e-6);
       expect(b.atFirstClose!.E_gap / a.atFirstClose!.E_gap).toBeCloseTo(1, 2);
     }

@@ -4,12 +4,12 @@
  * four-cylinder set-up and the CPU cost. Fit residuals are printed with IGNITION_REPORT=1.
  */
 import { describe, expect, it } from 'vitest';
-import type { EngineSpec, TremblerMagnetoIgnitionSpec } from '../core/engine-spec';
+import type { EngineSpec, TremblerCoilSpec, TremblerMagnetoIgnitionSpec } from '../core/engine-spec';
 import { cylinderAngleDeg } from '../core/engine-spec';
 import gasFixture from '../../../test/fixtures/ignition_kernel_gas.json';
 import oracleFx from '../../../test/fixtures/ignition_trembler.json';
 import { MODEL_T, MODEL_T_IGNITION } from '../engines/model-t';
-import { SparkGap } from './discharge';
+import { DEFAULT_SPARK_GAP_OPTIONS, REIGNITION_WINDOW, SparkGap } from './discharge';
 import { createIgnitionSystems, IgnitionSystem, magnetoEmf, PrimarySupply, TremblerCoil, tremblerCoilOf, tremblerTimerCommand, type IgnitionGasState } from './index';
 
 const REPORT = !!process.env.IGNITION_REPORT;
@@ -38,8 +38,8 @@ function gasT(SL = 0.3, Ma = 2, uPrime = 1, lI = 3e-3): IgnitionGasState {
 }
 
 /** Coil-tester bench: battery + 0.05 Ω straight onto the coil (no timer), 10 kV air gap. */
-function benchRun(V: number, tEnd: number) {
-  const coil = new TremblerCoil(IG.coil, PrimarySupply.dc(V, IG.battery.internalResistance), 0);
+function benchRun(V: number, tEnd: number, coilSpec: TremblerCoilSpec = IG.coil) {
+  const coil = new TremblerCoil(coilSpec, PrimarySupply.dc(V, IG.battery.internalResistance), 0);
   const gap = new SparkGap(3e-3);
   gap.pressure = 1e5;
   gap.breakdownVoltage = 10e3;
@@ -91,19 +91,37 @@ describe('MODEL_T_IGNITION — vibrator fit to the coil-tester data (ECCT; Cool3
     expect([m.cyclesPerRevolution, m.emfConstant, m.phaseDeg, m.internalResistance, m.internalInductance]).toEqual([p.magneto.N, p.magneto.k, p.magneto.phi, p.magneto.Rs, p.magneto.Ls]);
     expect(IG.timer.contactResistance).toBe(p.timerResistance);
     expect(IG.battery.internalResistance).toBe(p.batteryResistance);
+    // the oracle's re-ignition law is the gap model's
+    expect([DEFAULT_SPARK_GAP_OPTIONS.reignitionTime, REIGNITION_WINDOW, DEFAULT_SPARK_GAP_OPTIONS.transitionHysteresis]).toEqual([p.reignition.tau, p.reignition.window, p.reignition.hyst]);
     const f = oracleFx.fit;
     expect(Math.abs(f.achieved.t6 - f.targets.t6)).toBeLessThan(5e-6);
     expect(Math.abs(f.achieved.t9 - f.targets.t9)).toBeLessThan(5e-6);
     expect(Math.abs(f.achieved.t12 - f.targets.t12)).toBeLessThan(5e-6);
-    expect(Math.abs(f.achieved.reclose6 - f.targets.reclose6)).toBeLessThan(15e-6);
-    log(
-      `oracle fit residuals: ${((f.achieved.t6 - f.targets.t6) * 1e6).toFixed(1)} / ${((f.achieved.t9 - f.targets.t9) * 1e6).toFixed(1)} / ${((f.achieved.t12 - f.targets.t12) * 1e6).toFixed(1)} µs (6/9/12 V), re-close ${((f.achieved.reclose6 - f.targets.reclose6) * 1e6).toFixed(1)} µs; firing currents ${f.achieved.I6.toFixed(2)} / ${f.achieved.I9.toFixed(2)} / ${f.achieved.I12.toFixed(2)} A`,
-    );
+    // The vibrator in use was fitted before the re-ignition model (discharge.ts): each current zero then
+    // re-broke the 10 kV bench gap and dumped ½C₂V_bd² = 2 mJ, which damped the ring; re-igniting at V_r(t)
+    // the spark dissipates less and the points re-close ≈ 110 µs later. The refit vibrator (same targets, with
+    // re-ignition: oracle VIB_REFIT, proposed for MODEL_T_IGNITION) meets all four again.
+    expect(Math.abs(f.achieved.reclose6 - f.targets.reclose6)).toBeLessThan(0.12e-3);
+    const rf = oracleFx.refit.achieved;
+    expect(Math.abs(rf.t6 - f.targets.t6)).toBeLessThan(5e-6);
+    expect(Math.abs(rf.t9 - f.targets.t9)).toBeLessThan(5e-6);
+    expect(Math.abs(rf.t12 - f.targets.t12)).toBeLessThan(5e-6);
+    expect(Math.abs(rf.reclose6 - f.targets.reclose6)).toBeLessThan(15e-6);
+    const us = (a: { t6: number; t9: number; t12: number; reclose6: number }) =>
+      `${((a.t6 - f.targets.t6) * 1e6).toFixed(1)} / ${((a.t9 - f.targets.t9) * 1e6).toFixed(1)} / ${((a.t12 - f.targets.t12) * 1e6).toFixed(1)} µs (6/9/12 V), re-close ${((a.reclose6 - f.targets.reclose6) * 1e6).toFixed(1)} µs`;
+    log(`oracle fit residuals (vibrator in use): ${us(f.achieved)}; firing currents ${f.achieved.I6.toFixed(2)} / ${f.achieved.I9.toFixed(2)} / ${f.achieved.I12.toFixed(2)} A; buzz ${f.achieved.buzz6.toFixed(0)} Hz`);
+    log(`oracle refit residuals (${JSON.stringify(oracleFx.refit.vibrator)}): ${us(rf)}; firing currents ${rf.I6.toFixed(2)} / ${rf.I9.toFixed(2)} / ${rf.I12.toFixed(2)} A; buzz ${rf.buzz6.toFixed(0)} Hz`);
   });
 
   const r6 = benchRun(6, 20e-3);
   const r9 = benchRun(9, 8e-3);
   const r12 = benchRun(12, 8e-3);
+  /** The coil with the refit vibrator (oracle VIB_REFIT; contract request for MODEL_T_IGNITION). */
+  const rv = oracleFx.refit.vibrator;
+  const REFIT_COIL = { ...IG.coil, vibrator: { ...IG.coil.vibrator, pullCurrent: rv.Ip, naturalFrequency: rv.fn, dampingRatio: rv.zeta, airGap: rv.g0 } };
+  const q6 = benchRun(6, 20e-3, REFIT_COIL);
+  const q9 = benchRun(9, 8e-3, REFIT_COIL);
+  const q12 = benchRun(12, 8e-3, REFIT_COIL);
 
   it('first fire after the timer make: 3.5 ms / 6 V, 2.5 ms / 9 V, 2.0 ms / 12 V at ≈ 5.0–5.4, 6.2, 6–7 A', () => {
     const rows = [
@@ -120,16 +138,22 @@ describe('MODEL_T_IGNITION — vibrator fit to the coil-tester data (ECCT; Cool3
   });
 
   it('points re-close ≈ 1.8 ms after the 6 V fire; buzz ≈ 190–200 Hz; points stay open longer at higher current', () => {
-    const off6 = r6.closes[0] - r6.trips[0];
-    expect(Math.abs(off6 - 1.8e-3)).toBeLessThan(0.05e-3);
-    const period = (r6.trips[r6.trips.length - 1] - r6.trips[0]) / (r6.trips.length - 1);
-    expect(1 / period).toBeGreaterThan(180);
-    expect(1 / period).toBeLessThan(215);
-    const off9 = r9.closes[0] - r9.trips[0];
-    const off12 = r12.closes[0] - r12.trips[0];
-    expect(off9).toBeGreaterThan(off6);
-    expect(off12).toBeGreaterThan(off9);
-    log(`fit: re-close ${(off6 * 1e3).toFixed(3)} ms after the 6 V fire (target 1.8, residual ${((off6 - 1.8e-3) * 1e6).toFixed(1)} µs); buzz ${(1 / period).toFixed(0)} Hz; open ${(off9 * 1e3).toFixed(2)} ms at 9 V, ${(off12 * 1e3).toFixed(2)} ms at 12 V`);
+    const check = (a: typeof r6, b: typeof r9, c: typeof r12, reclose: number, buzz: [number, number], label: string) => {
+      const off6 = a.closes[0] - a.trips[0];
+      expect(Math.abs(off6 - 1.8e-3)).toBeLessThan(reclose);
+      const period = (a.trips[a.trips.length - 1] - a.trips[0]) / (a.trips.length - 1);
+      expect(1 / period).toBeGreaterThan(buzz[0]);
+      expect(1 / period).toBeLessThan(buzz[1]);
+      const off9 = b.closes[0] - b.trips[0];
+      const off12 = c.closes[0] - c.trips[0];
+      expect(off9).toBeGreaterThan(off6);
+      expect(off12).toBeGreaterThan(off9);
+      log(`${label}: re-close ${(off6 * 1e3).toFixed(3)} ms after the 6 V fire (target 1.8, residual ${((off6 - 1.8e-3) * 1e6).toFixed(1)} µs); buzz ${(1 / period).toFixed(0)} Hz; open ${(off9 * 1e3).toFixed(2)} ms at 9 V, ${(off12 * 1e3).toFixed(2)} ms at 12 V`);
+    };
+    // refit vibrator: the fit targets
+    check(q6, q9, q12, 0.05e-3, [180, 215], 'refit vibrator');
+    // vibrator in use (fitted before the re-ignition model; see the oracle fit test): ≈ 0.14 ms late, buzz ≈ 175 Hz
+    check(r6, r9, r12, 0.16e-3, [165, 215], 'vibrator in use');
   });
 
   it('stored energy at the fire ½L₁I² ≈ 47 mJ on 6 V (48–50 mJ at 5.4–5.5 A, ECCT)', () => {
@@ -271,10 +295,18 @@ describe('Trembler-magneto ignition — one event = one timer contact, spark tra
     expect(r.timerSeen).toBe(true);
     // 87° at 400 rpm = 36 ms of contact ≈ 7 buzz cycles
     expect(r.maxTrips).toBeGreaterThanOrEqual(5);
-    expect(r.maxBds).toBeGreaterThan(r.maxTrips);
+    // ONE spark (breakdown) per points opening, + at most the timer-break spark and a fresh breakdown after
+    // a recovery window; each spark oscillates with the condenser ring, re-igniting at its current zeros
+    // (review: previously every current zero was booked as a new breakdown, ≈ 18 per trip)
+    expect(r.maxBds).toBeGreaterThanOrEqual(r.maxTrips);
+    expect(r.maxBds).toBeLessThanOrEqual(r.maxTrips + 2);
+    expect(s.reignitionCount).toBeGreaterThan(5 * s.breakdownCount);
     expect(s.breakdownCount).toBe(r.maxBds); // cumulative over the train (no reset per buzz)
     expect(r.phases.slice(0, 3)).toEqual(['off', 'charging', 'breakdown']);
     expect(r.phases).toContain('glow');
+    // the phase no longer toggles 'breakdown' / 'charging' at every current zero of a spark (ring-up +
+    // breakdown step per trip, + the timer-break spark)
+    expect(r.phases.filter((p) => p === 'breakdown').length).toBeLessThanOrEqual(2 * r.maxTrips + 2);
     expect(r.phases[r.phases.length - 1]).toBe('done');
     expect(r.misDuring).toBe(false);
     expect(s.kernel.stage).toBe('handoff');
@@ -312,6 +344,53 @@ describe('Trembler-magneto ignition — one event = one timer contact, spark tra
     expect(train.s.kernel.stage).toBe('handoff');
     expect(train.s.misfire).toBe(false);
     log(`lean charge: single spark → ${single.s.kernel.quenchReason}; train (${train.s.pointsBreakCount} trips, ${train.s.breakdownCount} breakdowns) → hand-off ${(train.s.kernel.handoffTime * 1e3).toFixed(2)} ms after the kernel's start`);
+  });
+
+  it('the timer-break spark re-seeds a kernel quenched during the train; re-ignitions never re-seed (review finding)', () => {
+    const blocking = gasT(0.05, 4, 4);
+    const ign = new IgnitionSystem(IG, MODEL_T.sparkPlug, { ignitionSource: 'battery' });
+    let s = ign.stepTimed(20e-6, true, blocking);
+    let t = 20e-6;
+    for (; t < 40e-3 && s.kernel.stage !== 'quenched'; t += 20e-6) s = ign.stepTimed(20e-6, true, blocking);
+    expect(s.kernel.stage).toBe('quenched');
+    expect(s.kernel.quenchReason).toBe('kernel did not reach hand-off in time');
+    expect(s.misfire).toBe(false); // no verdict while the timer is closed
+    // contact held until the points are closed with the current back up (no new trip yet): then the timer
+    // breaks — ideal break, the coil fires once more ("timer spark") — into gas that can now ignite
+    const bd0 = s.breakdownCount;
+    for (; t < 60e-3 && (s.pointsOpen || s.primaryCurrent < 2.5); t += 20e-6) s = ign.stepTimed(20e-6, true, blocking);
+    expect(s.breakdownCount).toBe(bd0);
+    expect(s.pointsOpen).toBe(false);
+    expect(s.kernel.stage).toBe('quenched');
+    const ignitable = gasT(0.3, 2, 1);
+    s = ign.stepTimed(20e-6, false, ignitable);
+    for (let k = 0; k < 25 && s.breakdownCount === bd0; k++) s = ign.stepTimed(20e-6, false, ignitable);
+    expect(s.breakdownCount).toBe(bd0 + 1);
+    expect(s.kernel.stage).toBe('kernel'); // re-seeded (was: kept quenched → misfire)
+    for (let k = 0; k < 500; k++) s = ign.stepTimed(20e-6, false, ignitable);
+    expect(s.kernel.stage).toBe('handoff');
+    expect(s.misfire).toBe(false);
+    log(`timer-break re-seed: quenched at ${(t * 1e3).toFixed(2)} ms, timer spark → ${s.kernel.stage}`);
+
+    // a kernel lost DURING a spark (forced here) is not re-seeded by that spark's re-ignitions, only by the
+    // next breakdown (the next trip)
+    const ign2 = new IgnitionSystem(IG, MODEL_T.sparkPlug, { ignitionSource: 'battery' });
+    s = ign2.stepTimed(20e-6, true, ignitable);
+    for (let k = 0; k < 2000 && s.reignitionCount < 2; k++) s = ign2.stepTimed(20e-6, true, ignitable);
+    expect(s.breakdownCount).toBe(1);
+    (ign2.kernel as { stage: string }).stage = 'quenched';
+    let reigSteps = 0;
+    for (let k = 0; k < 5000 && s.breakdownCount === 1; k++) {
+      const rg = s.reignitionCount;
+      s = ign2.stepTimed(20e-6, true, ignitable);
+      if (s.breakdownCount === 1 && s.reignitionCount > rg) {
+        reigSteps++;
+        expect(s.kernel.stage).toBe('quenched');
+      }
+    }
+    expect(reigSteps).toBeGreaterThan(3);
+    expect(s.breakdownCount).toBe(2);
+    expect(s.kernel.stage).toBe('kernel');
   });
 
   it('a non-combustible charge: no misfire verdict while the timer is closed, misfire after the break', () => {
@@ -412,6 +491,61 @@ describe('Trembler-magneto ignition — four cylinders, shared magneto, per-cyli
   });
 });
 
+describe('Trembler-magneto ignition — robustness of the re-ignition events', () => {
+  it('seeded random sweep (gas, flow, speed, lever, supply, step): finite, exact ledger, bounded events', () => {
+    let seed = 20261003;
+    const rnd = (): number => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+    const lerp = (a: number, b: number): number => a + (b - a) * rnd();
+    const logu = (a: number, b: number): number => Math.exp(lerp(Math.log(a), Math.log(b)));
+    for (let trial = 0; trial < 16; trial++) {
+      const p = logu(0.3e5, 30e5);
+      const Tu = lerp(300, 900);
+      const SL = rnd() < 0.2 ? 0 : logu(0.02, 2);
+      const nu = C45.nuU * (Tu / C45.Tu) ** 1.7 * (C45.p / p);
+      const lF = SL > 0 ? nu / SL : 1e-5;
+      const gas: IgnitionGasState = {
+        ...gasT(),
+        p,
+        Tu,
+        rhoU: (p * 0.0298) / (8.314 * Tu),
+        SL,
+        marksteinLength: lerp(-2, 8) * lF,
+        flameThickness: lF,
+        uPrime: logu(0.05, 10),
+        kinematicViscosity: nu,
+        flowVelocity: rnd() < 0.4 ? 0 : logu(0.1, 30),
+      };
+      const rpm = logu(150, 2500);
+      const source = rnd() < 0.5 ? 'magneto' : 'battery';
+      const make = -lerp(-15, 64);
+      const dt = logu(5e-6, 200e-6);
+      const ign = new IgnitionSystem(IG, MODEL_T.sparkPlug, { ignitionSource: source });
+      const cmd = tremblerTimerCommand(IG, -make);
+      const w = (rpm * 2 * Math.PI) / 60;
+      let th = make - 5;
+      let finite = true;
+      const t0 = performance.now();
+      ign.step(dt, th, cmd, gas, w);
+      while (th < make + IG.timer.contactArcDeg + 30) {
+        th += rpm * 6 * dt;
+        const s = ign.step(dt, th >= 360 ? th - 720 : th, cmd, gas, w);
+        finite &&= Number.isFinite(s.secondaryVoltage) && Number.isFinite(s.energyToGas) && Number.isFinite(s.kernel.radius);
+      }
+      const ms = performance.now() - t0;
+      const s = ign.state;
+      const c = ign.trembler!;
+      expect(finite).toBe(true);
+      expect(Math.abs(c.energyResidual())).toBeLessThan(1e-11);
+      expect(s.energyToGas + s.energyToElectrodes + s.energyRadiated).toBeCloseTo(s.energyDelivered, 12);
+      expect(s.breakdownCount).toBeLessThan(1000);
+      expect(s.reignitionCount).toBeLessThan(5000);
+      expect(c.forcedSubsteps).toBeLessThan(50); // no zero-length event loops
+      expect(ms).toBeLessThan(2000);
+      log(`sweep ${trial}: ${source} ${rpm.toFixed(0)} rpm, ${(p / 1e5).toFixed(1)} bar ${Tu.toFixed(0)} K, flow ${(gas.flowVelocity ?? 0).toFixed(1)} m/s, dt ${(dt * 1e6).toFixed(0)} µs: ${s.pointsBreakCount} trips, ${s.breakdownCount} bds, ${s.reignitionCount} re-ignitions, forced ${c.forcedSubsteps}, ${ms.toFixed(0)} ms`);
+    }
+  });
+});
+
 describe('Trembler-magneto ignition — CPU per ignition event', () => {
   it('one cylinder over a full 720° cycle (20 µs engine steps) at 400 / 1000 / 1800 rpm', () => {
     const rows: string[] = [];
@@ -437,7 +571,7 @@ describe('Trembler-magneto ignition — CPU per ignition event', () => {
         for (let k = 1; k < n; k++) s = runOnce();
         const ms = (performance.now() - t0) / n;
         worst = Math.max(worst, ms);
-        rows.push(`${source.padEnd(8)} ${String(rpm).padStart(4)} rpm: ${ms.toFixed(2)} ms/event (${s.pointsBreakCount} trips, ${s.breakdownCount} breakdowns, cycle ${(120 / rpm * 1e3).toFixed(0)} ms)`);
+        rows.push(`${source.padEnd(8)} ${String(rpm).padStart(4)} rpm: ${ms.toFixed(2)} ms/event (${s.pointsBreakCount} trips, ${s.breakdownCount} breakdowns, ${s.reignitionCount} re-ignitions, ${(s.energyToGas * 1e3).toFixed(1)} mJ to the gas, cycle ${(120 / rpm * 1e3).toFixed(0)} ms)`);
       }
     }
     log('\nCPU per trembler ignition event (incl. the 720° of engine steps):\n' + rows.join('\n'));

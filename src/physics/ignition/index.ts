@@ -48,10 +48,13 @@
  *  - One ignition EVENT = one timer contact: the event (gap counters, kernel, ledgers) starts at the
  *    timer make; points openings/closings never start a new event. While the timer is closed the
  *    kernel's misfire checks are suspended (trainActive) and a quenched kernel is RE-SEEDED by the
- *    next breakdown of the train; misfire is judged after the timer break.
+ *    next BREAKDOWN of the event — of the train, or the timer-break spark within the 0.5 ms no-spark
+ *    margin after the break (not by a re-ignition, which re-lights the old channel; discharge.ts);
+ *    misfire is judged after the timer break.
  *  - makeSparkDiode is ignored (a trembler coil has no diode; make sparks are part of its physics).
  *  - state: switchState = the POINTS ('closed' / 'open'), timerClosed, pointsOpen, breakdownCount
- *    (whole train), pointsBreakCount, firstSparkDeg / firstSparkDelay (timer make → first breakdown),
+ *    (distinct sparks of the whole train: about one per points opening), reignitionCount (current-zero
+ *    re-ignitions of those sparks), pointsBreakCount, firstSparkDeg / firstSparkDelay (timer make → first breakdown),
  *    firstTripDelay / firstTripCurrent (timer make → first points opening), conductingTime (summed;
  *    also sparkDuration), sourceEmf, magnetoEmf, trainActive; breakdownDelay = first points opening →
  *    first breakdown.
@@ -198,8 +201,13 @@ export interface IgnitionState {
   energyRadiated: number;
   energyBreakdown: number;
   energyCapacitiveArc: number;
-  /** Number of breakdowns this cycle (1 + restrikes; trembler: the whole spark train). */
+  /**
+   * Number of breakdowns this cycle (1 + restrikes; trembler: the distinct sparks of the whole train —
+   * re-ignitions of a spark at its current zeros are counted in reignitionCount).
+   */
   breakdownCount: number;
+  /** Re-ignitions of the event's sparks after a current zero (discharge.ts; inductive: 0). */
+  reignitionCount: number;
   /** Voltage at the last breakdown, V. */
   lastBreakdownVoltage: number;
   /** Time from switch-off (trembler: the first points opening) to the first breakdown, s (NaN if none). */
@@ -282,6 +290,12 @@ function progress(theta0: number, theta1: number): number {
 }
 
 const DEG = Math.PI / 180;
+
+/**
+ * Trembler: time after the timer break within which a breakdown still belongs to the event's spark (the
+ * timer-break spark follows within µs): no-spark misfire verdict and kernel re-seed, s (UNVERIFIED margin).
+ */
+const TIMER_BREAK_MARGIN = 0.5e-3;
 
 /**
  * The coil of cylinder i (0-based) of a trembler-magneto ignition: `coil` with `coilOverrides[i]`
@@ -402,6 +416,7 @@ export class IgnitionSystem {
       energyBreakdown: 0,
       energyCapacitiveArc: 0,
       breakdownCount: 0,
+      reignitionCount: 0,
       lastBreakdownVoltage: 0,
       breakdownDelay: NaN,
       sparkDuration: 0,
@@ -611,11 +626,14 @@ export class IgnitionSystem {
     const imp = g.stepImpulseGasEnergy;
     const cont = g.stepContinuousGasEnergy;
     if (this.trembler) {
-      // spark train: no misfire decision while the timer contact lasts; a later breakdown re-seeds a
-      // quenched kernel
-      const train = sparkActive || this.trembler.timerClosed;
+      // spark train: no misfire decision while the timer contact lasts; a later BREAKDOWN of the event
+      // re-seeds a quenched kernel — during the contact, or the timer-break spark within the no-spark
+      // margin after the break (a re-ignition re-lights the old channel: it never re-seeds). The spark
+      // stays active between the current zeros of its oscillation (recovery window, discharge.ts).
+      const train = sparkActive || this.trembler.timerClosed || g.recovering(tEnd);
       if (imp > 0) {
-        if (k.stage === 'quenched' && this.trembler.timerClosed) k.reseed();
+        const tbd = g.stepBreakdownTime;
+        if (k.stage === 'quenched' && !Number.isNaN(tbd) && (this.trembler.timerClosed || tbd <= this.switchOffTime + TIMER_BREAK_MARGIN)) k.reseed();
         const tb = Number.isNaN(g.stepBreakdownTime) ? t0 : g.stepBreakdownTime;
         const wasNone = k.stage === 'none';
         k.deposit(imp, gas);
@@ -665,6 +683,7 @@ export class IgnitionSystem {
     s.energyBreakdown = g.energyBreakdown;
     s.energyCapacitiveArc = g.energyCapacitiveArc;
     s.breakdownCount = g.breakdownCount;
+    s.reignitionCount = g.reignitionCount;
     s.lastBreakdownVoltage = g.lastBreakdownVoltage;
     // kernel
     const ks = s.kernel;
@@ -741,19 +760,20 @@ export class IgnitionSystem {
     s.firstTripCurrent = c.firstTripCurrent;
     s.sourceEmf = c.emfNow();
     s.magnetoEmf = this.supply!.magnetoEmfAt(c.time);
-    const discharging = g.conducting || g.awaitingReentry;
+    // discharging: conducting, or between the current zeros of an oscillating spark (re-ignition window)
+    const discharging = g.conducting || g.awaitingReentry || g.recovering(c.time);
     s.trainActive = c.timerClosed || discharging;
     // phase: 'breakdown' in the step of a breakdown and during a ring-up (points open, no breakdown
     // since they opened); 'charging' while the timer contact lasts otherwise
     if (!Number.isNaN(g.stepBreakdownTime)) s.phase = 'breakdown';
     else if (g.conducting) s.phase = g.mode === 'arc' ? 'arc' : 'glow';
-    else if (g.awaitingReentry) s.phase = 'glow';
+    else if (discharging) s.phase = 'glow';
     else if (c.timerClosed)
       s.phase = c.pointsOpen && !(g.lastBreakdownTime >= c.lastTripTime) && c.storedEnergy() > 1e-6 ? 'breakdown' : 'charging';
     else s.phase = g.breakdownCount > 0 || this.firedThisCycle ? 'done' : 'off';
     // misfire: only once the train is over (timer open): kernel quenched, or no breakdown at all
-    // within 0.5 ms of the timer break (UNVERIFIED margin; a timer-break spark follows within µs)
-    const noSpark = this.firedThisCycle && g.breakdownCount === 0 && c.time - this.switchOffTime > 0.5e-3;
+    // within TIMER_BREAK_MARGIN of the timer break
+    const noSpark = this.firedThisCycle && g.breakdownCount === 0 && c.time - this.switchOffTime > TIMER_BREAK_MARGIN;
     s.misfire = !c.timerClosed && (k.misfire || noSpark);
   }
 }

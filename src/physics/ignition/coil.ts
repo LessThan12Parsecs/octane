@@ -31,7 +31,9 @@
  * voltage; conducting → V₂ is algebraic, V₂ = −sgn(I₂)·V_gap(|I₂|), because the discharge
  * time scale (ms) is ≫ the C₂–gap time scale (C₂ dV/dt ≈ 60 pF·500 V/ms = 3e-8 A ≪ I₂);
  * the gap current is I_gap = −I₂ − C₂V̇₂ and its energy is booked exactly as
- * −∫V₂I₂dt − ΔW_C₂.
+ * −∫V₂I₂dt − ΔW_C₂. After an extinction the gap needs a fresh breakdown: the re-ignition of a
+ * recovering channel (SparkGap.recovering / reignite, discharge.ts) is a trembler-coil event only —
+ * this single inductive spark ends after a monotonic ms-long current decay.
  *
  * Integration: trapezoidal rule (A-stable, second order; for this linear circuit it
  * conserves the quadratic energy exactly: W¹ − W⁰ = h·P(x̄) with x̄ the step midpoint, so

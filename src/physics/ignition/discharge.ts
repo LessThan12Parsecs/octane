@@ -61,6 +61,34 @@
  *    V_bd) — the gap never returns energy to the circuit;
  *  - with a circuit current ≤ I_ext the breakdown is a capacitive spark only (dump booked,
  *    gap open again).
+ *
+ * Re-ignition of an extinguished channel (oscillatory discharges; recovering / reignitionVoltage /
+ * reignite). A channel whose current went through zero microseconds ago has not recovered its
+ * dielectric strength: the re-ignition ("restrike") voltage after a current zero rises from a low
+ * value back toward the breakdown voltage of the gap — Slepian's "race" between the recovery voltage
+ * of the circuit and the dielectric recovery of the arc space (Slepian 1928, Trans. AIEE 47:1398);
+ * short a.c. arcs in air recover in two stages, a fast one while the space-charge layer deionises and a
+ * slow thermal one as the gas density recovers (Browne 1936, "Dielectric Recovery of Short A-C Arcs",
+ * PhD thesis, Caltech, abstract). Here the thermal stage is the hot-kernel breakdown voltage the owner
+ * sets (IgnitionSystem.updateGap: breakdown law at the kernel temperature), and the fast stage is
+ *     V_r(t) = V_ri + (V_bd − V_ri)·(1 − exp(−(t − t_ext)/τ_rec)),   t − t_ext < 5 τ_rec,
+ * V_ri = minimumBreakdownVoltage() = (1 + h)·V_glow(d, I_ext): the voltage of a sustainable glow,
+ * which includes a new normal cathode fall (the polarity reverses) — cf. the few-hundred-volt
+ * near-cathode recovery right after current zero in short a.c. arcs (Slepian; figure UNVERIFIED);
+ * τ_rec = reignitionTime (default 30 µs, UNVERIFIED: no measurement for a spark-plug gap was found;
+ * order of the fast stage, 10–100 µs). Oscillatory capacitor-discharge ignitions deliver energy to the
+ * plug on both half cycles "on a substantially continuous basis" (US 5,513,618) — the channel is
+ * re-lit at each current zero, not broken down anew. A re-ignition is a CONTINUATION of the spark:
+ * counted in reignitionCount (not breakdownCount), the C₂ dump through the existing channel is booked
+ * as capacitive-arc energy (capacitiveArcEfficiency / arcRadiationFraction; energyReignition ⊂
+ * energyCapacitiveArc), no breakdown phase, no stepBreakdownTime (the kernel is not re-seeded). It
+ * needs a circuit current above extinctionCurrent driving |V| up (the caller's event logic; below it
+ * the residual channel cannot carry a sustainable discharge). After the window the gap needs a fresh
+ * breakdown (threshold()). Only the trembler-coil integrator (trembler-coil.ts) uses it: its condenser
+ * ring drives the secondary current through zero every ≈ 50–125 µs from tens of mA. The inductive coil
+ * (coil.ts) does not: its single spark ends after a monotonic ms-long current decay (the channel has
+ * deionised at extinction; the coil's ringing after the spark line does not re-fire the plug in the
+ * usual secondary oscilloscope patterns — UNVERIFIED for our coil), and the CFR results stay unchanged.
  */
 
 import { normalCathodeFall } from './breakdown';
@@ -104,6 +132,11 @@ export interface SparkGapOptions {
   glowRadiationFraction: number;
   /** Maximum channel length as a multiple of the gap before a forced restrike (default 20). */
   maxChannelStretch: number;
+  /**
+   * Recovery time constant τ_rec of the re-ignition voltage after an extinction, s (default 30 µs;
+   * UNVERIFIED, see the module doc). 0 disables re-ignition (full instantaneous dielectric recovery).
+   */
+  reignitionTime: number;
 }
 
 /** Default gap-model constants (sources in the module doc). */
@@ -125,7 +158,11 @@ export const DEFAULT_SPARK_GAP_OPTIONS: Readonly<SparkGapOptions> = Object.freez
   arcRadiationFraction: 0.05,
   glowRadiationFraction: 0,
   maxChannelStretch: 20,
+  reignitionTime: 30e-6,
 });
+
+/** Re-ignition window after an extinction, in units of reignitionTime (V_r within 0.7 % of V_bd at its end). */
+export const REIGNITION_WINDOW = 5;
 
 /**
  * Result codes of SparkGap.afterConductingStep (consumed by the coil integrator).
@@ -175,8 +212,10 @@ export class SparkGap {
   awaitingReentry = false;
   /** Channel length, m. */
   channelLength: number;
-  /** Number of breakdowns (first + restrikes) since reset. */
+  /** Number of breakdowns (first + restrikes + fresh breakdowns after a recovery window) since reset. */
   breakdownCount = 0;
+  /** Number of re-ignitions of a recovering channel (reignite) since reset; not breakdowns. */
+  reignitionCount = 0;
   /** Simulated time of the first breakdown since reset, s (NaN if none). */
   firstBreakdownTime = NaN;
   /** Simulated time at which the discharge last extinguished, s (NaN if not yet). */
@@ -193,8 +232,10 @@ export class SparkGap {
   energyTotal = 0;
   /** Breakdown-phase energy ½C_plug V_bd². */
   energyBreakdown = 0;
-  /** Capacitive-arc energy (rest of C₂ dumped at breakdown). */
+  /** Capacitive-arc energy (rest of C₂ dumped at breakdown; and the re-ignition dumps). */
   energyCapacitiveArc = 0;
+  /** C₂ dumps at re-ignitions, J (included in energyCapacitiveArc). */
+  energyReignition = 0;
   /** Energy of the sustained (inductive) arc phase. */
   energyArc = 0;
   /** Energy of the glow phase. */
@@ -227,6 +268,8 @@ export class SparkGap {
   private cacheMinP = NaN;
   private cacheMinGap = NaN;
   private cacheMinV = 0;
+  /** Start of the current re-ignition recovery window (the last extinction), s; NaN: none. */
+  private recoveryStart = NaN;
 
   constructor(gap: number, opts?: Partial<SparkGapOptions>) {
     this.opts = { ...DEFAULT_SPARK_GAP_OPTIONS, ...opts };
@@ -240,14 +283,17 @@ export class SparkGap {
     this.awaitingReentry = false;
     this.channelLength = this.gap;
     this.breakdownCount = 0;
+    this.reignitionCount = 0;
     this.firstBreakdownTime = NaN;
     this.extinctionTime = NaN;
+    this.recoveryStart = NaN;
     this.lastBreakdownVoltage = 0;
     this.lastBreakdownTime = NaN;
     this.conductingTime = 0;
     this.energyTotal = 0;
     this.energyBreakdown = 0;
     this.energyCapacitiveArc = 0;
+    this.energyReignition = 0;
     this.energyArc = 0;
     this.energyGlow = 0;
     this.energyToGas = 0;
@@ -373,6 +419,66 @@ export class SparkGap {
   }
 
   /**
+   * True while the extinguished channel can re-ignite at reignitionVoltage (module doc): re-ignition
+   * enabled, gap open (no glow re-entry pending, breakdown not suppressed) and t within REIGNITION_WINDOW
+   * time constants of the last extinction. A Restrike (stretched channel) or a reset closes the window.
+   * @param t absolute time, s
+   */
+  recovering(t: number): boolean {
+    const tau = this.opts.reignitionTime;
+    if (!(tau > 0) || this.mode !== 'open' || this.awaitingReentry || this.suppressBreakdown) return false;
+    const s = t - this.recoveryStart;
+    return s >= 0 && s < REIGNITION_WINDOW * tau;
+  }
+
+  /**
+   * Re-ignition voltage of the recovering channel at time t, V:
+   * V_r = V_ri + (vFull − V_ri)(1 − e^{−(t − t_ext)/τ_rec}) with V_ri = minimumBreakdownVoltage() and
+   * vFull the breakdown threshold (threshold()). Only meaningful while recovering(t).
+   */
+  reignitionVoltage(t: number, vFull: number): number {
+    const vMin = this.minimumBreakdownVoltage();
+    if (!(vFull > vMin)) return vFull;
+    return vMin + (vFull - vMin) * (1 - Math.exp(-(t - this.recoveryStart) / this.opts.reignitionTime));
+  }
+
+  /**
+   * The recovering channel re-ignites at |V₂| = vAbs (≤ the breakdown threshold) with circuit current
+   * magnitude iAbs (> extinctionCurrent; the caller's event condition). The discharge resumes in the mode
+   * of the current and C₂ dumps down to its voltage through the existing channel: booked as
+   * capacitive-arc energy (also energyReignition), counted in reignitionCount — not a breakdown (no
+   * breakdown phase, breakdownCount / lastBreakdown* / stepBreakdownTime untouched). Returns the
+   * gap-voltage magnitude after the event (≤ vAbs). With iAbs ≤ extinctionCurrent it is a capacitive
+   * pulse only and the gap is open again (a new recovery window starts).
+   * @param c2 lumped secondary capacitance, F; @param t absolute time, s
+   */
+  reignite(vAbs: number, iAbs: number, c2: number, t: number): number {
+    const o = this.opts;
+    this.channelLength = this.gap;
+    this.recoveryStart = NaN;
+    const iEff = iAbs > o.extinctionCurrent ? iAbs : o.extinctionCurrent;
+    this.mode = this.modeForCurrent(iEff);
+    let vAfter = this.modeVoltage(this.mode, iEff);
+    if (vAfter > vAbs) vAfter = vAbs;
+    const e = Math.max(0, 0.5 * c2 * (vAbs * vAbs - vAfter * vAfter));
+    const gas = o.capacitiveArcEfficiency * e;
+    const rad = o.arcRadiationFraction * e;
+    this.energyCapacitiveArc += e;
+    this.energyReignition += e;
+    this.energyTotal += e;
+    this.stepElectricalEnergy += e;
+    this.energyToGas += gas;
+    this.stepImpulseGasEnergy += gas;
+    this.energyRadiated += rad;
+    this.energyToElectrodes += e - gas - rad;
+    this.reignitionCount++;
+    this.voltage = vAfter;
+    this.current = iAbs;
+    if (iAbs <= o.extinctionCurrent) this.extinguish(t);
+    return vAfter;
+  }
+
+  /**
    * The gap starts conducting at secondary-capacitor voltage |V₂| = vAbs with secondary
    * current magnitude iAbs. For a breakdown, dumps the capacitor energy above the new gap
    * voltage into the gap (breakdown + capacitive arc) and books it. Returns the gap-voltage
@@ -495,6 +601,7 @@ export class SparkGap {
     if (this.gapVoltage(iAbs) > this.threshold(iAbs)) {
       this.mode = 'open';
       this.channelLength = this.gap;
+      this.recoveryStart = NaN; // a fresh breakdown across the gap, not a re-ignition
       return GapTransition.Restrike;
     }
     if (this.mode === 'arc' && iAbs < o.arcGlowCurrent) {
@@ -509,12 +616,13 @@ export class SparkGap {
     return GapTransition.None;
   }
 
-  /** The discharge stops (current can no longer be sustained). */
+  /** The discharge stops (current can no longer be sustained); the re-ignition recovery window opens. */
   extinguish(t: number): void {
     this.mode = 'open';
     this.awaitingReentry = false;
     this.channelLength = this.gap;
     this.extinctionTime = t;
+    this.recoveryStart = t;
     this.current = 0;
   }
 }

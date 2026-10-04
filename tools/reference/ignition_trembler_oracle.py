@@ -9,6 +9,11 @@ implicit Radau IIA (adaptive, rtol 1e-9) and exact event location:
   C1 dV1/dt = I1                                    (points open; V1 = 0 closed, discharged on closing)
   C2 dV2/dt = -I2                                   (gap open)
   V2 = -sgn(I2) Vg(|I2|)                            (gap conducting, glow)
+  breakdown when |V2| reaches Vbd; extinction when |I2| falls to Iext; RE-IGNITION of the extinguished
+  channel (src/physics/ignition/discharge.ts module doc) within 5 tau of the extinction at t_ext when
+  |V2| reaches Vr(t) = Vri + (Vbd - Vri)(1 - exp(-(t - t_ext)/tau)), Vri = (1 + h) Vg_unstretched(Iext),
+  with a sustaining current driving |V2| up (|I2| > Iext and V2 I2 < 0): one continuous event function
+  min(|V2| - Vr, (|I2| - Iext) * 1e5 V/A, -V2 I2 / 10 mA) rising through zero (tau = 30 us, h = 0.1)
   x'' = w^2 [ xp ((I1/Ip)^2 (g0/(g0 - x))^2 - 1) - x ] - 2 zeta w x',   xp = g0/2,   0 <= x <= xmax
   points open when x rises through xb, close when it falls through xb (inelastic stops at 0 and xmax)
   e(t) = V (battery)  or  k w sin(N (theta(t) - phi) pi/180) (magneto, theta = theta0 + 6 rpm t)
@@ -25,8 +30,9 @@ vibrator parameters fitted here (`--fit`, scipy least_squares) to the DC firing 
                pulses (cf. 3.0-4.4 A on the hand-cranked coil tester, Kossor 2017);
   ladder600    first-spark angle vs timer make at 600 rpm on the magneto (Patterson & Coniff 2003).
 
-Writes test/fixtures/ignition_trembler.json. `--fit` re-runs the vibrator fit (slow, ~5 min) and
-prints the result; the fitted values are the constants below.
+Writes test/fixtures/ignition_trembler.json (`--dry`: print the summary only). `--fit` re-runs the vibrator
+fit (slow) and prints the result; the fitted values are the constants below (VIB, in use). `--fit2` re-runs the
+constrained refit with the re-ignition model (VIB_REFIT, proposed; fixture block `refit`).
 """
 from __future__ import annotations
 
@@ -45,10 +51,21 @@ IN = 0.0254
 COIL = dict(L1=3.3e-3, R1=0.295, L2=22.0, R2=3300.0, C2=40e-12, k=0.9, C1=0.43e-6)
 # fitted vibrator (see --fit); breakTravel / maxTravel sourced (cushion 0.005 in, point gap 1/32 in)
 VIB = dict(Ip=3.53, fn=133.0, zeta=0.34, g0=1.16e-3, xb=0.005 * IN, xmax=0.005 * IN + IN / 32)
+# The constants above (= engines/model-t.ts MODEL_T_IGNITION) were fitted before the re-ignition model, when
+# every current zero of the spark re-broke the 10 kV bench gap and dumped 1/2 C2 Vbd^2 = 2 mJ: with the
+# re-ignition model the 6 V re-close comes 110 us late. VIB_REFIT is the vibrator refitted WITH the re-ignition
+# model to the same targets (`--fit2`: least squares on Ip and zeta, fn and g0 kept; residuals +2.4 / -2.9 /
+# -1.1 us, re-close +0.6 us), proposed for MODEL_T_IGNITION; the fixture's `refit` block holds what it achieves.
+# UNVERIFIED as individual numbers, like VIB: the fit is degenerate along (fn down, zeta up, g0 up) — the free
+# 4-parameter `--fit` drifts along the valley, e.g. 3.43 A / 143.5 Hz / 0.62 / 0.958 mm with residuals < 1.2 us.
+VIB_REFIT = dict(VIB, Ip=3.471, zeta=0.574)
 VSHEATH = 3 * 365.0 / 14.6 * math.log(1 + 1 / 0.02)
 BENCH_GAP = dict(Vbd=10e3, p=1e5, l=3e-3)
 ENGINE_GAP = dict(Vbd=8e3, p=5e5, l=IN / 32)
 GLOW = dict(Vsheath=VSHEATH, Ccol=40.46, nI=-0.32, npres=0.51, Iext=2e-3)
+# re-ignition of an extinguished channel: recovery time constant (UNVERIFIED, discharge.ts
+# DEFAULT_SPARK_GAP_OPTIONS.reignitionTime), window in time constants, hysteresis of Vri (transitionHysteresis)
+REIGNITION = dict(tau=30e-6, window=5.0, hyst=0.1)
 MAGNETO = dict(k=0.317, N=8, phi=-8.5, Rs=0.3, Ls=3.05e-3)
 TIMER_R = 0.1
 BATTERY_R = 0.05
@@ -97,8 +114,16 @@ class Trembler:
         P = self.P
         y = [0.0] * 9  # I1 I2 V1 V2 x v Esup ER ER2
         t, timer, pts, smode, vib, sgn = 0.0, "closed", "closed", "open", "stop0", 1.0
-        out = dict(trips=[], tripI=[], closes=[], bds=[], bdI2=[], exts=[], peakV1_first=0.0, peakV2_first=0.0,
-                   tpeakV2_first=0.0)
+        out = dict(trips=[], tripI=[], closes=[], bds=[], bdI2=[], exts=[], reigs=[], reigV=[], peakV1_first=0.0,
+                   peakV2_first=0.0, tpeakV2_first=0.0)
+        tau, t_ext = P["tau"], math.nan  # re-ignition time constant (0: off), last extinction (recovery window)
+        vri = (1 + P["hyst"]) * self.vg(P["Iext"])
+
+        def vr(tt):
+            return vri + (P["Vbd"] - vri) * (1 - math.exp(-(tt - t_ext) / tau)) if P["Vbd"] > vri else P["Vbd"]
+
+        def g_reig(tt, yy):
+            return min(abs(yy[3]) - vr(tt), (abs(yy[1]) - P["Iext"]) * 1e5, -yy[3] * yy[1] / 1e-2)
         E_pts = E_timer = 0.0
         W0 = 0.0
         ts_all, ys_all = [], []
@@ -106,6 +131,15 @@ class Trembler:
         while t < t_end and n < max_events:
             n += 1
             t_stop = min(t_end, t_break) if timer == "closed" else t_end
+            recovering = gap and smode == "open" and tau > 0 and t - t_ext < P["window"] * tau
+            if recovering:
+                t_stop = min(t_stop, t_ext + P["window"] * tau)
+                if g_reig(t, y) >= 0:  # conditions already met (the TS event at theta = 0)
+                    sgn = 1.0 if y[1] > 0 else -1.0
+                    out["reigs"].append(t)
+                    out["reigV"].append(abs(y[3]))
+                    y[3] = -sgn * self.vg(abs(y[1]))
+                    smode, t_ext, recovering = "cond", math.nan, False
 
             def f(tt, yy, timer=timer, pts=pts, smode=smode, vib=vib, sgn=sgn):
                 I1, I2, V1, V2, x, v = yy[0], yy[1], yy[2], yy[3], yy[4], yy[5]
@@ -158,6 +192,11 @@ class Trembler:
                     return abs(yy[1]) - P["Iext"]
                 ev_ext.terminal, ev_ext.direction = True, -1
                 events.append(ev_ext)
+            if recovering:
+                def ev_reig(tt, yy):
+                    return g_reig(tt, yy)
+                ev_reig.terminal, ev_reig.direction = True, 1
+                events.append(ev_reig)
             max_step = 1e-6 if (pts == "open" or smode == "cond") else 10e-6
             sol = solve_ivp(f, (t, t_stop), y, method="Radau", rtol=RTOL, atol=ATOL, events=events,
                             max_step=max_step)
@@ -176,6 +215,10 @@ class Trembler:
             if sol.status == 0:
                 if t >= t_end - 1e-15:
                     break
+                if recovering and t >= t_ext + P["window"] * tau - 1e-15:
+                    t_ext = math.nan  # recovery window over: the gap needs a fresh breakdown
+                    if not (timer == "closed" and t >= t_break - 1e-15):
+                        continue
                 if timer == "closed" and t >= t_break - 1e-15:
                     w0 = self.stored(y)
                     y[1] += self.M * y[0] / P["L2"]
@@ -185,6 +228,7 @@ class Trembler:
                     if smode == "cond" and y[1] * sgn <= P["Iext"]:
                         smode = "open"
                         out["exts"].append(t)
+                        t_ext = t
                 continue
             name = events[[i for i, te in enumerate(sol.t_events) if len(te) > 0][0]].__name__
             if name == "ev_pts":
@@ -221,6 +265,13 @@ class Trembler:
                 y[3] = -sgn * self.vg(abs(y[1]))
                 smode = "open"
                 out["exts"].append(t)
+                t_ext = t
+            elif name == "ev_reig":
+                sgn = 1.0 if y[1] > 0 else -1.0
+                out["reigs"].append(t)
+                out["reigV"].append(abs(y[3]))
+                y[3] = -sgn * self.vg(abs(y[1]))
+                smode, t_ext = "cond", math.nan
         W1 = self.stored(y)
         out.update(E_sup=y[6], E_R=y[7], E_R2=y[8], E_pts=E_pts, E_timer=E_timer, W_end=W1, t_end=t,
                    y_end=list(y[:6]))
@@ -233,7 +284,7 @@ class Trembler:
 
 
 def params(gap, Ls=0.0, Rs=BATTERY_R, Rt=0.0, **over):
-    P = dict(COIL, **VIB, **GLOW, **gap, Ls=Ls, Rs=Rs, Rt=Rt)
+    P = dict(COIL, **VIB, **GLOW, **REIGNITION, **gap, Ls=Ls, Rs=Rs, Rt=Rt)
     P.update(over)
     return P
 
@@ -242,11 +293,12 @@ def ms_list(v):
     return [rnd(float(x)) for x in v]
 
 
-def bench(V, t_end):
-    o = Trembler(params(BENCH_GAP), ("dc", V)).run(t_end)
+def bench(V, t_end, vib=VIB):
+    o = Trembler(params(BENCH_GAP, **vib), ("dc", V)).run(t_end)
     first_close = {k: rnd(v) for k, v in o["atClose"][0].items()}
     return dict(V=V, t_end=rnd(t_end), trips=ms_list(o["trips"]), tripI=ms_list(o["tripI"]), closes=ms_list(o["closes"]),
-                bds=ms_list(o["bds"]), bdI2=ms_list(o["bdI2"]), exts=ms_list(o["exts"]), atFirstClose=first_close,
+                bds=ms_list(o["bds"]), bdI2=ms_list(o["bdI2"]), exts=ms_list(o["exts"]), reigs=ms_list(o["reigs"]),
+                reigV=ms_list(o["reigV"]), atFirstClose=first_close,
                 E_sup=rnd(o["E_sup"]), E_R=rnd(o["E_R"]), E_R2=rnd(o["E_R2"]), E_pts=rnd(o["E_pts"]),
                 E_gap=rnd(o["E_gap"]), W_end=rnd(o["W_end"]))
 
@@ -266,7 +318,8 @@ def magneto_case(rpm, make, t_after_break=1e-3, gap=ENGINE_GAP, t_end=None, **ov
     deg = lambda ts: [rnd(make + 6 * rpm * float(x)) for x in ts]
     return dict(rpm=rpm, make=make, t_break=rnd(t_break), t_end=rnd(t_end),
                 trips=ms_list(o["trips"]), tripI=ms_list(o["tripI"]), closes=ms_list(o["closes"]),
-                bds=ms_list(o["bds"]), exts=ms_list(o["exts"]), firstSparkDeg=(deg(o["bds"][:1]) or [None])[0],
+                bds=ms_list(o["bds"]), exts=ms_list(o["exts"]), reigs=ms_list(o["reigs"]),
+                firstSparkDeg=(deg(o["bds"][:1]) or [None])[0],
                 E_sup=rnd(o["E_sup"]), E_R=rnd(o["E_R"]), E_R2=rnd(o["E_R2"]), E_pts=rnd(o["E_pts"]),
                 E_timer=rnd(o["E_timer"]), E_gap=rnd(o["E_gap"]), W_end=rnd(o["W_end"]))
 
@@ -289,7 +342,7 @@ TARGETS = dict(t6=3.5e-3, t9=2.5e-3, t12=2.0e-3, reclose6=1.8e-3)
 def fit_residuals(q, verbose=False):
     Ip, fn, zeta, g0mm = q
     P = params(BENCH_GAP, Ip=Ip, fn=fn, zeta=zeta, g0=g0mm * 1e-3)
-    o = {V: Trembler(P, ("dc", V)).run(te, max_events=60) for V, te in ((6, 7.5e-3), (9, 4e-3), (12, 3.5e-3))}
+    o = {V: Trembler(P, ("dc", V)).run(te, max_events=200) for V, te in ((6, 7.5e-3), (9, 4e-3), (12, 3.5e-3))}
     t = {V: (o[V]["trips"][0] if o[V]["trips"] else 2 * te) for V, te in ((6, 4e-3), (9, 2.5e-3), (12, 2e-3))}
     rc = (o[6]["closes"][0] - t[6]) if o[6]["closes"] else 5e-3
     r = [(t[6] - TARGETS["t6"]) / 1e-4, (t[9] - TARGETS["t9"]) / 1e-4, (t[12] - TARGETS["t12"]) / 1e-4,
@@ -300,37 +353,63 @@ def fit_residuals(q, verbose=False):
 
 
 def run_fit():
-    sol = least_squares(lambda q: fit_residuals(q, True), [3.0, 150.0, 0.1, 1.2],
+    # start from the constants in use (the fit is degenerate along f_n down, zeta up, g0 up: see model-t.ts)
+    q0 = [VIB["Ip"], VIB["fn"], VIB["zeta"], VIB["g0"] * 1e3]
+    sol = least_squares(lambda q: fit_residuals(q, True), q0,
                         bounds=([1.0, 30, 0.0, 0.95], [6.0, 1000, 1.0, 10.0]), diff_step=1e-3, max_nfev=60)
     print("fit:", sol.x, "residuals (0.1 ms units):", sol.fun)
+
+
+def run_fit2():
+    """Constrained refit (VIB_REFIT): pull-in current and damping free, natural frequency and air gap kept."""
+    fn, g0mm = VIB["fn"], VIB["g0"] * 1e3
+    sol = least_squares(lambda q: fit_residuals([q[0], fn, q[1], g0mm], True), [VIB["Ip"], 0.45],
+                        bounds=([1.0, 0.0], [6.0, 1.0]), diff_step=1e-3, max_nfev=30)
+    print("fit2 (Ip, zeta):", sol.x, "residuals (0.1 ms units):", sol.fun)
 
 
 def main():
     if "--fit" in sys.argv:
         run_fit()
         return
+    if "--fit2" in sys.argv:
+        run_fit2()
+        return
     b6, b9, b12 = bench(6, 12e-3), bench(9, 8e-3), bench(12, 8e-3)
     oc6, oc12 = open_circuit(6), open_circuit(12)
     mag = magneto_case(1000, -25.0)
     slow = magneto_case(150, MAGNETO["phi"], t_end=20e-3)
     lad = ladder()
-    fit = dict(targets={k: rnd(v) for k, v in TARGETS.items()},
-               achieved=dict(t6=b6["trips"][0], t9=b9["trips"][0], t12=b12["trips"][0],
-                             reclose6=rnd(b6["closes"][0] - b6["trips"][0]),
-                             I6=b6["tripI"][0], I9=b9["tripI"][0], I12=b12["tripI"][0]))
-    write_fixture("ignition_trembler.json", dict(
+
+    def achieved(r6, r9, r12):
+        return dict(t6=r6["trips"][0], t9=r9["trips"][0], t12=r12["trips"][0], reclose6=rnd(r6["closes"][0] - r6["trips"][0]),
+                    I6=r6["tripI"][0], I9=r9["tripI"][0], I12=r12["tripI"][0], buzz6=rnd(1 / (r6["trips"][1] - r6["trips"][0])))
+
+    fit = dict(targets={k: rnd(v) for k, v in TARGETS.items()}, achieved=achieved(b6, b9, b12))
+    rb = [bench(V, te, VIB_REFIT) for V, te in ((6, 12e-3), (9, 8e-3), (12, 8e-3))]
+    refit = dict(vibrator={k: rnd(v) for k, v in VIB_REFIT.items()}, achieved=achieved(*rb))
+    fixture = dict(
         params=dict(coil={k: rnd(v) for k, v in COIL.items()}, vibrator={k: rnd(v) for k, v in VIB.items()},
-                    glow={k: rnd(v) for k, v in GLOW.items()}, benchGap={k: rnd(v) for k, v in BENCH_GAP.items()},
+                    glow={k: rnd(v) for k, v in GLOW.items()}, reignition={k: rnd(v) for k, v in REIGNITION.items()},
+                    benchGap={k: rnd(v) for k, v in BENCH_GAP.items()},
                     engineGap={k: rnd(v) for k, v in ENGINE_GAP.items()}, magneto={k: rnd(v) for k, v in MAGNETO.items()},
                     timerResistance=TIMER_R, batteryResistance=BATTERY_R),
         bench6=b6, bench9=b9, bench12=b12, open6=oc6, open12=oc12, magneto1000=mag, slow150=slow, ladder600=lad, fit=fit,
-    ))
+        refit=refit,
+    )
+    if "--dry" not in sys.argv:  # --dry: print the summary only
+        write_fixture("ignition_trembler.json", fixture)
+    print("fit residuals:", {k: round((fit["achieved"][k] - fit["targets"][k]) * 1e6, 2) for k in fit["targets"]}, "us",
+          "buzz", round(fit["achieved"]["buzz6"], 1), "Hz")
+    print("refit residuals:", {k: round((refit["achieved"][k] - fit["targets"][k]) * 1e6, 2) for k in fit["targets"]}, "us",
+          "buzz", round(refit["achieved"]["buzz6"], 1), "Hz, firing", [round(refit["achieved"][k], 3) for k in ("I6", "I9", "I12")], "A")
     for name, c in (("bench6", b6), ("bench9", b9), ("bench12", b12)):
         print(name, "trips", [round(x * 1e3, 4) for x in c["trips"]], "I", [round(x, 3) for x in c["tripI"]],
-              "closes", [round(x * 1e3, 4) for x in c["closes"]], "bds", len(c["bds"]), "E_gap", round(c["E_gap"] * 1e3, 3), "mJ")
+              "closes", [round(x * 1e3, 4) for x in c["closes"]], "bds", len(c["bds"]), "reigs", len(c["reigs"]),
+              "E_gap", round(c["E_gap"] * 1e3, 3), "mJ")
     print("open6", oc6, "\nopen12", oc12)
     print("magneto1000 trips", [round(x * 1e3, 4) for x in mag["trips"]], "I", [round(x, 3) for x in mag["tripI"]],
-          "bds", len(mag["bds"]), "first spark", mag["firstSparkDeg"], "E_timer", mag["E_timer"])
+          "bds", len(mag["bds"]), "reigs", len(mag["reigs"]), "first spark", mag["firstSparkDeg"], "E_timer", mag["E_timer"])
     print("slow150 trips", [round(x * 1e3, 4) for x in slow["trips"]], "I", [round(x, 3) for x in slow["tripI"]],
           "first spark", slow["firstSparkDeg"])
     print("ladder600", list(zip(lad["makes"], lad["firstSparkDeg"])))
