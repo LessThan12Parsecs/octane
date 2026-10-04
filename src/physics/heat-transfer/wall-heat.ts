@@ -17,7 +17,7 @@
  *
  * All inputs SI; allocation-free given a reused result object.
  */
-import type { ValveSpec, WallSpec } from '../core/engine-spec';
+import type { ValveSpec, WallSpec, WallThermalResistance } from '../core/engine-spec';
 
 /** Gas-exposed chamber areas, m². */
 export interface ChamberAreas {
@@ -172,6 +172,171 @@ export function wallHeatLossTwoZone(
   out.liner = b + u;
   qb += b;
   qu += u;
+  out.burned = qb;
+  out.unburned = qu;
+  out.total = qb + qu;
+  return out.total;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Chamber-generic wall surfaces (combustion/chamber.ts: surfaceAreas / evaluate().burnedFraction)
+//
+// The same per-surface law over N_WALL_SURFACES = 6 surfaces held in Float64Arrays: the five of the
+// flat-disc split plus the BLOCK (side-valve 'l-head' chambers: the water-jacketed block deck / valve-
+// pocket floor between the bore and the valve seats, WallSpec.blockTemperature). Each surface carries
+// its OWN burned fraction (an L-head valve face is wetted when the flame covers the pocket floor, not
+// in proportion to the head roof). With the flat-disc areas (block 0) and the disc fractions of
+// DiscChamber (valves at the head fraction) the sums run in the order of wallHeatLoss /
+// wallHeatLossTwoZone (head, intake, exhaust, piston, liner, block), so the results are bit-identical
+// to the 5-surface functions (wall-heat-surfaces.test.ts, combustion/chamber.test.ts).
+// ---------------------------------------------------------------------------------------------
+
+/** Surface index: head (flat head fire deck / L-head cavity roof and head-casting walls), valve faces excluded. */
+export const WALL_HEAD = 0;
+/** Surface index: piston (crown, plus the side above the deck when an L-head piston rises into the head). */
+export const WALL_PISTON = 1;
+/** Surface index: liner (bore wall between the crown and the head face / block deck). */
+export const WALL_LINER = 2;
+/** Surface index: intake valve faces (all intake valves). */
+export const WALL_INTAKE_VALVE = 3;
+/** Surface index: exhaust valve faces (all exhaust valves). */
+export const WALL_EXHAUST_VALVE = 4;
+/** Surface index: block deck / valve-pocket floor outside the valve faces ('l-head'; 0 area for a flat disc). */
+export const WALL_BLOCK = 5;
+/** Number of chamber wall surfaces of the generic path. */
+export const N_WALL_SURFACES = 6;
+
+/** Surface ids in index order (= the cycle model's per-surface heat ledgers, block appended last). */
+export type WallSurfaceId = 'head' | 'piston' | 'liner' | 'intakeValve' | 'exhaustValve' | 'block';
+export const WALL_SURFACE_IDS: readonly WallSurfaceId[] = Object.freeze([
+  'head',
+  'piston',
+  'liner',
+  'intakeValve',
+  'exhaustValve',
+  'block',
+] as WallSurfaceId[]);
+
+/** Summation order reproducing wallHeatLoss / wallHeatLossTwoZone bit for bit. */
+const SUM_ORDER = [WALL_HEAD, WALL_INTAKE_VALVE, WALL_EXHAUST_VALVE, WALL_PISTON, WALL_LINER, WALL_BLOCK];
+
+/** Allocate a zeroed per-surface array (areas, temperatures, fractions, …). */
+export function newWallSurfaceArray(): Float64Array {
+  return new Float64Array(N_WALL_SURFACES);
+}
+
+/** Surface temperatures, K, in WALL_* order; the block falls back to the liner temperature. Returns `out`. */
+export function wallSurfaceTemperatures(walls: WallSpec, out: Float64Array): Float64Array {
+  out[WALL_HEAD] = walls.headTemperature;
+  out[WALL_PISTON] = walls.pistonTemperature;
+  out[WALL_LINER] = walls.linerTemperature;
+  out[WALL_INTAKE_VALVE] = walls.intakeValveTemperature;
+  out[WALL_EXHAUST_VALVE] = walls.exhaustValveTemperature;
+  out[WALL_BLOCK] = walls.blockTemperature ?? walls.linerTemperature;
+  return out;
+}
+
+/**
+ * Lumped-wall thermal resistances, K/W, in WALL_* order (WallSpec.thermalResistance); the block falls back
+ * to the liner resistance (both water-jacketed block surfaces). Returns `out`.
+ */
+export function wallSurfaceResistances(R: WallThermalResistance, out: Float64Array): Float64Array {
+  out[WALL_HEAD] = R.head;
+  out[WALL_PISTON] = R.piston;
+  out[WALL_LINER] = R.liner;
+  out[WALL_INTAKE_VALVE] = R.intakeValve;
+  out[WALL_EXHAUST_VALVE] = R.exhaustValve;
+  out[WALL_BLOCK] = R.block ?? R.liner;
+  return out;
+}
+
+/** {@link ChamberAreas} → per-surface areas (block 0). Returns `out`. */
+export function chamberAreasToSurfaces(areas: ChamberAreas, out: Float64Array): Float64Array {
+  out[WALL_HEAD] = areas.head;
+  out[WALL_PISTON] = areas.piston;
+  out[WALL_LINER] = areas.liner;
+  out[WALL_INTAKE_VALVE] = areas.intakeValves;
+  out[WALL_EXHAUST_VALVE] = areas.exhaustValves;
+  out[WALL_BLOCK] = 0;
+  return out;
+}
+
+/** Heat-loss rates of the generic path, W (positive gas → wall). */
+export interface WallSurfaceHeatResult {
+  total: number;
+  /** Part of `total` leaving the burned zone (0 in single-zone mode). */
+  burned: number;
+  /** Part of `total` leaving the unburned zone (= total in single-zone mode). */
+  unburned: number;
+  /** Per-surface heat flow, W, WALL_* order. */
+  surface: Float64Array;
+}
+
+/** Allocate a zeroed {@link WallSurfaceHeatResult}. */
+export function newWallSurfaceHeatResult(): WallSurfaceHeatResult {
+  return { total: 0, burned: 0, unburned: 0, surface: new Float64Array(N_WALL_SURFACES) };
+}
+
+/**
+ * Single-zone wall heat loss over the generic surfaces, W (positive gas → wall).
+ * @param h heat-transfer coefficient, W/(m² K)
+ * @param T gas temperature, K
+ * @param areas per-surface areas, m² (WALL_* order)
+ * @param Tw per-surface temperatures, K ({@link wallSurfaceTemperatures})
+ * @param c Annand radiation constant, W/(m² K⁴) (default 0)
+ */
+export function wallHeatLossSurfaces(
+  h: number,
+  T: number,
+  areas: Float64Array,
+  Tw: Float64Array,
+  out: WallSurfaceHeatResult,
+  c = 0,
+): number {
+  const q = out.surface;
+  let total = 0;
+  for (let k = 0; k < N_WALL_SURFACES; k++) {
+    const i = SUM_ORDER[k];
+    const qi = areas[i] * flux(h, c, T, Tw[i]);
+    q[i] = qi;
+    total = k === 0 ? qi : total + qi;
+  }
+  out.total = total;
+  out.burned = 0;
+  out.unburned = total;
+  return total;
+}
+
+/**
+ * Two-zone wall heat loss over the generic surfaces, W (positive gas → wall): on surface i the burned zone
+ * (T_b) covers the fraction f_i of the area, the unburned zone (T_u) the rest. Fractions are clamped to
+ * [0, 1] (NaN → 0). `out.burned` / `out.unburned` give the zone split.
+ * @param burnedFraction per-surface burned fractions (chamber evaluate().burnedFraction)
+ */
+export function wallHeatLossTwoZoneSurfaces(
+  h: number,
+  Tu: number,
+  Tb: number,
+  areas: Float64Array,
+  burnedFraction: Float64Array,
+  Tw: Float64Array,
+  out: WallSurfaceHeatResult,
+  c = 0,
+): number {
+  const q = out.surface;
+  let qb = 0;
+  let qu = 0;
+  for (let k = 0; k < N_WALL_SURFACES; k++) {
+    const i = SUM_ORDER[k];
+    let f = burnedFraction[i];
+    f = f > 0 ? (f < 1 ? f : 1) : 0;
+    const A = areas[i];
+    const b = f * A * flux(h, c, Tb, Tw[i]);
+    const u = (1 - f) * A * flux(h, c, Tu, Tw[i]);
+    q[i] = b + u;
+    qb += b;
+    qu += u;
+  }
   out.burned = qb;
   out.unburned = qu;
   out.total = qb + qu;
