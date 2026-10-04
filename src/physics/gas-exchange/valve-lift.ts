@@ -37,7 +37,7 @@
  * integral by 11 % (intake) / 15 % (exhaust). With the 0.008 in lash the same cam reproduces the
  * measured intake profile to 0.095 mm rms (1.6 % of the peak), its lift integral to 0.7 % and
  * the lift near the events to 4 % (exhaust: 0.27 mm rms, −5 %, +25 %) (valve-lift.test.ts).
- * `lash` is an optional field of the timing spec (default 0; PROPOSED ValveSpec field).
+ * `lash` is an optional field of the timing spec (default 0; ValveSpec.lash).
  *
  * ── Timing ──────────────────────────────────────────────────────────────────────────────
  * The CFR (and most engines) quote timing at a small lift threshold of the VALVE (or at the
@@ -50,10 +50,46 @@
  * Angles are taken modulo 720°; the quoted duration is (closeDeg − openDeg) mod 720 ∈ (0, 720),
  * so an event may straddle the ±360° seam (e.g. exhaust 140° → −345° ≡ 375°).
  *
+ * ── Lift profiles from the spec ─────────────────────────────────────────────────────────
+ * {@link LiftProfile} is the interface the cycle model and the render consume. Implementations:
+ * this polydyne {@link ValveLiftProfile} (ValveSpec.cam absent or 'polydyne'), the exact three-arc
+ * lobe on a flat follower and the measured table (cam-lift.ts). {@link createLiftProfile} builds the
+ * one the ValveSpec asks for, with the running clearance resolved by {@link resolveValveLash}.
+ *
  * Units: lift m, angles crank degrees, lift rate m/deg, lift acceleration m/deg².
  * Hot paths allocate nothing.
  */
-import type { ValveSpec } from '../core/engine-spec';
+import type { CamSpec, ValveSpec } from '../core/engine-spec';
+import { TabulatedLiftProfile, ThreeArcFlatFollowerProfile } from './cam-lift';
+
+/**
+ * Valve lift L(θ) of one valve over the 720° cycle (θ = the cylinder's local crank angle, deg,
+ * firing-TDC convention), all methods allocation-free.
+ */
+export interface LiftProfile {
+  /** Maximum VALVE lift (after the running clearance), m. */
+  readonly maxLift: number;
+  /** Running clearance (lash) between follower and valve, m. */
+  readonly lash: number;
+  /** Maximum cam rise at the valve at zero clearance (maxLift + lash), m. */
+  readonly camMaxLift: number;
+  /** Crank angle of maximum lift (cam nose), deg in [−360, 360). */
+  readonly centerDeg: number;
+  /** Valve seat-off angle, deg in [−360, 360). */
+  readonly seatOpenDeg: number;
+  /** Valve seat-on angle, deg in [−360, 360). */
+  readonly seatCloseDeg: number;
+  /** Valve lift at crank angle θ (deg), m (0 when seated). */
+  lift(thetaDeg: number): number;
+  /** Cam rise transmitted to the valve at zero clearance (tappet motion; render), m. */
+  camLift(thetaDeg: number): number;
+  /** dL/dθ of the valve, m per crank degree (0 while seated). */
+  liftRate(thetaDeg: number): number;
+  /** d²L/dθ² of the valve, m per crank degree² (0 while seated). */
+  liftAccel(thetaDeg: number): number;
+  /** True while the valve is off its seat. */
+  isOpen(thetaDeg: number): boolean;
+}
 
 /** Even-power lift polynomial s(x) = 1 + Σ coeffs[i]·x^powers[i] on |x| ≤ 1. */
 export interface CamPolynomial {
@@ -127,7 +163,7 @@ export function wrapDeg720(deg: number): number {
 
 /**
  * The ValveSpec fields the lift profile needs, plus the optional valve running clearance
- * `lash` (m, default 0; PROPOSED ValveSpec field — see file header).
+ * `lash` (m, default 0; ValveSpec.lash — see file header).
  */
 export type ValveTimingSpec = Pick<ValveSpec, 'maxLift' | 'openDeg' | 'closeDeg' | 'timingLiftThreshold'> & {
   /** Valve (tappet) running clearance taken up on the cam before the valve moves, m (default 0). */
@@ -138,7 +174,7 @@ export type ValveTimingSpec = Pick<ValveSpec, 'maxLift' | 'openDeg' | 'closeDeg'
  * Precomputed lift profile of one valve (recommended for the hot path: no per-call setup).
  * All methods are allocation-free.
  */
-export class ValveLiftProfile {
+export class ValveLiftProfile implements LiftProfile {
   /** Maximum VALVE lift L_max, m. */
   readonly maxLift: number;
   /** Valve running clearance (lash), m. */
@@ -311,6 +347,46 @@ export class ValveLiftProfile {
   }
 }
 
+// ---- lift profile from a ValveSpec ------------------------------------------------------
+
+/** The ValveSpec fields a lift profile needs (any ValveSpec qualifies). */
+export type CamValveSpec = ValveTimingSpec & { readonly cam?: CamSpec };
+
+/**
+ * Running clearance of a valve: the spec's own ValveSpec.lash when present (contract: it overrides
+ * the cycle option), else `optionLash` (CycleModelOptions.valveLash), else 0. m.
+ */
+export function resolveValveLash(valve: { readonly lash?: number }, optionLash?: number): number {
+  return valve.lash ?? optionLash ?? 0;
+}
+
+/**
+ * Lift profile of a valve as its ValveSpec.cam asks for:
+ *  - absent: the default 2-10-18-26 polydyne ValveLiftProfile ({...valve, lash}: bit-identical to the
+ *    cycle model's historical `new ValveLiftProfile({ ...spec.intakeValve, lash })`);
+ *  - 'polydyne': ValveLiftProfile with the given powers (default 2-10-18-26);
+ *  - 'three-arc-flat-follower': exact flat-follower lift of the three-arc lobe, lobe centre at the
+ *    midpoint of openDeg/closeDeg (cam-lift.ts ThreeArcFlatFollowerProfile);
+ *  - 'table': the measured zero-lash table (cam-lift.ts TabulatedLiftProfile).
+ * @param lashOverride running clearance to use, m; absent → valve.lash ?? 0. The cycle model passes
+ *   resolveValveLash(valve, options.valveLash) so a spec lash wins over the option.
+ */
+export function createLiftProfile(valve: CamValveSpec, lashOverride?: number): LiftProfile {
+  const lash = lashOverride ?? valve.lash ?? 0;
+  const cam = valve.cam;
+  if (cam === undefined) return new ValveLiftProfile({ ...valve, lash });
+  switch (cam.kind) {
+    case 'polydyne':
+      return new ValveLiftProfile({ ...valve, lash }, cam.powers === undefined ? POLYDYNE_2_10_18_26 : polydyneCam(cam.powers));
+    case 'three-arc-flat-follower':
+      return new ThreeArcFlatFollowerProfile({ ...valve, lash }, cam);
+    case 'table':
+      return new TabulatedLiftProfile(cam, lash);
+    default:
+      throw new RangeError(`createLiftProfile: unknown cam kind '${(cam as { kind: string }).kind}'`);
+  }
+}
+
 // ---- functional API (contract) with a per-spec cache ------------------------------------
 
 interface CacheEntry {
@@ -319,15 +395,17 @@ interface CacheEntry {
   closeDeg: number;
   thr: number;
   lash: number | undefined;
-  profile: ValveLiftProfile;
+  cam: CamSpec | undefined;
+  profile: LiftProfile;
 }
-const cache = new WeakMap<ValveTimingSpec, CacheEntry>();
+const cache = new WeakMap<CamValveSpec, CacheEntry>();
 
 /**
- * Cached {@link ValveLiftProfile} for a spec object (rebuilt if its timing fields changed).
- * Uses the default polydyne cam and the spec's optional `lash`.
+ * Cached {@link LiftProfile} for a spec object (rebuilt if its timing fields, lash or cam object
+ * changed): {@link createLiftProfile} with the spec's own optional `lash` (default polydyne when the
+ * spec has no `cam`).
  */
-export function valveLiftProfile(spec: ValveTimingSpec): ValveLiftProfile {
+export function valveLiftProfile(spec: CamValveSpec): LiftProfile {
   const e = cache.get(spec);
   if (
     e !== undefined &&
@@ -335,28 +413,30 @@ export function valveLiftProfile(spec: ValveTimingSpec): ValveLiftProfile {
     e.openDeg === spec.openDeg &&
     e.closeDeg === spec.closeDeg &&
     e.thr === spec.timingLiftThreshold &&
-    e.lash === spec.lash
+    e.lash === spec.lash &&
+    e.cam === spec.cam
   ) {
     return e.profile;
   }
-  const profile = new ValveLiftProfile(spec);
+  const profile = createLiftProfile(spec);
   cache.set(spec, {
     maxLift: spec.maxLift,
     openDeg: spec.openDeg,
     closeDeg: spec.closeDeg,
     thr: spec.timingLiftThreshold,
     lash: spec.lash,
+    cam: spec.cam,
     profile,
   });
   return profile;
 }
 
 /** Valve lift at crank angle θ (deg, firing-TDC convention), m. */
-export function valveLift(spec: ValveTimingSpec, thetaDeg: number): number {
+export function valveLift(spec: CamValveSpec, thetaDeg: number): number {
   return valveLiftProfile(spec).lift(thetaDeg);
 }
 
 /** Valve lift rate dL/dθ at crank angle θ (deg), m per crank degree. */
-export function valveLiftRate(spec: ValveTimingSpec, thetaDeg: number): number {
+export function valveLiftRate(spec: CamValveSpec, thetaDeg: number): number {
   return valveLiftProfile(spec).liftRate(thetaDeg);
 }

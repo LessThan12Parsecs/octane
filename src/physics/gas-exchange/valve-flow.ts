@@ -62,9 +62,41 @@
  * turbulence model should expect to scale swirlTorqueIn by a calibrated (< 1) swirl-momentum
  * efficiency. UNVERIFIED: no CFR swirl measurement was found to check against.
  *
+ * ── Side valve in an L-head pocket ──────────────────────────────────────────────────────
+ * A side valve (ValveSpec.liftDirection +1, chamber 'l-head') seats in the block deck and lifts UP
+ * into the valve pocket toward the pocket roof (LHeadChamberSpec). Two extra restrictions follow the
+ * seat in the flow path:
+ *  4. ROOF masking. The valve head approaches the roof: with h_c the closed-valve clearance between
+ *     the head and the roof, the gas that the pocket walls turn over the head must pass the
+ *     cylindrical gap of the head rim, A_roof = π D_v (h_c − L) (→ 0 as the head reaches the roof).
+ *     It is adjacent to the curtain (the head rim bounds both, no room for the jet to dissipate in
+ *     between), so like Heywood's stages it enters the MINIMUM: A_m = min(A_seat|shrouded, A_port,
+ *     A_roof); the curtain C_D is scaled by A_m/A_m,unmasked exactly as for a shroud.
+ *  5. Pocket → bore TRANSFER. The gas then crosses the vertical boundary between pocket and bore
+ *     column (the arc of the bore circle inside the pocket plan, width w_t, from the deck — or the
+ *     crown when the piston stands above the deck — up to the pocket roof):
+ *       A_t = w_t · max(0, (roofY − deckY) − max(0, crown height above the deck)).
+ *     The pocket separates it from the curtain, so the curtain jet is taken as dissipated in the
+ *     pocket and the two are SERIES restrictions (incompressible, each losing its dynamic head):
+ *       1/(C_D A)² = 1/(C_D A)²_valve + 1/(C_D,t A_t)².
+ *     (For an exact compressible series solve with the intermediate pressure, see series-orifice.ts.)
+ *     The pocket itself is part of the cylinder volume (same pressure); both valves of a cylinder see
+ *     the full transfer section (exact when their events do not overlap — the Model T has −12.7°
+ *     overlap; with overlap the shared section would couple the two flows).
+ * Transfer discharge coefficients (full-loss orifice form; UNVERIFIED, no side-valve flow-bench
+ * data found — W. Atkinson's 1999 Model T flow tests are not online): flow INTO the bore column is a
+ * sudden expansion from the slot (Borda–Carnot: the full slot dynamic head is lost) → C_D,t = 1;
+ * flow OUT of the bore column enters the slot over the sharp bore/head edges → the 2-D free-streamline
+ * jet contraction π/(π + 2) = 0.611 (Kirchhoff 1869 / von Mises 1917; e.g. Batchelor 1967 §6.13 —
+ * UNVERIFIED section), the re-expansion in the pocket counted as lost. The curtain C_Dc tables above
+ * are OHV data; no side-valve curtain data were found, so they are used for side valves as well
+ * (UNVERIFIED: a flathead pocket typically flows worse than the OHV bench port; use
+ * CycleModelOptions.dischargeCoefficientMultiplier as the calibration handle).
+ * Oracle: tools/reference/gasex_lhead_flow.py (independent stage formulas, numerical boundary arc).
+ *
  * Units SI (m, m², kg/s, m/s). Hot paths allocate nothing.
  */
-import type { ValveSpec } from '../core/engine-spec';
+import type { EngineSpec, LHeadChamberSpec, ValveSpec } from '../core/engine-spec';
 import { Pchip } from './pchip';
 
 /** Curtain discharge coefficient table C_Dc(L/D) (reference area π D_i L). */
@@ -123,7 +155,43 @@ export interface ValveFlowOptions {
   inflow?: CurtainDischargeTable;
   /** Outflow curtain C_D table (default OUTFLOW_CURTAIN_CD). */
   outflow?: CurtainDischargeTable;
+  /**
+   * Side valve: closed-valve clearance between the valve head and the pocket roof h_c, m
+   * (default ∞: no roof stage). See the file header (stage 4).
+   */
+  roofClearance?: number;
+  /** Side valve: pocket → bore transfer section in series (default none). See the file header (stage 5). */
+  transfer?: PocketTransfer;
 }
+
+/** Pocket → bore transfer section of an L-head cylinder (series restriction). */
+export interface PocketTransfer {
+  /** Length of the pocket/bore boundary (arc of the bore circle inside the pocket plan), m. */
+  width: number;
+  /** Pocket roof height above the deck (the boundary height while the crown is below the deck), m. */
+  height: number;
+  /** Full-loss discharge coefficient for flow from the pocket INTO the bore column (default 1). */
+  inflowCd?: number;
+  /** Full-loss discharge coefficient for flow OUT OF the bore column into the pocket (default π/(π+2)). */
+  outflowCd?: number;
+}
+
+/**
+ * Effective area of two restrictions in series, each losing its full dynamic head (incompressible):
+ * 1/(C_D A)² = 1/a² + 1/b², m² (0 if either is ≤ 0; ∞ acts as no restriction).
+ */
+export function seriesEffectiveArea(a: number, b: number): number {
+  if (!(a > 0 && b > 0)) return 0;
+  if (b === Infinity) return a;
+  if (a === Infinity) return b;
+  return (a * b) / Math.sqrt(a * a + b * b);
+}
+
+/** Kirchhoff free-streamline contraction coefficient of a sharp-edged 2-D slot, π/(π + 2) (see header). */
+export const SLOT_CONTRACTION_COEFFICIENT = Math.PI / (Math.PI + 2);
+
+/** Default transfer coefficients (UNVERIFIED, see the file header). */
+export const POCKET_TRANSFER_CD = Object.freeze({ inflow: 1, outflow: SLOT_CONTRACTION_COEFFICIENT });
 
 /** Output of {@link ValveFlowModel.inflowJet} (reuse one instance). */
 export interface ValveJet {
@@ -182,6 +250,11 @@ export class ValveFlowModel {
   readonly shroudHeight: number;
   /** Kind of valve (sets forward direction). */
   readonly kind: ValveKind;
+  /** Side valve: closed-valve head-to-roof clearance h_c, m (∞ = no roof stage). */
+  readonly roofClearance: number;
+  /** Side valve: pocket → bore transfer section (null = none). */
+  readonly transfer: Readonly<Required<PocketTransfer>> | null;
+  private readonly hasRoof: boolean;
   private readonly cb: number;
   private readonly sb: number;
   private readonly tb: number;
@@ -220,6 +293,20 @@ export class ValveFlowModel {
     this.shroudHeight = opts.shroudHeight ?? Infinity;
     this.cdIn = new CurtainCd(opts.inflow ?? INFLOW_CURTAIN_CD);
     this.cdOut = new CurtainCd(opts.outflow ?? OUTFLOW_CURTAIN_CD);
+    const hc = opts.roofClearance ?? Infinity;
+    if (!(hc > 0)) throw new RangeError('ValveFlowModel: roofClearance must be > 0');
+    this.roofClearance = hc;
+    this.hasRoof = hc < Infinity;
+    const tr = opts.transfer;
+    if (tr !== undefined) {
+      if (!(tr.width > 0 && tr.height > 0)) throw new RangeError('ValveFlowModel: transfer width and height must be > 0');
+      const ci = tr.inflowCd ?? POCKET_TRANSFER_CD.inflow;
+      const co = tr.outflowCd ?? POCKET_TRANSFER_CD.outflow;
+      if (!(ci > 0 && co > 0)) throw new RangeError('ValveFlowModel: transfer discharge coefficients must be > 0');
+      this.transfer = Object.freeze({ width: tr.width, height: tr.height, inflowCd: ci, outflowCd: co });
+    } else {
+      this.transfer = null;
+    }
     // swirl lever: (sin α/α)(z₀ cosψ − x₀ sinψ), α = π f
     const alpha = Math.PI * this.openFraction;
     const sinc = alpha > 0 ? Math.sin(alpha) / alpha : 1;
@@ -236,11 +323,41 @@ export class ValveFlowModel {
     return Math.PI * this.meanSeatDiameter * Math.sqrt(a * a + this.seatWidth * this.seatWidth);
   }
 
-  /** Heywood minimum-area stage at lift L: 0 closed, 1, 2 seat-limited, 3 port-limited (with shroud). */
-  stage(L: number): 0 | 1 | 2 | 3 {
+  /**
+   * Minimum-area stage at lift L: 0 closed, 1, 2 seat-limited, 3 port-limited (with shroud),
+   * 4 roof-limited (side valve).
+   */
+  stage(L: number): 0 | 1 | 2 | 3 | 4 {
     if (!(L > 0)) return 0;
-    if (this.maskedSeatArea(L) >= this.portArea) return 3;
+    const a = this.maskedSeatArea(L);
+    if (this.hasRoof) {
+      const r = this.roofArea(L);
+      if (r < (a < this.portArea ? a : this.portArea)) return 4;
+    }
+    if (a >= this.portArea) return 3;
     return L < this.stage12Lift ? 1 : 2;
+  }
+
+  /**
+   * Side-valve roof gap of ONE valve at lift L, π D_v (h_c − L), m² (∞ without a roof; 0 once the
+   * head would touch the roof).
+   */
+  roofArea(L: number): number {
+    if (!this.hasRoof) return Infinity;
+    const g = this.roofClearance - (L > 0 ? L : 0);
+    return g > 0 ? Math.PI * this.headDiameter * g : 0;
+  }
+
+  /**
+   * Geometric pocket → bore transfer area of the cylinder, m² (0 without a transfer section).
+   * @param crownAboveDeck piston-crown height above the deck plane, m (negative below the deck):
+   *   lHead.crownAboveDeckAtTDC − pistonDisplacement(θ)
+   */
+  transferArea(crownAboveDeck: number): number {
+    const t = this.transfer;
+    if (t === null) return 0;
+    const h = t.height - (crownAboveDeck > 0 ? crownAboveDeck : 0);
+    return h > 0 ? t.width * h : 0;
   }
 
   private maskedSeatArea(L: number): number {
@@ -250,11 +367,16 @@ export class ValveFlowModel {
     return a;
   }
 
-  /** Geometric minimum flow area of all `count` valves at lift L (shroud included), m². */
+  /** Geometric minimum flow area of all `count` valves at lift L (shroud and roof included), m². */
   flowArea(L: number): number {
     if (!(L > 0)) return 0;
     const a = this.maskedSeatArea(L);
-    return this.count * (a < this.portArea ? a : this.portArea);
+    let m = a < this.portArea ? a : this.portArea;
+    if (this.hasRoof) {
+      const r = this.roofArea(L);
+      if (r < m) m = r;
+    }
+    return this.count * m;
   }
 
   /** Curtain area count·π D_i L, m². */
@@ -291,17 +413,24 @@ export class ValveFlowModel {
   }
 
   /**
-   * Effective flow area C_D·A_m of all valves (shroud included), m² — the CdA to pass to the
-   * orifice model. Equals count·f·C_Dc·π D_i L below the port limit.
+   * Effective flow area C_D·A_m of all valves (shroud and roof included), m² — the CdA to pass to
+   * the orifice model. Equals count·f·C_Dc·π D_i L below the port limit. With a pocket transfer
+   * section and `crownAboveDeck` given, the transfer restriction is added in series (file header).
+   * @param reverse false = the valve's normal direction (intake: into, exhaust: out of the cylinder)
+   * @param crownAboveDeck side valves: piston-crown height above the deck, m (see transferArea);
+   *   omitted → no transfer stage
    */
-  effectiveArea(L: number, reverse: boolean): number {
+  effectiveArea(L: number, reverse: boolean, crownAboveDeck?: number): number {
     if (!(L > 0)) return 0;
     const cdc = this.curtainDischargeCoefficient(L, reverse);
     const aSeat = this.seatArea(L);
     const aUnmasked = aSeat < this.portArea ? aSeat : this.portArea;
     if (!(aUnmasked > 0)) return 0; // denormal lift
     const aMasked = this.flowArea(L) / this.count;
-    return this.count * cdc * Math.PI * this.innerDiameter * L * (aMasked / aUnmasked);
+    const cda = this.count * cdc * Math.PI * this.innerDiameter * L * (aMasked / aUnmasked);
+    const t = this.transfer;
+    if (t === null || crownAboveDeck === undefined) return cda;
+    return seriesEffectiveArea(cda, this.transferArea(crownAboveDeck) * (this.isInflow(reverse) ? t.inflowCd : t.outflowCd));
   }
 
   /**
@@ -324,6 +453,99 @@ export class ValveFlowModel {
     out.kineticEnergyFlux = 0.5 * mdotIn * jetVelocity * jetVelocity;
     return out;
   }
+}
+
+// ---- flow model from the engine spec ----------------------------------------------------
+
+/** True for a side valve (lifts up, +y) in an 'l-head' chamber with an L-head description. */
+export function isSideValve(valve: ValveSpec, spec: EngineSpec): boolean {
+  return valve.liftDirection === 1 && spec.geometry.chamber === 'l-head' && spec.geometry.lHead !== undefined;
+}
+
+/** Inside test for the rounded-rectangle pocket plan (cylinder frame x, z). */
+function insidePocketPlan(p: LHeadChamberSpec['pocket'], x: number, z: number): boolean {
+  if (!(x >= p.xMin && x <= p.xMax && z >= p.zMin && z <= p.zMax)) return false;
+  const rc = Math.max(0, Math.min(p.cornerRadius, 0.5 * (p.xMax - p.xMin), 0.5 * (p.zMax - p.zMin)));
+  const cx = x < p.xMin + rc ? p.xMin + rc : x > p.xMax - rc ? p.xMax - rc : x;
+  const cz = z < p.zMin + rc ? p.zMin + rc : z > p.zMax - rc ? p.zMax - rc : z;
+  const dx = x - cx;
+  const dz = z - cz;
+  return dx * dx + dz * dz <= rc * rc;
+}
+
+/**
+ * Length of the pocket/bore boundary of an L-head: the arc of the bore circle (radius bore/2, centred
+ * on the cylinder axis) that lies inside the pocket plan, m. The circle is sampled at 7200 points
+ * starting from an outside point, and every in/out crossing is refined by bisection to machine
+ * precision (construction-time only).
+ */
+export function pocketBoreBoundaryLength(lHead: LHeadChamberSpec, bore: number): number {
+  const R = 0.5 * bore;
+  const p = lHead.pocket;
+  const N = 7200;
+  const inside = (a: number) => insidePocketPlan(p, R * Math.cos(a), R * Math.sin(a));
+  let a0 = NaN;
+  for (let i = 0; i < N; i++) {
+    const a = (2 * Math.PI * i) / N;
+    if (!inside(a)) {
+      a0 = a;
+      break;
+    }
+  }
+  if (Number.isNaN(a0)) return 2 * Math.PI * R; // the pocket plan covers the whole bore circle
+  let total = 0;
+  let enter = 0;
+  let prevA = a0;
+  let prevIn = false;
+  for (let i = 1; i <= N; i++) {
+    const a = a0 + (2 * Math.PI * i) / N;
+    const isIn = inside(a);
+    if (isIn !== prevIn) {
+      let lo = prevA;
+      let hi = a;
+      for (let k = 0; k < 60; k++) {
+        const m = 0.5 * (lo + hi);
+        if (inside(m) === prevIn) lo = m;
+        else hi = m;
+      }
+      const ax = 0.5 * (lo + hi);
+      if (isIn) enter = ax;
+      else total += ax - enter;
+    }
+    prevA = a;
+    prevIn = isIn;
+  }
+  return total * R;
+}
+
+/**
+ * Pocket → bore transfer section of an L-head spec (width = pocketBoreBoundaryLength, height = pocket
+ * roof above the deck), default transfer discharge coefficients.
+ */
+export function lHeadPocketTransfer(spec: EngineSpec): PocketTransfer {
+  const lh = spec.geometry.lHead;
+  if (lh === undefined) throw new RangeError('lHeadPocketTransfer: spec has no lHead chamber');
+  return { width: pocketBoreBoundaryLength(lh, spec.geometry.bore), height: lh.pocket.roofY - lh.deckY };
+}
+
+/**
+ * Flow model of a valve kind built from the engine spec:
+ *  - port diameter = max(manifold port diameter, 1.01 × stem) (the cycle model's historical choice;
+ *    bit-identical to `new ValveFlowModel(valve, kind, { portDiameter })` for overhead valves);
+ *  - side valves (isSideValve): roof stage with h_c = pocket roofY − seatY (seatY default deckY; the
+ *    valve head taken flush with the seat plane — UNVERIFIED, the Model T head stands ≈ 1 mm proud by
+ *    its face/margin geometry) and the pocket → bore transfer section (lHeadPocketTransfer).
+ * @param opts overrides of any of the above (and of the C_D tables)
+ */
+export function createValveFlowModel(valve: ValveSpec, kind: ValveKind, spec: EngineSpec, opts: ValveFlowOptions = {}): ValveFlowModel {
+  const port = kind === 'intake' ? spec.manifolds.intakePortDiameter : spec.manifolds.exhaustPortDiameter;
+  const o: ValveFlowOptions = { portDiameter: Math.max(port, valve.stemDiameter * 1.01), ...opts };
+  const lh = spec.geometry.lHead;
+  if (isSideValve(valve, spec) && lh !== undefined) {
+    if (o.roofClearance === undefined) o.roofClearance = lh.pocket.roofY - (valve.seatY ?? lh.deckY);
+    if (o.transfer === undefined) o.transfer = lHeadPocketTransfer(spec);
+  }
+  return new ValveFlowModel(valve, kind, o);
 }
 
 // ---- functional API (contract) ---------------------------------------------------------
@@ -351,7 +573,8 @@ const KEY = new Float64Array(N_KEY);
 
 /**
  * Cached {@link ValveFlowModel} (default options) for a spec object and kind; rebuilt when
- * the spec's geometry fields change. Allocation-free on cache hits.
+ * the spec's geometry fields change. Allocation-free on cache hits. Overhead-valve defaults only
+ * (port = seat, no side-valve stages): engine code uses createValveFlowModel.
  */
 export function valveFlowModel(spec: ValveSpec, kind: ValveKind = 'intake'): ValveFlowModel {
   writeKey(spec, KEY);

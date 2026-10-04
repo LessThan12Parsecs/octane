@@ -149,12 +149,18 @@ export const MODEL_T_VALVE_LASH = 0.0256 * IN;
 
 /**
  * Cam lobe: forged-integral three-arc profile, no ramp, acting on a 1 in flat-footed mushroom push rod
- * [DB23; valvetrain research]: base radius 0.406 in, flank radius 1.260 in, nose radius 0.031 in,
- * 0.250 in rise. Same lobe for intake and exhaust.
+ * [DB23; valvetrain research]. Radii and rise at the 4-decimal precision of the MTFC Tulsa table of the
+ * Ford-drawing lobe (design_stock.htm Table 1; via D. R. Post 1997 and M. C. Turkish 1946): base radius
+ * 0.4060 in, flank radius 1.2601 in, nose radius 0.0313 in, rise 0.2502 in (Ford: heel 13/16 in,
+ * heel-to-toe 1-1/16 in → 0.250 in). Same lobe for intake and exhaust. With these values the exact
+ * flat-follower lift (gas-exchange/cam-lift.ts; envelope oracle tools/reference/mechanics_cam_three_arc.py)
+ * reproduces MTFC's duration-vs-lash Table 2 within 0.11° and gives 218.04° seat-to-seat at the
+ * 0.0256 in lash (Ford's 218.1°/217.9° piston-position timing); the earlier 3-decimal rounding
+ * (0.406/1.260/0.031/0.250 in) gave 217.91°.
  */
-const CAM = { kind: 'three-arc-flat-follower' as const, baseRadius: 0.406 * IN, flankRadius: 1.26 * IN, noseRadius: 0.031 * IN, rise: 0.25 * IN };
+const CAM = { kind: 'three-arc-flat-follower' as const, baseRadius: 0.406 * IN, flankRadius: 1.2601 * IN, noseRadius: 0.0313 * IN, rise: 0.2502 * IN };
 
-/** Net valve lift at the running clearance, m: 0.250 in rise − 0.0256 in lash ≈ 0.225 in (5.7 mm). */
+/** Net valve lift at the running clearance, m: 0.2502 in rise − 0.0256 in lash = 0.2246 in (5.70 mm). */
 const VALVE_LIFT = CAM.rise - MODEL_T_VALVE_LASH;
 
 /**
