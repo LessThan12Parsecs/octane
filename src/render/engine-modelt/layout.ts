@@ -272,9 +272,15 @@ export interface ModelTLayout {
   generator: { x: number; y: number; radius: number; z0: number; z1: number };
   starter: { x: number; y: number; radius: number; z0: number; z1: number; pinionTeeth: number; pinionR: number; pinionZ: number };
 
-  /** Valve side (−1 = −x): the cutaway removes {cutSide·x > 0, z > cutZ} of block and head. */
+  /**
+   * Valve side (−1 = −x): the cutaway removes {cutSide·x > 0, z > sectionZ[k]} of block and head, the
+   * quarter section through the front valve axis of the section cylinder k (the focus cylinder; cutZ =
+   * sectionZ[0], cylinder 1's front valve).
+   */
   cutSide: 1 | -1;
   cutZ: number;
+  /** Per cylinder: z of its front (largest-z) valve axis, the section plane when it is the section cylinder. */
+  sectionZ: number[];
   /** The bell (transmission cover) set removes its whole valve-side half: frame behind the bell. */
   bellCutZ: number;
   bounds: { min: Vec3; max: Vec3 };
@@ -726,8 +732,8 @@ export function computeModelTLayout(spec: EngineSpec): ModelTLayout {
   const stDist = ringPitchR + pinionR;
   const starter = { x: stDist * Math.cos(stAng), y: stDist * Math.sin(stAng), radius: 2.2 * IN, z0: zB - 0.1 * IN, z1: zB + 8.5 * IN, pinionTeeth: 10, pinionR, pinionZ: flywheel.ringGear.z0 + 0.375 * IN };
 
-  // ---- cutaway: quarter section through cylinder 1's front valve axis on the valve side ----
-  const v1 = valves.filter((v) => v.cyl === 0).sort((a, b) => b.z - a.z)[0];
+  // ---- cutaway: quarter section through the section cylinder's front valve axis on the valve side ----
+  const sectionZ = axisZ.map((_, c) => Math.max(...valves.filter((v) => v.cyl === c).map((v) => v.z)));
   const cutSide: 1 | -1 = camX < 0 ? -1 : 1;
   const bellEnd = bell.inner[bell.inner.length - 1].z - bell.wall;
 
@@ -843,7 +849,8 @@ export function computeModelTLayout(spec: EngineSpec): ModelTLayout {
     generator,
     starter,
     cutSide,
-    cutZ: v1.z,
+    cutZ: sectionZ[0],
+    sectionZ,
     bellCutZ: bellEnd - 0.01,
     bounds,
   };

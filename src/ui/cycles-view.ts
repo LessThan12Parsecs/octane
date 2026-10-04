@@ -115,7 +115,7 @@ export class CyclesView {
     }
     // Engine tiles (hidden until the simulator reports engine-level results).
     const engineTiles: [string, string, string][] = [
-      ['bT', 'Brake torque [N·m]', 'Mean brake torque over the statistics window (lb·ft in brackets)'],
+      ['bT', 'Brake torque [N·m]', 'Mean brake torque over the statistics window: engine output at the crankshaft, excludes the car’s inertia (lb·ft in brackets)'],
       ['bP', 'Brake power [kW]', 'Mean brake power over the statistics window (hp in brackets)'],
     ];
     for (const [k, label, hint] of engineTiles) {

@@ -210,7 +210,7 @@ export class Hud {
     cell('flame', 'Flame', '', 'Flame stage: kernel → turbulent → burn-out');
     cell('spark', 'Spark', '', 'Ignition phase: charging (dwell) → breakdown → arc → glow', '');
     cell('knock', 'Knock', '', 'End-gas Livengood–Wu integral (autoignition at 100 %) — lamp lights on autoignition');
-    if (opts.brake) cell('brake', 'Brake', '', 'Brake torque and power: mean of the last engine cycle (instantaneous load torque until one is complete)');
+    if (opts.brake) cell('brake', 'Brake', '', 'Brake torque and power at the crankshaft (engine output, excludes the car’s inertia): mean of the last engine cycle (instantaneous load torque until one is complete)');
     if (opts.vehicle) cell('road', 'Road speed', '', 'Vehicle speed (vehicle load model)');
     cell('cycle', 'Cycle', '', 'Completed cycles and simulated time');
     this.el.appendChild(cells);

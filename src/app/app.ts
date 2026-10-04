@@ -16,7 +16,14 @@
  * available) leaves the running engine untouched.
  *
  * Starts on the engine from ?engine=, the remembered choice or the default (the
- * CFR at its Research-method conditions) in slow motion, framed on the chamber.
+ * CFR at its Research-method conditions) in slow motion, framed on the chamber. A
+ * link with operating-point knobs but no ?engine= predates the engine picker and
+ * opens the default engine (resolveStartEngine); after start-up the address bar
+ * names the engine that started whenever it carries other parameters.
+ *
+ * Render-loop errors halt the animation loop (AnimationLoop, loop.ts) behind a
+ * failure card; "Back to <engine>" (a successful session swap) and the UI's Reset
+ * restart it, and an error that repeats right away halts it again.
  */
 import type { EngineSpec } from '../physics/core/engine-spec';
 import type { OperatingPoint } from '../physics/core/operating-point';
@@ -27,12 +34,21 @@ import { definitionForSpec, engineTitle } from '../ui/index';
 import { loadPref, savePref } from '../ui/prefs';
 import type { SimulatorOptions } from '../worker/protocol';
 import type { PlaybackState, ViewState } from './conductor';
-import { engineChoices, initialOperatingPoint, isEngineId, resolveEngine } from './engines';
+import { engineChoices, initialOperatingPoint, isEngineId, resolveStartEngine } from './engines';
+import { AnimationLoop } from './loop';
 import { ViewportOverlay, type StatusAction } from './overlay';
 import './register-engines';
 import { EngineSession } from './session';
 import type { SimClientConfig } from './sim-client';
-import { clampOperatingPoint, errorSummary, framingDistanceScale, parseUrlOptions, searchWithEngine, type Framing } from './sync';
+import {
+  clampOperatingPoint,
+  errorSummary,
+  framingDistanceScale,
+  parseUrlOptions,
+  searchWithEngine,
+  searchWithStartEngine,
+  type Framing,
+} from './sync';
 
 /** Default playback speed: 1/50 of real time (a 600 rpm burn of ~5 ms takes ~¼ s). */
 export const DEFAULT_TIME_SCALE = 1 / 50;
@@ -68,7 +84,10 @@ export interface AppOptions {
   simulatorOptions?: SimulatorOptions;
   /** `location.search` for the URL knobs (?engine=&cr=&on=&rpm=&spark=&phi=&ts=&paused=&view=&cyl=&sim=). */
   search?: string;
-  /** Write the engine choice back to the address bar (history.replaceState) on a switch (default true). */
+  /**
+   * Write the engine back to the address bar (history.replaceState) on a switch, and after start-up when
+   * the URL carries parameters but does not name the engine that started (default true).
+   */
   syncUrl?: boolean;
   /** SimClient configuration of every session (e.g. a custom worker factory for dev pages and tests). */
   simClientConfig?: SimClientConfig;
@@ -84,7 +103,7 @@ export class App {
   private readonly syncUrl: boolean;
   private framing: Framing;
   private focus = 0;
-  private raf = 0;
+  private readonly loop: AnimationLoop;
   private startedAt = NaN;
   private hasData = false;
   private failed = false;
@@ -98,7 +117,8 @@ export class App {
   private notice = false;
 
   constructor(opts: AppOptions) {
-    const url = parseUrlOptions(opts.search ?? '');
+    const search = opts.search ?? '';
+    const url = parseUrlOptions(search);
     this.uiContainer = opts.uiContainer;
     this.syncUrl = opts.syncUrl ?? true;
     this.simClientConfig = opts.simClientConfig;
@@ -109,12 +129,15 @@ export class App {
 
     const requested: EngineDefinition = opts.spec
       ? definitionForSpec(opts.spec)
-      : resolveEngine(opts.engineId, url.engine, loadPref<string | null>(ENGINE_PREF, null));
+      : resolveStartEngine(opts.engineId, search, loadPref<string | null>(ENGINE_PREF, null));
     this.focus = Math.max(0, Math.min(requested.spec.cylinders - 1, url.focusCylinder ?? 0));
     const op = initialOperatingPoint(requested, url.op, opts.operatingPoint);
     const playback: PlaybackState = { timeScale: url.timeScale ?? DEFAULT_TIME_SCALE, paused: url.paused ?? false };
 
     // ---- shell ----
+    this.loop = new AnimationLoop(this.frame, (err, consecutive) =>
+      this.fail(consecutive > 1 ? 'The render loop stopped again on an error.' : 'The render loop stopped on an error.', err),
+    );
     this.stage = new Stage(opts.viewport);
     let session: EngineSession | null = null;
     let startError: { def: EngineDefinition; err: unknown } | null = null;
@@ -148,6 +171,11 @@ export class App {
     this.session = session;
     this.afterSwap(null, url.timeScale !== undefined || url.paused !== undefined ? playback : null, null);
     if (startError) this.reportEngineError(startError.def, startError.err);
+    else if (!opts.spec) {
+      // A copied address bar must reopen this engine, not the copier's remembered one.
+      const next = searchWithStartEngine(typeof location !== 'undefined' ? location.search : search, session.def.id);
+      if (next !== null) this.replaceSearch(next);
+    }
 
     window.addEventListener('keydown', this.onKey);
   }
@@ -181,16 +209,15 @@ export class App {
     return this.session.gas;
   }
 
-  /** Start the animation loop. */
+  /** Start the animation loop (idempotent). */
   start(): void {
-    if (this.raf || this.disposed) return;
-    this.raf = requestAnimationFrame(this.tick);
+    if (this.disposed) return;
+    this.loop.start();
   }
 
   /** Stop the animation loop (the worker keeps its buffer). */
   stop(): void {
-    if (this.raf) cancelAnimationFrame(this.raf);
-    this.raf = 0;
+    this.loop.stop();
   }
 
   get currentFraming(): Framing {
@@ -209,8 +236,9 @@ export class App {
   }
 
   /**
-   * Focus cylinder (0-based): UI readouts and charts, the 'chamber' close-up, and the featured
-   * in-cylinder visuals (flow tracers and chamber light follow the focus).
+   * Focus cylinder (0-based): UI readouts and charts, the cutaway section (engines whose section can
+   * move: the Model T's quarter section opens the focus cylinder's chamber), the 'chamber' close-up, and
+   * the featured in-cylinder visuals (flow tracers and chamber light follow the focus).
    */
   setFocusCylinder(index: number, animate = true): void {
     const n = this.session.spec.cylinders;
@@ -219,10 +247,10 @@ export class App {
     this.focus = i;
     this.session.ui.setFocusCylinder(i);
     try {
-      this.session.setFeaturedCylinder(i);
+      this.session.setFocusCylinder(i);
     } catch (err) {
-      // The visuals keep featuring the previous cylinder; readouts and framing still follow the focus.
-      console.error('[octane] could not move the flow tracers to the focus cylinder', err);
+      // Section and/or visuals stay where they were; readouts and framing still follow the focus.
+      console.error('[octane] could not move the cutaway section / flow tracers to the focus cylinder', err);
     }
     if (this.framing === 'chamber') this.stage.setFraming(this.framingView(), animate);
   }
@@ -262,7 +290,7 @@ export class App {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.stop();
+    this.loop.dispose();
     window.removeEventListener('keydown', this.onKey);
     this.session.dispose();
     this.overlay.dispose();
@@ -295,6 +323,7 @@ export class App {
           this.failed = false;
           if (!this.notice) this.overlay.setStatus('Restarting the simulator…', 'Running the first cycle again with the current settings.');
         }
+        this.loop.resume(); // a render-loop error halted it: try again (it halts again if the error repeats)
       },
       onFocusCylinder: (i) => this.setFocusCylinder(i),
       simClientConfig: this.simClientConfig,
@@ -336,29 +365,27 @@ export class App {
     }
     if (previous) {
       savePref(ENGINE_PREF, s.def.id);
-      if (this.syncUrl && typeof history !== 'undefined' && typeof location !== 'undefined') {
-        try {
-          history.replaceState(history.state, '', `${location.pathname}${searchWithEngine(location.search, s.def.id)}${location.hash}`);
-        } catch {
-          /* sandboxed frames may refuse; the URL is a convenience */
-        }
-      }
+      if (typeof location !== 'undefined') this.replaceSearch(searchWithEngine(location.search, s.def.id));
+    }
+    // After a render-loop error the card offered this swap as the way out: run the new session.
+    this.loop.resume();
+  }
+
+  /** history.replaceState with a new search string (when syncUrl; path and hash kept). */
+  private replaceSearch(search: string): void {
+    if (!this.syncUrl || typeof history === 'undefined' || typeof location === 'undefined') return;
+    try {
+      history.replaceState(history.state, '', `${location.pathname}${search}${location.hash}`);
+    } catch {
+      /* sandboxed frames may refuse; the URL is a convenience */
     }
   }
 
-  private readonly tick = (now: number): void => {
-    if (this.disposed) return;
-    this.raf = requestAnimationFrame(this.tick);
+  /** One animation frame (AnimationLoop; a throw halts the loop and shows the failure card). */
+  private readonly frame = (now: number): void => {
     if (Number.isNaN(this.startedAt)) this.startedAt = now;
     const session = this.session;
-    let s: EngineSnapshot | null = null;
-    try {
-      s = session.conductor.frame(now);
-    } catch (err) {
-      this.fail('The render loop stopped on an error.', err);
-      this.stop();
-      return;
-    }
+    const s: EngineSnapshot | null = session.conductor.frame(now);
     if (!s && !this.hasData && !this.failed && (now - this.startedAt) / 1000 > STALL_WARNING_SECONDS) {
       this.overlay.setStatus(
         'Still waiting for the simulator…',

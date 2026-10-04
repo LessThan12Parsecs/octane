@@ -7,7 +7,8 @@
  * count would make three.js recompile every lit material. Tracer capacity and the light are fixed when a
  * CombustionVisuals is built (render/combustion/index.ts), so setFeatured rebuilds just the two instances
  * whose flags change (the previous and the new featured cylinder) and carries the view state the app
- * sets on them — render mode and cut region — over; the other cylinders are untouched. (The app never
+ * sets on them — render mode and the host's CURRENT cut region (the session moves the section to the
+ * focus cylinder before featuring it) — over; the other cylinders are untouched. (The app never
  * changes the temperature range, tracer visibility, chamber-light switch or electrode tips from their
  * defaults, so a rebuilt instance needs nothing else.) A single-cylinder engine always features its one
  * cylinder, exactly as before the multi-cylinder work.
